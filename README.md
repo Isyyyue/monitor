@@ -195,6 +195,17 @@ mkdir -p data
 
 正式部署到域名时，通过 HTTPS 反向代理访问，并给 Hub 设置 `--site https://your-domain.example`；代理需要转发 WebSocket。网站页面提供配置示例，已有 nginx 或端口分流配置应按现有拓扑整合。
 
+### 没有域名怎么办
+
+默认安装只监听回环，公网访问不到，而且没有 HTTPS 域名就不给添加节点。没有域名时安装器有两条路，二选一：
+
+- `sudo ./install-hub.sh --https`：签一张自签证书并配好 nginx，面板走 `https://公网IP`。浏览器第一次会警告「不安全」，点「继续」即可，流量是加密的。**但只有面板和本机节点能用**——远程节点的 Agent 只认公共 CA 签的证书，连不上自签的 Hub。
+- `sudo ./install-hub.sh --plain`：不要证书，Hub 直接监听公网，面板走 `http://公网IP:28080`。**登录密码、会话 cookie 和节点 token 都不加密**，链路上抓包就能拿走，拿到 token 就能接管对应节点。好处是零依赖、零维护，远程节点也能加。只在信得过的网络里这么用。
+
+两条路都可以加 `--local-node 名字`，安装器会顺手把本机建成节点并打印装 Agent 的命令——服务器和面板是同一台机器时用这个，token 只在本地生成，不过网。
+
+等域名解析过来之后，重跑一次带上 `--site https://你的域名`，就能收紧到全程加密。`--plain` 的明文状态会在三处被告知：安装完成时的汇总、Hub 每次启动的日志、以及面板上安装命令的下方。
+
 ### 自研 Agent 构建
 
 ```bash
@@ -204,7 +215,9 @@ cargo build --release --locked
 
 产物是 `agent/target/release/monitor-agent`。同一个二进制有两个入口：不带子命令时是常驻的指标上报服务，`provision` 子命令则由安装器以 root 调用一次，用于写入 sing-box 配置与订阅。
 
-安装器通过 `MONITOR_SERVER`、`MONITOR_TOKEN` 和可选的 `MONITOR_IFACE` 传递配置；也可显式使用 `--server`、`--token`、`--interval` 与 `--iface`。`install.sh` 另有 `--vpn-ip ADDRESS`（本机公网地址，缺省时自行查询）与 `--no-vpn`（只装监控、不部署 VPN）。自研 Agent 的 HTTPS 连接要求可信证书，不支持 `--insecure`。
+安装器通过 `MONITOR_SERVER`、`MONITOR_TOKEN` 和可选的 `MONITOR_IFACE` 传递配置；也可显式使用 `--server`、`--token`、`--interval` 与 `--iface`。`install.sh` 另有 `--vpn-ip ADDRESS`（本机公网地址，缺省时自行查询）与 `--no-vpn`（只装监控、不部署 VPN）。
+
+Agent 本身不接受 `--insecure`：它按连接地址的协议决定用 `ws://` 还是 `wss://`，明文连接不做证书校验，也就没有需要关掉的东西。`install.sh` 的 `--insecure` 是另一回事——它放行「向非本机的 Hub 用明文 HTTP」，那条链路上既取要执行的二进制、又送节点 token，所以默认拒绝。Hub 没有域名时（`--plain`）面板拼出的安装命令会自动带上它。
 
 ### Hub 常用参数
 
@@ -213,7 +226,11 @@ cargo build --release --locked
 | `--listen` | 监听地址；建议在反向代理后明确使用回环地址 |
 | `--db` | SQLite 数据库路径，默认 `monitor.db` |
 | `--themes` | 外部主题目录，默认在数据库旁的 `themes/` |
-| `--site` | 节点安装入口使用的站点地址，正式环境使用 HTTPS 域名 |
+| `--site` | 节点安装入口使用的站点地址。有域名写 `https://` 加域名；没有域名写 `http://` 加公网 IP 和端口，配合 `--plain` |
+| `--plain` | 无域名部署：Hub 监听公网、面板走明文 HTTP。密码与节点 token 不加密 |
+| `--https` | 无域名部署：签自签证书并配好 nginx，面板走 `https://公网IP`。只有面板和本机节点能用 |
+| `--https-port` | 自签 HTTPS 的监听端口，默认 443 |
+| `--local-node` | 顺手建好本机节点并打印装 Agent 的命令；重名会复用而不是再建一个 |
 | `--reset-password` | 重置管理员密码并使现有会话失效，打印新密码后退出 |
 
 日志级别可通过 `MONITOR_LOG` 设置。数据库与主题目录需要持久保存；升级前保留一致的数据库备份、旧二进制和相关服务配置。
