@@ -28,12 +28,14 @@ INTERVAL=""
 INSECURE=""
 UNINSTALL=""
 UPGRADE=""
+VPN_IP=""
+NO_VPN=""
 
 while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
 	# message rather than the usage below, and `shift 2` cannot proceed.
 	case "$1" in
-	--server | --token | --register | --name | --iface | --interval)
+	--server | --token | --register | --name | --iface | --interval | --vpn-ip)
 		[ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;
 	esac
 	case "$1" in
@@ -43,6 +45,8 @@ while [ $# -gt 0 ]; do
 	--name) NAME="$2"; shift 2 ;;
 	--iface) IFACE="$2"; IFACE_SET=1; shift 2 ;;
 	--interval) INTERVAL="$2"; shift 2 ;;
+	--vpn-ip) VPN_IP="$2"; shift 2 ;;
+	--no-vpn) NO_VPN=1; shift ;;
 	--insecure) INSECURE=1; shift ;;
 	--uninstall) UNINSTALL=1; shift ;;
 	--upgrade) UPGRADE=1; shift ;;
@@ -90,9 +94,11 @@ fi
 
 [ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
 	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure]" >&2
-	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS]" >&2
+	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS] [--vpn-ip ADDRESS]" >&2
 	echo "       install.sh --uninstall" >&2
 	echo "--name NAME names the node --register creates; the hostname otherwise" >&2
+	echo "--vpn-ip ADDRESS is this machine's public address, for the VPN links;" >&2
+	echo "  without it the address is looked up, and --no-vpn skips the VPN entirely" >&2
 	exit 2
 }
 # Names the node a registration creates. A token belongs to a node that already
@@ -373,6 +379,52 @@ not_started() {
 	exit 1
 }
 
+# sing-box and the subscription are written here, once, as root. Nothing the hub
+# sends can do this afterwards: the service runs unprivileged and, since the
+# `vpn.deploy` channel was removed, has no deploy path at all.
+#
+# Failure is not fatal. The machine is already reporting by this point, and
+# `provision` is idempotent -- it reuses the credentials in an existing config --
+# so a rerun is the fix rather than a reinstall.
+provision_vpn() {
+	[ -z "$NO_VPN" ] || { echo "skipping VPN setup (--no-vpn)"; return 0; }
+	if [ -z "$VPN_IP" ]; then
+		VPN_IP=$(curl -s --max-time 10 https://api.ipify.org 2>/dev/null || true)
+	fi
+	case "$VPN_IP" in
+	"" | *[!0-9.]*)
+		echo "warning: could not determine this machine's public address" >&2
+		echo "         VPN setup skipped; re-run with --upgrade --vpn-ip ADDRESS" >&2
+		return 0
+		;;
+	esac
+	# The certificate's CN follows the name clients actually send, so a hub reached
+	# by domain gives one. Reached by a bare address, provision's own default stands.
+	VPN_SNI=""
+	case "$HOST" in
+	*[!0-9.]*) VPN_SNI="$HOST" ;;
+	esac
+	echo "setting up sing-box and the subscription for $VPN_IP"
+	# Built with `set --` rather than `${VAR:+--sni "$VAR"}`: inside `:+` the quotes
+	# are not quote removal, so the address would reach provision wrapped in them.
+	set -- provision --server "$VPN_IP"
+	[ -z "$VPN_SNI" ] || set -- "$@" --sni "$VPN_SNI"
+	if ! VPN_JSON=$("$BIN" "$@"); then
+		echo "warning: VPN setup failed; this machine still reports as a node" >&2
+		echo "         re-run with: --upgrade --vpn-ip $VPN_IP" >&2
+		return 0
+	fi
+	# The links live in the panel, which is where they are shown and kept. A refusal
+	# here would leave the node serving traffic it cannot display, so it is said out
+	# loud rather than swallowed.
+	CODE=$(printf '%s' "$VPN_JSON" | curl -sS --max-time 30 -w '%{http_code}' -o /dev/null \
+		-X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+		--data-binary @- "${SERVER%/}/api/agent/vpn" 2>/dev/null) || CODE=000
+	[ "$CODE" = 200 ] ||
+		echo "warning: the hub did not record the deployment (HTTP $CODE); the node is running" >&2
+	return 0
+}
+
 if [ "$INIT" = openrc ]; then
 	cat >"$RC_FILE" <<RC
 #!/sbin/openrc-run
@@ -410,6 +462,7 @@ RC
 	sleep 3
 	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
 	rm -f "$BIN.old"
+	provision_vpn
 	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
 	exit 0
 fi
@@ -459,6 +512,7 @@ systemctl restart monitor-agent
 # Checked inside that window, so a batch run shows the failure on the machine
 # where it happened rather than a line reading "installed".
 sleep 3
-systemctl is-active --quiet monitor-agent || not_started "journalctl -u monitor-agent -n 20"
-rm -f "$BIN.old"
-echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"
+	systemctl is-active --quiet monitor-agent || not_started "journalctl -u monitor-agent -n 20"
+	rm -f "$BIN.old"
+	provision_vpn
+	echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"

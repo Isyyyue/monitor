@@ -1,8 +1,13 @@
-//! monitor-agent: reports system metrics to the hub and handles VPN deployment.
+//! monitor-agent: reports system metrics to the hub.
 //!
 //! Usage:
 //!   monitor-agent --server wss://hub.example.com/api/agent/ws --token TOKEN
 //!   MONITOR_SERVER=https://hub.example.com MONITOR_TOKEN=TOKEN monitor-agent --interval 1
+//!   monitor-agent provision --server 203.0.113.10 [--sni …] [--label …]
+//!
+//! VPN 的写入动作（装 sing-box、写 config、写订阅）已移出常驻服务，改由 `provision`
+//! 子命令承担，由安装器以 root 调用一次。**服务本身不再接受任何部署指令** ——
+//! 运行期不存在 root 指令通道，hub 被攻破也无法在本机执行任何东西。
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -14,6 +19,8 @@ use tokio_tungstenite::{
     tungstenite::{client::IntoClientRequest, Message},
 };
 use tracing::{error, info, warn};
+
+mod provision;
 
 /// Arguments also accept the environment written by install.sh.
 #[derive(Debug)]
@@ -108,19 +115,32 @@ fn parse_args() -> Result<Args> {
     )
 }
 
-/// System metrics collected from the host
+/// System metrics collected from the host.
+///
+/// The field names are the hub's contract: `agent_ws::report_fields()` derives the
+/// list it checks from `api::PUBLIC_METRICS`, and anything missing there is stored
+/// as zero and shown as zero. `net_rx`/`net_tx` are rates over the report interval,
+/// which the hub keeps as the minute's peak.
 #[derive(Debug, Serialize)]
 struct Metrics {
     boot_id: String,
     hostname: String,
+    uptime: u64,
     cpu: f32,
     load: [f32; 3],
     mem_total: u64,
     mem_used: u64,
+    swap_total: u64,
+    swap_used: u64,
     disk_total: u64,
     disk_used: u64,
+    net_rx: u64,
+    net_tx: u64,
     net_rx_total: u64,
     net_tx_total: u64,
+    tcp: u64,
+    udp: u64,
+    procs: u64,
 }
 
 fn boot_id() -> String {
@@ -135,7 +155,73 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-fn collect_metrics(sys: &mut sysinfo::System, ifaces: &[String]) -> Metrics {
+/// Seconds since boot. `/proc/uptime` is two floats; only the first is wanted.
+fn uptime() -> u64 {
+    std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().map(str::to_owned))
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map_or(0, |v| v as u64)
+}
+
+/// Established and listening sockets of one family, as `/proc/net` reports them.
+///
+/// The files carry a header line. A count rather than a state breakdown: the panel
+/// draws one figure per family, and reading the state column would mean parsing
+/// addresses this does not need.
+fn socket_count(paths: &[&str]) -> u64 {
+    paths
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .map(|body| body.lines().count().saturating_sub(1) as u64)
+        .sum()
+}
+
+/// Processes, counted from `/proc` rather than through `sysinfo`: the count is all
+/// the panel shows, and a full process refresh costs far more than a readdir.
+fn process_count() -> u64 {
+    std::fs::read_dir("/proc")
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()))
+                .count() as u64
+        })
+        .unwrap_or(0)
+}
+
+/// Turns two monotonic counters into a rate, remembering the previous reading.
+///
+/// The interval is measured with `Instant` rather than a wall clock: a rate divides
+/// by elapsed time, and an NTP step would make that negative. A counter that went
+/// backwards means the interface was reset, so the rate is reported as zero rather
+/// than as a huge number.
+#[derive(Default)]
+struct Rate {
+    last: Option<(u64, u64, std::time::Instant)>,
+}
+
+impl Rate {
+    fn measure(&mut self, rx: u64, tx: u64) -> (u64, u64) {
+        let now = std::time::Instant::now();
+        let out = match self.last {
+            Some((prx, ptx, at)) => {
+                let secs = now.duration_since(at).as_secs_f64();
+                if secs <= 0.0 || rx < prx || tx < ptx {
+                    (0, 0)
+                } else {
+                    (((rx - prx) as f64 / secs) as u64, ((tx - ptx) as f64 / secs) as u64)
+                }
+            }
+            None => (0, 0),
+        };
+        self.last = Some((rx, tx, now));
+        out
+    }
+}
+
+fn collect_metrics(sys: &mut sysinfo::System, ifaces: &[String], rate: &mut Rate) -> Metrics {
     sys.refresh_all();
 
     let cpu = sys.global_cpu_info().cpu_usage();
@@ -143,6 +229,8 @@ fn collect_metrics(sys: &mut sysinfo::System, ifaces: &[String]) -> Metrics {
 
     let mem_total = sys.total_memory();
     let mem_used = sys.used_memory();
+    let swap_total = sys.total_swap();
+    let swap_used = sys.used_swap();
 
     // Disks
     let disks = sysinfo::Disks::new_with_refreshed_list();
@@ -156,308 +244,200 @@ fn collect_metrics(sys: &mut sysinfo::System, ifaces: &[String]) -> Metrics {
         .iter()
         .filter(|(name, _)| ifaces.is_empty() || ifaces.iter().any(|wanted| wanted == *name))
         .fold((0, 0), |(r, t), (_, n)| (r + n.total_received(), t + n.total_transmitted()));
+    let (net_rx, net_tx) = rate.measure(rx, tx);
 
     Metrics {
         boot_id: boot_id(),
         hostname: hostname(),
+        uptime: uptime(),
         cpu,
         load: [load.one as f32, load.five as f32, load.fifteen as f32],
         mem_total,
         mem_used,
+        swap_total,
+        swap_used,
         disk_total,
         disk_used,
+        net_rx,
+        net_tx,
         net_rx_total: rx,
         net_tx_total: tx,
+        tcp: socket_count(&["/proc/net/tcp", "/proc/net/tcp6"]),
+        udp: socket_count(&["/proc/net/udp", "/proc/net/udp6"]),
+        procs: process_count(),
     }
 }
 
-/// JSON-RPC message from hub
+/// The slow-changing facts a node sends once, on connect.
+///
+/// The hub stores these in `node` and six of them go straight into the anonymous
+/// public frame. Its `save_facts` reads exactly these keys, and anything absent
+/// leaves the panel's row blank -- which is what an agent sending only its hostname
+/// produced.
+#[derive(Debug, Serialize)]
+struct Facts {
+    hostname: String,
+    os: String,
+    kernel: String,
+    arch: String,
+    virt: String,
+    cpu_name: String,
+    cpu_cores: u64,
+    mem_total: u64,
+    swap_total: u64,
+    disk_total: u64,
+    agent_version: String,
+    /// The machine's own addresses. See [`own_addresses`].
+    ipv4: String,
+    ipv6: String,
+}
+
+/// Whether an address is one the internet routes to.
+///
+/// A loopback or private address names no country, and reporting one would make the
+/// hub fall back to the connection address anyway -- which is the case this exists
+/// to cover.
+fn routable(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            // 100.64/10 is carrier-grade NAT: routable-looking, but not an address
+            // a geo database will know.
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || (o[0] == 100 && (64..128).contains(&o[1])))
+        }
+        IpAddr::V6(v6) => {
+            let head = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || head & 0xfe00 == 0xfc00 // unique-local
+                || head & 0xffc0 == 0xfe80) // link-local
+        }
+    }
+}
+
+/// The machine's own global addresses, at most one per family.
+///
+/// The hub attributes a country from these before it falls back to where the
+/// connection came from, and that fallback names nothing when the node reaches the
+/// hub through a reverse proxy -- which is the standard deployment, since the hub
+/// listens on loopback and nginx fronts it. Without this, every node behind a proxy
+/// is left without a country.
+fn own_addresses() -> (String, String) {
+    let (mut v4, mut v6) = (String::new(), String::new());
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return (v4, v6);
+    };
+    for iface in ifaces {
+        match iface.addr {
+            if_addrs::IfAddr::V4(a) if v4.is_empty() && routable(a.ip.into()) => {
+                v4 = a.ip.to_string();
+            }
+            if_addrs::IfAddr::V6(a) if v6.is_empty() && routable(a.ip.into()) => {
+                v6 = a.ip.to_string();
+            }
+            _ => {}
+        }
+    }
+    (v4, v6)
+}
+
+/// One `KEY="value"` line out of a shell-style environment file.
+fn env_field(path: &str, key: &str) -> String {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|body| {
+            body.lines()
+                .find_map(|l| l.strip_prefix(key))
+                .map(|v| v.trim_start_matches('=').trim().trim_matches('"').to_string())
+        })
+        .unwrap_or_default()
+}
+
+/// The container this runs in, from what the kernel and systemd expose.
+///
+/// Empty when none is detected on purpose: a virtual machine and bare metal look
+/// identical from inside, and labelling one as the other would put a wrong value
+/// on the panel where a blank one is merely unhelpful.
+fn container() -> String {
+    if let Ok(env) = std::fs::read("/proc/1/environ") {
+        let text = String::from_utf8_lossy(&env);
+        if let Some(v) = text.split('\0').find_map(|p| p.strip_prefix("container=")) {
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+    std::fs::read_to_string("/run/systemd/container").map(|s| s.trim().to_string()).unwrap_or_default()
+}
+
+/// The CPU model, from `/proc/cpuinfo` on either architecture's spelling.
+fn cpu_name() -> String {
+    std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|body| {
+            body.lines().find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                let k = k.trim();
+                matches!(k, "model name" | "Model" | "Hardware" | "cpu model").then(|| v.trim().to_string())
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn collect_facts(sys: &sysinfo::System) -> Facts {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let disk_total = disks.iter().fold(0, |t, d| t + d.total_space());
+    // Physical cores where the platform reports them, logical otherwise: the panel
+    // labels this "cores", and one figure has to serve both.
+    let cpu_cores = sys.physical_core_count().filter(|n| *n > 0).unwrap_or_else(|| sys.cpus().len()) as u64;
+
+    let (ipv4, ipv6) = own_addresses();
+
+    Facts {
+        hostname: hostname(),
+        os: env_field("/etc/os-release", "PRETTY_NAME"),
+        kernel: std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default(),
+        arch: std::env::consts::ARCH.to_string(),
+        virt: container(),
+        cpu_name: cpu_name(),
+        cpu_cores,
+        mem_total: sys.total_memory(),
+        swap_total: sys.total_swap(),
+        disk_total,
+        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        ipv4,
+        ipv6,
+    }
+}
+
+/// JSON-RPC message from hub。
+///
+/// 只有 `method`：`vpn.deploy` 分支删除后，唯一还会到达的是 `ping.tasks`，
+/// 而它尚未实现、参数也不用。等 ping.tasks 落地时再把 `params` 加回来。
 #[derive(Debug, Deserialize)]
 struct RpcMessage {
     method: String,
-    params: serde_json::Value,
-}
-
-/// Handle vpn.deploy command from hub
-async fn handle_vpn_deploy(_params: serde_json::Value) -> Result<serde_json::Value> {
-    info!("Received vpn.deploy command");
-
-    // 1. Check if running as root
-    let uid = unsafe { libc::getuid() };
-    if uid != 0 {
-        return Ok(json!({
-            "success": false,
-            "error": "vpn.deploy requires root privileges"
-        }));
-    }
-
-    // 2. Install sing-box if not present
-    if !std::path::Path::new("/usr/local/bin/sing-box").exists() {
-        info!("Installing sing-box...");
-        install_sing_box().await?;
-    }
-
-    // 3. Generate credentials
-    let uuid = generate_uuid()?;
-    let (reality_private, reality_public) = generate_reality_keypair()?;
-    let short_id = generate_short_id()?;
-    let hy2_password = generate_password()?;
-
-    // 4. Get server IP for links
-    let server_ip = get_server_ip().unwrap_or_else(|| "SERVER_IP".to_string());
-
-    // 5. Write sing-box config
-    let config = generate_singbox_config(&uuid, &reality_private, &short_id, &hy2_password);
-    std::fs::create_dir_all("/etc/sing-box")?;
-    std::fs::write("/etc/sing-box/config.json", config)?;
-
-    // 6. Generate self-signed cert for HY2
-    generate_self_signed_cert()?;
-
-    // 7. Create systemd service
-    let service = r#"[Unit]
-Description=sing-box VPN service
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-"#;
-    std::fs::write("/etc/systemd/system/sing-box.service", service)?;
-
-    // 8. Start service
-    for arguments in [
-        vec!["daemon-reload"],
-        vec!["enable", "sing-box"],
-        vec!["restart", "sing-box"],
-        vec!["is-active", "--quiet", "sing-box"],
-    ] {
-        let output = tokio::process::Command::new("systemctl")
-            .args(&arguments)
-            .output()
-            .await
-            .context("failed to run systemctl")?;
-        if !output.status.success() {
-            anyhow::bail!("systemctl {} failed", arguments.join(" "));
-        }
-    }
-
-    // 9. Generate links
-    let vless_link = format!(
-        "vless://{}@{}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.cloudflare.com&fp=chrome&pbk={}&sid={}#VLESS",
-        uuid, server_ip, reality_public, short_id
-    );
-    let hy2_link =
-        format!("hysteria2://{}@{}:443?insecure=1&sni=www.cloudflare.com#HY2", hy2_password, server_ip);
-
-    info!("VPN deployment completed");
-
-    Ok(json!({
-        "success": true,
-        "vless_link": vless_link,
-        "hy2_link": hy2_link,
-        "uuid": uuid,
-        "reality_public_key": reality_public,
-        "hy2_password": hy2_password,
-    }))
-}
-
-fn random_hex(bytes: usize) -> Result<String> {
-    let mut value = vec![0u8; bytes];
-    getrandom::getrandom(&mut value).map_err(|_| anyhow::anyhow!("OS randomness unavailable"))?;
-    Ok(value.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-fn generate_uuid() -> Result<String> {
-    let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).map_err(|_| anyhow::anyhow!("OS randomness unavailable"))?;
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]))
-}
-
-fn generate_reality_keypair() -> Result<(String, String)> {
-    // Use sing-box to generate reality keypair
-    let output = std::process::Command::new("/usr/local/bin/sing-box")
-        .args(["generate", "reality-keypair"])
-        .output()
-        .context("Failed to generate reality keypair")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut private = String::new();
-    let mut public = String::new();
-
-    for line in stdout.lines() {
-        if line.starts_with("PrivateKey:") {
-            private = line.replace("PrivateKey:", "").trim().to_string();
-        } else if line.starts_with("PublicKey:") {
-            public = line.replace("PublicKey:", "").trim().to_string();
-        }
-    }
-
-    if private.is_empty() || public.is_empty() {
-        anyhow::bail!("Failed to parse reality keypair");
-    }
-
-    Ok((private, public))
-}
-
-fn generate_short_id() -> Result<String> {
-    random_hex(4)
-}
-fn generate_password() -> Result<String> {
-    random_hex(32)
-}
-
-async fn install_sing_box() -> Result<()> {
-    info!("Downloading sing-box...");
-
-    // Detect architecture
-    let arch = std::env::consts::ARCH;
-    let sb_arch = match arch {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        _ => anyhow::bail!("Unsupported architecture: {}", arch),
-    };
-
-    // Get latest version (hardcode for now, or fetch from API)
-    let version = "1.14.2";
-    let url = format!(
-        "https://github.com/SagerNet/sing-box/releases/download/v{}/sing-box-{}-linux-{}.tar.gz",
-        version, version, sb_arch
-    );
-
-    // Download using curl
-    let output = tokio::process::Command::new("curl")
-        .args(["-fsSL", "-o", "/tmp/sing-box.tar.gz", &url])
-        .output()
-        .await
-        .context("Failed to download sing-box")?;
-
-    if !output.status.success() {
-        anyhow::bail!("curl failed to download sing-box");
-    }
-
-    // Extract
-    let output = tokio::process::Command::new("tar")
-        .args(["-xzf", "/tmp/sing-box.tar.gz", "-C", "/tmp"])
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        anyhow::bail!("Failed to extract sing-box");
-    }
-
-    // Install binary
-    let output = tokio::process::Command::new("sh")
-        .args([
-            "-c",
-            &format!(
-                "cp /tmp/sing-box-{0}-linux-{1}/sing-box /usr/local/bin/ && chmod +x /usr/local/bin/sing-box",
-                version, sb_arch
-            ),
-        ])
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        anyhow::bail!("Failed to install sing-box binary");
-    }
-
-    info!("sing-box installed successfully");
-    Ok(())
-}
-
-fn generate_singbox_config(uuid: &str, reality_private: &str, short_id: &str, hy2_password: &str) -> String {
-    json!({
-        "log": {"level": "info"},
-        "inbounds": [
-            {
-                "type": "vless",
-                "tag": "vless-in",
-                "listen": "::",
-                "listen_port": 443,
-                "users": [{"uuid": uuid, "flow": "xtls-rprx-vision"}],
-                "tls": {
-                    "enabled": true,
-                    "server_name": "www.cloudflare.com",
-                    "reality": {
-                        "enabled": true,
-                        "handshake": {"server": "www.cloudflare.com", "server_port": 443},
-                        "private_key": reality_private,
-                        "short_id": [short_id]
-                    }
-                }
-            },
-            {
-                "type": "hysteria2",
-                "tag": "hy2-in",
-                "listen": "::",
-                "listen_port": 443,
-                "users": [{"password": hy2_password}],
-                "tls": {
-                    "enabled": true,
-                    "alpn": ["h3"],
-                    "certificate_path": "/etc/sing-box/cert.pem",
-                    "key_path": "/etc/sing-box/key.pem"
-                }
-            }
-        ],
-        "outbounds": [{"type": "direct", "tag": "direct"}]
-    })
-    .to_string()
-}
-
-fn generate_self_signed_cert() -> Result<()> {
-    let output = std::process::Command::new("openssl")
-        .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-keyout",
-            "/etc/sing-box/key.pem",
-            "-out",
-            "/etc/sing-box/cert.pem",
-            "-days",
-            "3650",
-            "-nodes",
-            "-subj",
-            "/CN=www.cloudflare.com",
-        ])
-        .output()
-        .context("Failed to generate self-signed cert")?;
-
-    if !output.status.success() {
-        anyhow::bail!("openssl failed");
-    }
-
-    Ok(())
-}
-
-fn get_server_ip() -> Option<String> {
-    // Try to get public IP
-    std::process::Command::new("curl")
-        .args(["-s", "--max-time", "5", "https://api.ipify.org"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
-            } else {
-                None
-            }
-        })
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `provision` 是安装器以 root 调用的一次性动作，与常驻服务无关。
+    // 在起 tracing、连 hub 之前就分派掉。
+    if std::env::args().nth(1).as_deref() == Some("provision") {
+        return provision::run(provision::parse_args(std::env::args().skip(2))?);
+    }
+
     tracing_subscriber::fmt::init();
 
     let args = parse_args()?;
@@ -471,26 +451,27 @@ async fn main() -> Result<()> {
 
     let (mut write, mut read) = ws_stream.split();
 
-    // Send hello
+    let mut sys = sysinfo::System::new_all();
+
+    // Send hello: the facts the panel shows and never changes. Sent as a struct
+    // rather than a hand-written object so a renamed field is a compile error here
+    // rather than a blank column on the panel.
     let hello = json!({
         "jsonrpc": "2.0",
         "method": "hello",
-        "params": {
-            "hostname": hostname(),
-            "agent_version": env!("CARGO_PKG_VERSION"),
-        }
+        "params": collect_facts(&sys),
     });
     write.send(Message::Text(hello.to_string())).await?;
     info!("Sent hello");
 
-    let mut sys = sysinfo::System::new_all();
+    let mut rate = Rate::default();
     let mut interval = tokio::time::interval(args.interval);
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 // Send metrics report
-                let metrics = collect_metrics(&mut sys, &args.ifaces);
+                let metrics = collect_metrics(&mut sys, &args.ifaces, &mut rate);
                 let report = json!({
                     "jsonrpc": "2.0",
                     "method": "report",
@@ -510,23 +491,9 @@ async fn main() -> Result<()> {
                                     // TODO: Handle ping tasks
                                     info!("Received ping.tasks (not implemented)");
                                 }
-                                "vpn.deploy" => {
-                                    match handle_vpn_deploy(rpc.params).await {
-                                        Ok(result) => {
-                                            let response = json!({
-                                                "jsonrpc": "2.0",
-                                                "method": "vpn.result",
-                                                "params": result,
-                                            });
-                                            let _ = write.send(Message::Text(response.to_string())).await;
-                                        }
-                                        Err(e) => {
-                                            error!("vpn.deploy failed: {}", e);
-                                            let failure = json!({"jsonrpc":"2.0", "method":"vpn.result", "params":{"success":false,"error":"deployment failed; see agent log"}});
-                                            write.send(Message::Text(failure.to_string())).await?;
-                                        }
-                                    }
-                                }
+                                // `vpn.deploy` 曾在这里处理，需要 root 才能写 /etc 与调 systemctl。
+                                // 那条通道已删除：部署改由 `provision` 在安装期以 root 完成。
+                                // 这里刻意不保留任何等价分支 —— 运行期不得存在 root 指令通道。
                                 other => {
                                     warn!("Unknown method from hub: {}", other);
                                 }
@@ -553,17 +520,6 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn generated_credentials_have_uuid_v4_bits_and_independent_secrets() {
-        let uuid = generate_uuid().unwrap();
-        assert_eq!(uuid.len(), 36);
-        assert_eq!(&uuid[14..15], "4");
-        assert!(matches!(&uuid[19..20], "8" | "9" | "a" | "b"));
-        assert_eq!(generate_short_id().unwrap().len(), 8);
-        let first = generate_password().unwrap();
-        assert_eq!(first.len(), 64);
-        assert_ne!(first, generate_password().unwrap());
-    }
     #[test]
     fn request_contains_complete_handshake_and_bearer_auth() {
         let r = websocket_request("ws://localhost:28080/api/agent/ws", "audit-token").unwrap();
@@ -605,5 +561,125 @@ mod tests {
         );
         assert!(websocket_url("https://user:secret@example.com").is_err());
         assert!(websocket_url("https://example.com?token=t").is_err());
+    }
+
+    /// The rate divides by elapsed time, so the first reading has none to divide by,
+    /// and a counter that went backwards -- an interface reset -- must not become a
+    /// negative or an enormous figure.
+    #[test]
+    fn the_rate_needs_two_readings_and_survives_a_reset() {
+        let mut rate = Rate::default();
+        assert_eq!(rate.measure(1_000, 2_000), (0, 0), "第一次没有间隔可除");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let (rx, tx) = rate.measure(3_000, 4_000);
+        assert!(rx > 0 && tx > 0, "第二次应该算出速率，实得 {rx}/{tx}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(rate.measure(10, 20), (0, 0), "计数器回退说明接口重置，不能算成负数或巨大值");
+    }
+
+    /// The report has to carry every field the hub reads, or the panel shows a zero
+    /// with nothing in any log to say why. This is the list `agent_ws::report_fields`
+    /// checks on the other side; it is asserted here because that is the side that
+    /// can be changed without noticing.
+    #[test]
+    fn the_report_carries_every_field_the_hub_reads() {
+        let mut sys = sysinfo::System::new_all();
+        let mut rate = Rate::default();
+        let m = serde_json::to_value(collect_metrics(&mut sys, &[], &mut rate)).unwrap();
+        let obj = m.as_object().unwrap();
+        for key in [
+            "boot_id",
+            "net_rx_total",
+            "net_tx_total",
+            "uptime",
+            "cpu",
+            "load",
+            "mem_total",
+            "mem_used",
+            "swap_total",
+            "swap_used",
+            "disk_total",
+            "disk_used",
+            "net_rx",
+            "net_tx",
+            "tcp",
+            "udp",
+            "procs",
+        ] {
+            assert!(obj.contains_key(key), "缺 {key}：hub 要它，缺了面板显示 0");
+        }
+    }
+
+    /// The same argument for the facts `db::save_facts` stores on connect. Sending
+    /// only a hostname left the panel's system row blank and the country attributed
+    /// from the connection address instead of the machine's own.
+    #[test]
+    fn the_hello_carries_the_facts_the_hub_stores() {
+        let sys = sysinfo::System::new_all();
+        let f = serde_json::to_value(collect_facts(&sys)).unwrap();
+        let obj = f.as_object().unwrap();
+        for key in [
+            "hostname",
+            "os",
+            "kernel",
+            "arch",
+            "virt",
+            "cpu_name",
+            "cpu_cores",
+            "mem_total",
+            "swap_total",
+            "disk_total",
+            "agent_version",
+            "ipv4",
+            "ipv6",
+        ] {
+            assert!(obj.contains_key(key), "缺 {key}：hub 的 save_facts 读它");
+        }
+        assert!(obj["mem_total"].as_u64().unwrap() > 0, "内存总量要读得到");
+        assert!(!obj["os"].as_str().unwrap().is_empty(), "os 要读得到（/etc/os-release）");
+        assert!(obj["cpu_cores"].as_u64().unwrap() > 0, "核数要读得到");
+    }
+
+    /// The address filter: a loopback or private address names no country, and the
+    /// hub would fall back to the connection address -- which is `127.0.0.1` for
+    /// every node behind a reverse proxy, so nothing at all.
+    #[test]
+    fn only_routable_addresses_are_reported() {
+        use std::net::IpAddr;
+        for private in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "172.16.0.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+        ] {
+            assert!(!routable(private.parse::<IpAddr>().unwrap()), "{private} 不是全球可路由");
+        }
+        for public in ["50.114.172.226", "64.81.26.233", "2606:4700::1111"] {
+            assert!(routable(public.parse::<IpAddr>().unwrap()), "{public} 应该被上报");
+        }
+    }
+
+    /// The `/proc` readers, on the platform they are written for.
+    #[test]
+    fn the_proc_readers_answer_plausibly() {
+        assert!(uptime() > 0, "开机时长应大于 0");
+        assert!(process_count() >= 1, "至少有本进程");
+        assert!(!hostname().is_empty());
+        assert!(!boot_id().is_empty());
+
+        // The header line is not a socket, and a file that is not there counts as
+        // none rather than failing the report.
+        let dir = std::env::temp_dir().join(format!("sock-count-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("tcp");
+        std::fs::write(&f, "  sl  local_address rem_address\n0: 1 2\n1: 3 4\n").unwrap();
+        assert_eq!(socket_count(&[f.to_str().unwrap()]), 2, "表头不算");
+        assert_eq!(socket_count(&["/proc/net/does-not-exist"]), 0, "缺失的文件算 0");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

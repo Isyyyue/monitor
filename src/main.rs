@@ -495,7 +495,10 @@ async fn main() -> Result<()> {
         .route("/api/sessions/{id}", delete(api::delete_session))
         .route("/api/settings", get(api::settings).put(api::save_settings))
         .route("/api/change-password", post(api::change_password))
-        .route("/api/nodes/{id}/vpn-deploy", post(api::vpn_deploy))
+        // `/api/nodes/{id}/vpn-deploy` used to sit here. It told the node's agent to
+        // install sing-box, which required that agent to run as root. Provisioning
+        // is now an install-time action and the node reports the result itself, so
+        // the route is gone rather than left returning a message nothing reads.
         .route("/api/nodes/{id}/vpn", get(api::vpn_info))
         .route("/api/notify/test", post(notify::test))
         .route("/api/themes", get(api::themes))
@@ -533,6 +536,7 @@ async fn main() -> Result<()> {
             Router::new()
                 .route("/api/agent/ws", get(agent_ws::handler))
                 .route("/api/agent/register", post(api::agent_register))
+                .route("/api/agent/vpn", post(api::agent_vpn))
                 .route("/install.sh", get(install_script))
                 .route("/agent/{arch}", get(agent_binary))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))

@@ -1,6 +1,6 @@
 [package]
 name = "monitor-agent"
-version = "1.3.3"
+version = "1.4.0"
 edition = "2021"
 
 [[bin]]
@@ -21,3 +21,10 @@ url = "2"
 libc = "0.2"
 http = "1"
 getrandom = "0.2"
+# provision 用：订阅的 base64 与 REALITY 的 X25519 公钥推导。
+# 两者都是纯 Rust，不引入 C 依赖，与仓库现有的 argon2/sha2/rand 风格一致。
+base64 = "0.22"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+# hello 上报本机地址用。节点在反代后面时，hub 看到的来源是 127.0.0.1，
+# 只有接口上的地址能确定国家。
+if-addrs = "0.13"

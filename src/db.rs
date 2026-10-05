@@ -1217,12 +1217,15 @@ impl Db {
     /// False when no node has this id.
     pub fn delete_node(&self, id: i64) -> Result<bool> {
         let conn = self.conn();
-        // `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed
-        // for the chart query -- so it is cleared explicitly; the other history
-        // tables cascade. SQLite reassigns a deleted node's id to the next node
-        // created, which would otherwise inherit the removed machine's latency
-        // chart.
+        // `ping_record` and `vpn` carry no foreign key, so they are cleared here;
+        // the other history tables cascade. `ping_record` is WITHOUT ROWID and keyed
+        // for the chart query, and `vpn` predates the cascade the rest of the schema
+        // uses. SQLite reassigns a deleted node's id to the next node created, which
+        // would otherwise inherit the removed machine's latency chart -- and, for
+        // `vpn`, hand the next node the previous machine's links, uuid and
+        // subscription addresses.
         conn.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
+        conn.execute("DELETE FROM vpn WHERE node_id = ?1", [id])?;
         Ok(conn.execute("DELETE FROM node WHERE id = ?1", [id])? > 0)
     }
 
@@ -1344,10 +1347,15 @@ impl Db {
         let mut stmt = conn.prepare("SELECT vless_link, hy2_link, uuid, clash_sub_url, v2ray_sub_url, updated_at FROM vpn WHERE node_id=?1")?;
         let mut rows = stmt.query([node_id])?;
         if let Some(row) = rows.next()? {
+            // Every column is nullable in `vpn`, and `get` on a NULL with a `String`
+            // target is an `InvalidColumnType` error, not an empty string: a row
+            // written by hand, or by an agent that omitted a field, would fail the
+            // whole request. The two subscription columns were already read this
+            // way; the other three were not.
             Ok(Some(serde_json::json!({
-                "vless_link": row.get::<_, String>(0)?,
-                "hy2_link": row.get::<_, String>(1)?,
-                "uuid": row.get::<_, String>(2)?,
+                "vless_link": row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                "hy2_link": row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                "uuid": row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 "clash_sub_url": row.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 "v2ray_sub_url": row.get::<_, Option<String>>(4)?.unwrap_or_default(),
                 "updated_at": row.get::<_, i64>(5)?,
@@ -3283,6 +3291,61 @@ mod tests {
             db.ping_records(fresh, Span::minutes(0, 60)).unwrap().0.is_empty(),
             "and it starts with no history"
         );
+    }
+
+    /// A deleted node's VPN row goes with it.
+    ///
+    /// `vpn` predates the `ON DELETE CASCADE` the rest of the schema uses, and
+    /// SQLite hands the freed id to the next node created: without the sweep the
+    /// new machine would be served the removed one's links, uuid and subscription
+    /// addresses. `ping_record` was swept from the start; this table was missed.
+    #[test]
+    fn deleting_a_node_takes_its_vpn_row_with_it() {
+        let db = db();
+        let make = |name: &str| {
+            db.create_node(&Node { name: name.into(), ..Default::default() }, &format!("tok-{name}")).unwrap()
+        };
+        let id = make("a");
+        db.save_vpn_result(
+            id,
+            &serde_json::json!({
+                "success": true,
+                "vless_link": "vless://a",
+                "hy2_link": "hysteria2://a",
+                "uuid": "uuid-a",
+                "clash_sub_url": "http://a/sub.yaml",
+                "v2ray_sub_url": "http://a/v2.txt",
+            }),
+        )
+        .unwrap();
+        assert_eq!(db.get_vpn(id).unwrap().unwrap()["uuid"], "uuid-a");
+
+        assert!(db.delete_node(id).unwrap());
+        assert!(db.get_vpn(id).unwrap().is_none(), "删节点要带走 vpn 行");
+
+        let fresh = make("b");
+        assert_eq!(fresh, id, "the id is reused, which is what makes this reachable");
+        assert!(db.get_vpn(fresh).unwrap().is_none(), "新节点不该继承上一台的 VPN 记录");
+    }
+
+    /// Every column in `vpn` is nullable, and reading a NULL into a `String` is an
+    /// error rather than an empty string. A row written by hand -- an operator
+    /// correcting a link, which this deployment has needed -- used to fail the whole
+    /// request instead of answering with the columns it did hold. The two
+    /// subscription columns were already read as optional; the other three were not.
+    #[test]
+    fn a_vpn_row_with_null_columns_reads_back_as_empty() {
+        let db = db();
+        let id = db.create_node(&Node { name: "a".into(), ..Default::default() }, "tok-a").unwrap();
+        db.conn().execute(&format!("INSERT INTO vpn (node_id, updated_at) VALUES ({id}, 7)"), []).unwrap();
+
+        let vpn = db.get_vpn(id).unwrap().expect("the row is there");
+        assert_eq!(vpn["vless_link"], "");
+        assert_eq!(vpn["hy2_link"], "");
+        assert_eq!(vpn["uuid"], "");
+        assert_eq!(vpn["clash_sub_url"], "");
+        assert_eq!(vpn["v2ray_sub_url"], "");
+        assert_eq!(vpn["updated_at"], 7);
     }
 
     /// The mirror of the sweep above, on the other key of the same table. SQLite

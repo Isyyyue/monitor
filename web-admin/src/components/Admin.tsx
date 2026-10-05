@@ -2662,8 +2662,9 @@ sudo nginx -t && sudo systemctl reload nginx`
 function Deploy() {
   const [nodes, setNodes] = useState<any[]>([])
   const [vpnInfo, setVpnInfo] = useState<Record<number, any>>({})
-  const [deploying, setDeploying] = useState<number | null>(null)
-  const [showLinks, setShowLinks] = useState<number | null>(null)
+  // A set, not one id: the point of this page is comparing nodes, and a single
+  // slot made opening the second close the first.
+  const [open, setOpen] = useState<Set<number>>(new Set())
 
   const load = () => {
     api<{ nodes: any[] }>("/nodes").then((data) => {
@@ -2679,34 +2680,36 @@ function Deploy() {
   }
   useEffect(() => { load() }, [])
 
-  const doDeploy = async (id: number) => {
-    setDeploying(id)
-    try {
-      await api(`/nodes/${id}/vpn-deploy`, { method: "POST" })
-      toast.success("部署指令已发送，等待 agent 执行...")
-      // 轮询检查结果
-      setTimeout(load, 10000)
-    } catch (e) {
-      toast.error((e as Error).message)
-    } finally {
-      setDeploying(null)
-    }
+  const toggle = (id: number) => {
+    setOpen((old) => {
+      const next = new Set(old)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
   }
+
+  // sing-box and the subscription are written by `install.sh` on the node, as root,
+  // once. The hub has no way to ask a node to do anything, so this is the command
+  // that does it rather than a button that sends one.
+  const command = (n: any) =>
+    `curl -fsSL ${location.origin}/install.sh | sudo sh -s -- --upgrade --vpn-ip ${n.ip || "<节点公网IP>"}`
 
   return (
     <div className="space-y-4">
       <Card className="gap-4 p-5">
         <div>
-          <h3 className="text-sm font-medium">VPN 一键部署</h3>
+          <h3 className="text-sm font-medium">VPN 部署</h3>
           <p className="mt-1 text-xs text-muted-foreground">
-            通过 agent 在节点上自动安装 sing-box 并配置 VLESS + Hysteria2。节点必须在线且 agent 为新版。
+            sing-box 与订阅由安装器在节点上以 root 写一次，面板不再向节点下发指令。
+            复制下面的命令到节点上执行即可部署或重新部署；节点必须已装 agent。
           </p>
         </div>
         <div className="space-y-2">
           {nodes.map((n: any) => {
             const vpn = vpnInfo[n.id]
             const hasVpn = vpn && vpn.vless_link
-            const expanded = showLinks === n.id
+            const expanded = open.has(n.id)
             return (
               <div key={n.id} className="rounded-lg border p-3">
                 <div className="flex items-center justify-between">
@@ -2716,44 +2719,51 @@ function Deploy() {
                       {n.online ? "在线" : "离线"} · {hasVpn ? "已部署 VPN" : "未部署 VPN"}
                     </div>
                   </div>
-                  <div className="flex gap-2">
-                    {hasVpn ? (
-                      <Button size="sm" variant="outline" onClick={() => setShowLinks(expanded ? null : n.id)}>
-                        {expanded ? "关闭" : "查看链接"}
-                      </Button>
-                    ) : (
-                      <Button
-                        size="sm"
-                        disabled={!n.online || deploying === n.id}
-                        onClick={() => doDeploy(n.id)}
-                      >
-                        {deploying === n.id ? "部署中..." : "一键部署 VPN"}
-                      </Button>
-                    )}
-                  </div>
+                  <Button size="sm" variant="outline" onClick={() => toggle(n.id)}>
+                    {expanded ? "关闭" : hasVpn ? "查看链接" : "部署命令"}
+                  </Button>
                 </div>
-                {expanded && hasVpn && (
+                {expanded && (
                   <div className="mt-3 space-y-3 border-t pt-3">
-                    {vpn.clash_sub_url && (
-                      <Field label="Clash 订阅">
-                        <div className="flex gap-2">
-                          <div className="flex-1 rounded-md border bg-muted/50 p-2 font-mono text-xs break-all">
-                            {vpn.clash_sub_url}
-                          </div>
-                          <Button size="sm" onClick={() => { navigator.clipboard.writeText(vpn.clash_sub_url); toast.success("已复制") }}>复制</Button>
-                        </div>
-                      </Field>
+                    {hasVpn ? (
+                      <>
+                        {vpn.clash_sub_url && (
+                          <Field label="Clash 订阅">
+                            <div className="flex gap-2">
+                              <div className="flex-1 rounded-md border bg-muted/50 p-2 font-mono text-xs break-all">
+                                {vpn.clash_sub_url}
+                              </div>
+                              <Button size="sm" onClick={() => { navigator.clipboard.writeText(vpn.clash_sub_url); toast.success("已复制") }}>复制</Button>
+                            </div>
+                          </Field>
+                        )}
+                        {vpn.v2ray_sub_url && (
+                          <Field label="v2rayN 订阅">
+                            <div className="flex gap-2">
+                              <div className="flex-1 rounded-md border bg-muted/50 p-2 font-mono text-xs break-all">
+                                {vpn.v2ray_sub_url}
+                              </div>
+                              <Button size="sm" onClick={() => { navigator.clipboard.writeText(vpn.v2ray_sub_url); toast.success("已复制") }}>复制</Button>
+                            </div>
+                          </Field>
+                        )}
+                      </>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">
+                        该节点尚未部署 VPN。在节点上执行下面的命令即可。
+                      </p>
                     )}
-                    {vpn.v2ray_sub_url && (
-                      <Field label="v2rayN 订阅">
-                        <div className="flex gap-2">
-                          <div className="flex-1 rounded-md border bg-muted/50 p-2 font-mono text-xs break-all">
-                            {vpn.v2ray_sub_url}
-                          </div>
-                          <Button size="sm" onClick={() => { navigator.clipboard.writeText(vpn.v2ray_sub_url); toast.success("已复制") }}>复制</Button>
+                    <Field label="部署命令">
+                      <div className="flex gap-2">
+                        <div className="flex-1 rounded-md border bg-muted/50 p-2 font-mono text-xs break-all">
+                          {command(n)}
                         </div>
-                      </Field>
-                    )}
+                        <Button size="sm" onClick={() => { navigator.clipboard.writeText(command(n)); toast.success("已复制") }}>复制</Button>
+                      </div>
+                    </Field>
+                    <p className="text-xs text-muted-foreground">
+                      重新执行会复用节点上已有的凭据，已发出的链接不受影响。
+                    </p>
                   </div>
                 )}
               </div>

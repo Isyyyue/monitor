@@ -2036,21 +2036,43 @@ pub async fn change_password(
     }
 }
 
-/// Trigger VPN deployment on a node via its agent.
-pub async fn vpn_deploy(_: Admin, State(app): State<Shared>, Path(node_id): Path<i64>) -> Response {
-    if crate::agent_ws::send_vpn_deploy(&app, node_id) {
-        Json(json!({"ok": true, "message": "部署指令已发送"})).into_response()
-    } else {
-        answer(StatusCode::BAD_REQUEST, "节点不在线，无法发送部署指令")
-    }
-}
-
 /// Get VPN info for a node.
 pub async fn vpn_info(_: Admin, State(app): State<Shared>, Path(node_id): Path<i64>) -> Response {
     match app.db.get_vpn(node_id) {
         Ok(Some(vpn)) => Json(vpn).into_response(),
         Ok(None) => answer(StatusCode::NOT_FOUND, "该节点尚未部署 VPN").into_response(),
         Err(e) => fail(e).into_response(),
+    }
+}
+
+/// Records what a node's `provision` step produced.
+///
+/// The caller is `install.sh` on the node, right after `monitor-agent provision`
+/// has written the sing-box config and the subscription files: it sends the JSON
+/// that command printed. The node's own token is the credential — the same one
+/// the agent handshake uses — so a machine can only ever report for itself, and
+/// an unknown or malformed token gets the same 401.
+///
+/// This replaced the `vpn.deploy` / `vpn.result` pair that used to travel over the
+/// agent's WebSocket. Provisioning now happens once, at install time, under the
+/// installer's root; the hub can no longer ask a node to do anything, and this
+/// route only records the outcome. `save_vpn_result` keeps the previous row when
+/// `success` is not true, so a failed run never blanks a working deployment.
+pub async fn agent_vpn(State(app): State<Shared>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    let Some(token) = crate::agent_ws::bearer(&headers) else {
+        return answer(StatusCode::UNAUTHORIZED, "missing token");
+    };
+    let Ok(Some(node_id)) = app.db.node_by_token(token) else {
+        return answer(StatusCode::UNAUTHORIZED, "invalid token");
+    };
+    match app.db.save_vpn_result(node_id, &body) {
+        Ok(()) => {
+            // The admin frame carries the links, so a cached one would keep showing
+            // the previous deployment's addresses.
+            invalidate_snapshot(&app);
+            Json(json!({"ok": true})).into_response()
+        }
+        Err(e) => fail(e),
     }
 }
 
@@ -3180,6 +3202,63 @@ mod tests {
         assert_eq!(close_register(Admin, State(app.clone())).await.status(), StatusCode::NO_CONTENT);
         assert_eq!(register(Some(&key), "c").await.status(), StatusCode::FORBIDDEN);
         assert_eq!(app.db.nodes().unwrap().len(), 1);
+    }
+
+    /// A node records its own provisioning result, and only its own.
+    ///
+    /// `install.sh` posts what `monitor-agent provision` printed; the node token is
+    /// the credential. The point of the route is that the hub never asks a node to
+    /// do anything — it only receives.
+    #[tokio::test]
+    async fn a_node_records_its_own_provisioning_result_and_no_other() {
+        let app = std::sync::Arc::new(app());
+        let mine = node(&app, "mine", true);
+        let other = node(&app, "other", true);
+
+        let post = |token: Option<String>, body: Value| {
+            let app = app.clone();
+            async move {
+                let mut headers = HeaderMap::new();
+                if let Some(t) = token {
+                    headers.insert("authorization", format!("Bearer {t}").parse().unwrap());
+                }
+                agent_vpn(State(app), headers, Json(body)).await
+            }
+        };
+        let report = |uuid: &str| {
+            json!({
+                "success": true,
+                "vless_link": format!("vless://{uuid}@203.0.113.10:443?pbk=P&sid=S#N-VLESS"),
+                "hy2_link": "hysteria2://H@203.0.113.10:443?sni=panel.example.com#N-HY2",
+                "uuid": uuid,
+                "clash_sub_url": "http://203.0.113.10/sub-aaa.yaml",
+                "v2ray_sub_url": "http://203.0.113.10/v2-bbb.txt",
+            })
+        };
+
+        // No token, and a token that opens nothing, get the same refusal.
+        assert_eq!(post(None, report("u1")).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(post(Some("guess".into()), report("u1")).await.status(), StatusCode::UNAUTHORIZED);
+        assert!(app.db.get_vpn(mine).unwrap().is_none());
+
+        // A node's token writes that node's row and no other.
+        assert_eq!(post(Some("token-of-mine".into()), report("u1")).await.status(), StatusCode::OK);
+        let saved = app.db.get_vpn(mine).unwrap().expect("the node's own row");
+        assert_eq!(saved["uuid"], "u1");
+        assert_eq!(saved["clash_sub_url"], "http://203.0.113.10/sub-aaa.yaml");
+        assert!(app.db.get_vpn(other).unwrap().is_none(), "另一个节点的行不该被写");
+
+        // A failed run keeps the row already there: the route records an outcome,
+        // it does not blank a working deployment.
+        assert_eq!(
+            post(Some("token-of-mine".into()), json!({"success": false, "error": "boom"})).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(app.db.get_vpn(mine).unwrap().unwrap()["uuid"], "u1");
+
+        // A rerun replaces the row rather than adding one.
+        assert_eq!(post(Some("token-of-mine".into()), report("u2")).await.status(), StatusCode::OK);
+        assert_eq!(app.db.get_vpn(mine).unwrap().unwrap()["uuid"], "u2");
     }
 
     /// A rerun of the batch command on a registered machine keeps its node, also

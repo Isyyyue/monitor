@@ -4,7 +4,7 @@
 
 Hub 使用 Rust、axum 和 SQLite，管理后台使用 React 和 TypeScript，公开状态页通过主题提供。后台与默认主题嵌入 Hub 二进制，运行 Hub 不需要额外的 Node.js 服务或独立数据库服务。
 
-本项目基于 [monitor-probe/monitor](https://github.com/monitor-probe/monitor) 开发，增加了定制后台、自研 Agent 和 VPN 部署模块。VPN 部署模块包含指令下发和结果回传；订阅服务及完整安装验收仍需完善，具体状态见下文。
+本项目基于 [monitor-probe/monitor](https://github.com/monitor-probe/monitor) 开发，增加了定制后台、自研 Agent 和 VPN 部署模块。VPN 的安装与配置由安装器在节点上以 root 完成一次，节点把结果回报给面板；Hub 不向节点下发任何指令。具体状态见下文。
 
 ## 能做什么
 
@@ -15,7 +15,7 @@ Hub 使用 Rust、axum 和 SQLite，管理后台使用 React 和 TypeScript，�
 - 管理节点名称、排序、公开状态及备注；私有节点不出现在公开列表中。
 - 为每个节点设置独立 token，并支持轮换 token、批量编辑及安装注册窗口。
 
-Hub 支持的指标与节点实际显示的数据取决于 Agent 上报的字段。仓库内自研 Agent 目前提供一部分指标；不能把 Hub 支持的全部字段等同于 Agent 已上报的字段。
+Hub 依赖的字段就是仓库内自研 Agent 上报的字段。两侧由同一份清单约束：Hub 侧据此检查每一份报告，Agent 侧有测试断言每一个字段都在——改名会在测试期失败，而不是让面板静默显示 0。
 
 ### 流量与服务器账单
 
@@ -72,28 +72,41 @@ Hub 支持的指标与节点实际显示的数据取决于 Agent 上报的字段
 | 主题 | 安装、预览、切换、更新和主题配置 |
 | 安全 | 密码修改、登录会话管理 |
 | 网站 | 域名访问状态与 nginx HTTPS 反向代理配置示例 |
-| 部署 | 向在线节点发送 VPN 部署指令，查看已保存的部署信息（订阅服务尚未提供） |
+| 部署 | 查看各节点的部署状态与订阅地址，复制重新部署的命令 |
 
 密码修改页面要求验证旧密码。网站页面生成的是供管理员执行的配置说明，并不会自动修改服务器 DNS、安装 nginx 或申请证书。
 
-## VPN 部署模块与当前边界
+## VPN 部署模块
 
-这个模块的目标是从后台选择在线节点，通过 Agent 安装 sing-box，配置 VLESS + REALITY 和 Hysteria2，最终提供 Clash 与 v2rayN 订阅。
+模块的目标是：在节点上装好 sing-box、配置 VLESS + REALITY 与 Hysteria2，并生成 Clash 与 v2rayN 订阅。
 
-当前源码已包含：
+**部署由安装器完成，不由 Hub 下发。** `install.sh` 在节点上以 root 运行一次，调用
+`monitor-agent provision` 写入配置与订阅，再把结果 `POST` 到 Hub 的 `/api/agent/vpn`，
+用节点自己的 token 鉴权。Hub 只能收，不能叫节点做事——自研 Agent 的常驻服务里没有任何
+部署分支，因此它也不需要以 root 常驻。
 
-- 后台部署页面与管理员部署 API。
-- Hub 向节点发送 `vpn.deploy` 指令的通道。
-- 自研 Agent 中的 sing-box 安装、凭据生成、配置文件及 systemd 服务写入逻辑。
-- VLESS/TCP 443、Hysteria2/UDP 443 的配置生成，以及部署信息的数据库字段和读取 API。
+`provision` 的要点：
 
-本次发行补齐了 Agent 的 Bearer 鉴权、WebSocket 握手、安装器环境变量读取和 HTTPS 连接支持；Hub 已接入 `vpn.result` 的保存逻辑。部署请求成功表示指令已经发送，实际部署结果仍需等待 Agent 回传。
+- sing-box 从官方包源安装（`deb.sagernet.org`），使用包自带的 systemd 单元，可 `apt upgrade`。
+- **凭据由已有的 config 派生**：重跑复用其中的 uuid、REALITY 私钥与 short_id，
+  链接里的公钥由私钥推导，因此重跑不会改变已经发出去的链接。
+- 订阅三件套（Clash yaml 带 proxy-group 与分流规则、v2rayN txt、v2rayN b64）由同一份凭据生成；
+  路径记在 `/var/lib/sing-box/subscription.json`，供重跑复用。
+
+重新部署在节点上执行面板给出的命令即可：
+
+```bash
+curl -fsSL https://<面板地址>/install.sh | sudo sh -s -- --upgrade --vpn-ip <节点公网地址>
+```
 
 目前的边界：
 
-- **订阅服务尚未提供**：后台和数据库预留了 Clash、v2rayN 订阅地址，但自研 Agent 当前只生成单节点链接。已有独立订阅服务不由此模块自动接管，也不能凭空生成可用订阅地址。
-- **系统服务必须实测**：回执处理与数据保存的验证不能替代目标机器上的 sing-box 启动、实际代理连接和订阅验收。
-- **现有配置不会自动迁移**：部署代码会写入 `/etc/sing-box/config.json`、证书和 `sing-box.service`，需要 root 与 systemd；它不是保留现有代理配置的升级工具。
+- **订阅由节点自己伺服**：`provision` 把三件套写到 `/var/www/sub/`，由节点上的 nginx 提供。
+  已有的独立订阅服务不由此模块自动接管。
+- **真实连通需要实测**：仓库内的测试覆盖内容生成与 Hub 侧的收发，不覆盖目标机器上的
+  sing-box 启动与实际代理连接。
+- **凭据默认不轮换**：重跑复用现有凭据是刻意的。需要轮换时，先删掉节点上的
+  `/etc/sing-box/config.json` 再执行。
 
 独立运行的既有 VPN 或订阅服务，与本仓库这一部署模块的完成程度应分别判断。
 
@@ -116,12 +129,14 @@ Hub 与 Agent 是两个独立进程，运行在不同角色的机器上。本地
 ```mermaid
 flowchart LR
     A[Linux 节点 / 兼容监控 Agent] -->|指标与探测结果| H[Monitor Hub]
+    A -->|POST /api/agent/vpn · 节点 token| H
     H --> D[(SQLite)]
     H --> P[公开状态页]
     H --> M[管理后台]
     H --> T[Telegram]
-    M -->|部署请求| H
-    H -.->|vpn.deploy / vpn.result| V[自研 Agent / sing-box]
+    M -.->|复制部署命令| I[install.sh · 在节点上以 root 运行一次]
+    I -->|monitor-agent provision| V[sing-box + 订阅三件套]
+    V -->|nginx 伺服| S[订阅地址]
     Q[Python 代理探针] -->|延迟样本| D
 ```
 
@@ -129,7 +144,7 @@ flowchart LR
 
 ### 环境要求
 
-Hub 和 Agent 以 Linux 为目标环境；Windows 开发可使用 WSL。Hub 的安装器使用 systemd，监控 Agent 安装脚本另包含 OpenRC 支持；自研 Agent 的 VPN 部署逻辑当前依赖 systemd。
+Hub 和 Agent 以 Linux 为目标环境；Windows 开发可使用 WSL。Hub 的安装器使用 systemd，监控 Agent 安装脚本另包含 OpenRC 支持。`provision` 需要包管理器与 systemd，在 systemd 的机器上运行。
 
 源码构建需要 Rust stable、C 编译工具、Node.js 24 / npm，以及 curl、tar、sha256sum 等工具。Node.js 用于构建后台，Hub 运行时不依赖它。初次构建需要访问依赖仓库及默认主题下载地址。
 
@@ -187,7 +202,9 @@ cd agent
 cargo build --release --locked
 ```
 
-产物是 `agent/target/release/monitor-agent`。这只完成编译；部署前仍应按上文的功能边界验证目标机器。安装器通过 `MONITOR_SERVER`、`MONITOR_TOKEN` 和可选的 `MONITOR_IFACE` 传递配置；也可显式使用 `--server`、`--token`、`--interval` 与 `--iface`。自研 Agent 的 HTTPS 连接要求可信证书，不支持 `--insecure`。
+产物是 `agent/target/release/monitor-agent`。同一个二进制有两个入口：不带子命令时是常驻的指标上报服务，`provision` 子命令则由安装器以 root 调用一次，用于写入 sing-box 配置与订阅。
+
+安装器通过 `MONITOR_SERVER`、`MONITOR_TOKEN` 和可选的 `MONITOR_IFACE` 传递配置；也可显式使用 `--server`、`--token`、`--interval` 与 `--iface`。`install.sh` 另有 `--vpn-ip ADDRESS`（本机公网地址，缺省时自行查询）与 `--no-vpn`（只装监控、不部署 VPN）。自研 Agent 的 HTTPS 连接要求可信证书，不支持 `--insecure`。
 
 ### Hub 常用参数
 
@@ -206,7 +223,7 @@ cargo build --release --locked
 - 管理后台使用密码和服务端会话；密码以 Argon2 哈希保存，并有限制登录失败的机制。
 - 监控 Agent 主动连接 Hub，不需要开放用于接收 Hub 请求的独立管理端口；节点以独立 token 鉴权。
 - 公开 API 与管理员 API 分开，公开节点视图过滤 token、备注等管理字段。
-- VPN 部署模块允许 Hub 经现有连接下发具有系统修改能力的指令，因此启用这一模块后，Hub 与具备 root 权限的 Agent 必须按管理入口保护。
+- VPN 的写入由安装器在节点上以 root 完成，Hub 侧没有下发指令的能力；节点只通过 `/api/agent/vpn` 上报结果，且只能上报自己。面板与 Hub 仍应按管理入口保护——部署命令里含节点 token。
 - 第三方主题在站点中运行，应仅安装可信来源的主题。VPN 链接、订阅地址、Bot Token 和节点 token 均应作为凭据保管。
 
 ## 开发检查

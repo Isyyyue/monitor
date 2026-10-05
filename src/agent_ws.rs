@@ -848,19 +848,13 @@ pub fn push_ping_tasks(app: &App) {
     }
 }
 
-/// Send vpn.deploy command to a specific node's agent.
-/// Returns true if the node is connected and the message was queued.
-pub fn send_vpn_deploy(app: &App, node_id: i64) -> bool {
-    let sender =
-        app.agents.read().unwrap_or_else(|e| e.into_inner()).get(&node_id).map(|agent| agent.tx.clone());
-
-    if let Some(tx) = sender {
-        let msg = json!({"jsonrpc": "2.0", "method": "vpn.deploy", "params": {}}).to_string();
-        tx.try_send(msg).is_ok()
-    } else {
-        false
-    }
-}
+// `send_vpn_deploy` used to live here: a JSON-RPC `vpn.deploy` notification that
+// told a node's agent to install sing-box and rewrite its config. The agent had to
+// run as root for that, which made the hub a root path into every node.
+//
+// Provisioning now happens once, at install time, under `install.sh`'s root, and
+// the node reports the result over HTTP (`POST /api/agent/vpn`). Nothing on this
+// side can ask a node to do anything, so there is no function here to do it with.
 
 #[cfg(test)]
 mod tests {
