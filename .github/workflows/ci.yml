@@ -57,6 +57,6 @@ jobs:
       # between the two repositories, and what the public view withholds.
       - run: cargo build
       - run: |
-          curl -fsSL -o agent https://github.com/monitor-probe/agent/releases/latest/download/monitor-agent-x86_64-unknown-linux-musl
-          chmod +x agent
-      - run: scripts/e2e.sh target/debug/monitor-hub ./agent
+          curl -fsSL --retry 3 -o target/upstream-monitor-agent https://github.com/monitor-probe/agent/releases/latest/download/monitor-agent-x86_64-unknown-linux-musl
+          chmod +x target/upstream-monitor-agent
+      - run: scripts/e2e.sh target/debug/monitor-hub target/upstream-monitor-agent
