@@ -1,0 +1,17 @@
+[Unit]
+Description=Proxy latency prober (VLESS/HY2)
+After=network.target probe-singbox.service
+Requires=probe-singbox.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/probe/probe.py
+Restart=always
+RestartSec=10
+# Optional: override defaults
+# Environment="PROBE_TARGETS=vless:18083:1:1,hy2:18084:1:2"
+# Environment="PROBE_INTERVAL=60"
+# Environment="PROBE_DB=/opt/monitor/data/monitor.db"
+
+[Install]
+WantedBy=multi-user.target

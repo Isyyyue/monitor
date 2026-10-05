@@ -1,0 +1,127 @@
+{
+    "inbounds": [
+        {
+            "listen": "127.0.0.1",
+            "listen_port": 18083,
+            "tag": "in-vless-1",
+            "type": "http"
+        },
+        {
+            "listen": "127.0.0.1",
+            "listen_port": 18084,
+            "tag": "in-hy2-1",
+            "type": "http"
+        },
+        {
+            "listen": "127.0.0.1",
+            "listen_port": 18085,
+            "tag": "in-vless-2",
+            "type": "http"
+        },
+        {
+            "listen": "127.0.0.1",
+            "listen_port": 18086,
+            "tag": "in-hy2-2",
+            "type": "http"
+        }
+    ],
+    "log": {
+        "level": "warn"
+    },
+    "outbounds": [
+        {
+            "flow": "xtls-rprx-vision",
+            "server": "YOUR_SERVER_IP",
+            "server_port": 443,
+            "tag": "vless-1",
+            "tls": {
+                "enabled": true,
+                "reality": {
+                    "enabled": true,
+                    "public_key": "YOUR_REALITY_PUBLIC_KEY",
+                    "short_id": "YOUR_SHORT_ID"
+                },
+                "server_name": "www.cloudflare.com",
+                "utls": {
+                    "enabled": true,
+                    "fingerprint": "chrome"
+                }
+            },
+            "type": "vless",
+            "uuid": "YOUR_VLESS_UUID"
+        },
+        {
+            "password": "YOUR_HY2_PASSWORD",
+            "server": "YOUR_SERVER_IP",
+            "server_port": 443,
+            "tag": "hy2-1",
+            "tls": {
+                "enabled": true,
+                "insecure": true,
+                "server_name": "YOUR_SERVER_NAME"
+            },
+            "type": "hysteria2"
+        },
+        {
+            "flow": "xtls-rprx-vision",
+            "server": "YOUR_SERVER_IP_2",
+            "server_port": 443,
+            "tag": "vless-2",
+            "tls": {
+                "enabled": true,
+                "reality": {
+                    "enabled": true,
+                    "public_key": "YOUR_REALITY_PUBLIC_KEY_2",
+                    "short_id": "YOUR_SHORT_ID_2"
+                },
+                "server_name": "www.cloudflare.com",
+                "utls": {
+                    "enabled": true,
+                    "fingerprint": "chrome"
+                }
+            },
+            "type": "vless",
+            "uuid": "YOUR_VLESS_UUID_2"
+        },
+        {
+            "password": "YOUR_HY2_PASSWORD_2",
+            "server": "YOUR_SERVER_IP_2",
+            "server_port": 443,
+            "tag": "hy2-2",
+            "tls": {
+                "enabled": true,
+                "insecure": true,
+                "server_name": "YOUR_SERVER_NAME_2"
+            },
+            "type": "hysteria2"
+        }
+    ],
+    "route": {
+        "rules": [
+            {
+                "inbound": [
+                    "in-vless-1"
+                ],
+                "outbound": "vless-1"
+            },
+            {
+                "inbound": [
+                    "in-hy2-1"
+                ],
+                "outbound": "hy2-1"
+            },
+            {
+                "inbound": [
+                    "in-vless-2"
+                ],
+                "outbound": "vless-2"
+            },
+            {
+                "inbound": [
+                    "in-hy2-2"
+                ],
+                "outbound": "hy2-2"
+            }
+        ]
+    }
+}
