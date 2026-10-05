@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "monitor-agent"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "base64",
