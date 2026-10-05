@@ -402,6 +402,14 @@ fn migrate_to_12(conn: &Connection) -> Result<()> {
 }
 
 fn migrate_to_13(conn: &Connection) -> Result<()> {
+    // Restoring an older backup does not run SCHEMA first.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS vpn (
+        node_id INTEGER PRIMARY KEY,
+        vless_link TEXT, hy2_link TEXT, uuid TEXT,
+        updated_at INTEGER NOT NULL
+    );",
+    )?;
     add_column(conn, "vpn", "clash_sub_url TEXT")?;
     add_column(conn, "vpn", "v2ray_sub_url TEXT")
 }
@@ -1298,14 +1306,14 @@ impl Db {
         if !success {
             return Ok(());
         }
-        
+
         let vless_link = params.get("vless_link").and_then(|v| v.as_str()).unwrap_or("");
         let hy2_link = params.get("hy2_link").and_then(|v| v.as_str()).unwrap_or("");
         let uuid = params.get("uuid").and_then(|v| v.as_str()).unwrap_or("");
         let clash_sub_url = params.get("clash_sub_url").and_then(|v| v.as_str()).unwrap_or("");
         let v2ray_sub_url = params.get("v2ray_sub_url").and_then(|v| v.as_str()).unwrap_or("");
         let now = chrono::Utc::now().timestamp();
-        
+
         let conn = self.conn();
         conn.execute(
             "INSERT INTO vpn (node_id, vless_link, hy2_link, uuid, clash_sub_url, v2ray_sub_url, updated_at)
@@ -1317,7 +1325,15 @@ impl Db {
                clash_sub_url=excluded.clash_sub_url,
                v2ray_sub_url=excluded.v2ray_sub_url,
                updated_at=excluded.updated_at",
-            [node_id.to_string(), vless_link.to_string(), hy2_link.to_string(), uuid.to_string(), clash_sub_url.to_string(), v2ray_sub_url.to_string(), now.to_string()],
+            [
+                node_id.to_string(),
+                vless_link.to_string(),
+                hy2_link.to_string(),
+                uuid.to_string(),
+                clash_sub_url.to_string(),
+                v2ray_sub_url.to_string(),
+                now.to_string(),
+            ],
         )?;
         Ok(())
     }

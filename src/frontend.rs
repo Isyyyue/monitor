@@ -25,15 +25,6 @@ struct AdminAssets;
 #[folder = "target/theme/dist"]
 struct DefaultThemeAssets;
 
-/// The built-in theme's thumbnail, which sits beside `theme.json` rather than
-/// inside `dist/` and so is not among the assets above. The file is optional in
-/// a theme package: a package without one embeds nothing here and the panel
-/// shows the card without an image.
-#[derive(RustEmbed)]
-#[folder = "target/theme"]
-#[include = "preview.png"]
-struct DefaultPreview;
-
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Theme {
     pub name: String,

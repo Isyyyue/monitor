@@ -22,6 +22,8 @@ jobs:
       - if: startsWith(github.ref, 'refs/tags/')
         run: |
           V=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+          A=v$(sed -n 's/^version = "\(.*\)"/\1/p' agent/Cargo.toml)
+          [ "$V" = "$A" ] || { echo "::error::hub and agent versions disagree"; exit 1; }
           [ "$GITHUB_REF_NAME" = "$V" ] || { echo "::error::tag $GITHUB_REF_NAME, Cargo.toml $V"; exit 1; }
 
       # The default theme arrives as a published archive, verified against the
@@ -47,12 +49,17 @@ jobs:
       - run: cargo install --locked cross
       - run: cross build --release --locked --target ${{ matrix.target }}
 
-      - run: cp "target/${{ matrix.target }}/release/monitor-hub" "monitor-hub-${{ matrix.target }}"
+      - run: cross build --release --locked --target ${{ matrix.target }} --manifest-path agent/Cargo.toml --target-dir target/agent
+      - run: |
+          cp "target/${{ matrix.target }}/release/monitor-hub" "monitor-hub-${{ matrix.target }}"
+          cp "target/agent/${{ matrix.target }}/release/monitor-agent" "monitor-agent-${{ matrix.target }}"
 
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
-          path: monitor-hub-${{ matrix.target }}
+          path: |
+            monitor-hub-${{ matrix.target }}
+            monitor-agent-${{ matrix.target }}
 
   release:
     needs: build
@@ -82,9 +89,9 @@ jobs:
       # script a release was tested with is the one it is measured against.
       - if: startsWith(github.ref, 'refs/tags/')
         run: |
-          cp install-hub.sh bin/
-          (cd bin && sha256sum monitor-hub-* install-hub.sh > sha256sums.txt)
-          gh release create "$GITHUB_REF_NAME" bin/monitor-hub-* bin/install-hub.sh bin/sha256sums.txt \
+          cp install-hub.sh install.sh bin/
+          (cd bin && sha256sum monitor-hub-* monitor-agent-* install-hub.sh install.sh > sha256sums.txt)
+          gh release create "$GITHUB_REF_NAME" bin/monitor-hub-* bin/monitor-agent-* bin/install-hub.sh bin/install.sh bin/sha256sums.txt \
             --generate-notes --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}

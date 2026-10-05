@@ -16,6 +16,12 @@ read -r TAG SHA <web-theme.pin || true
 [ -n "${TAG:-}" ] && [ -n "${SHA:-}" ] ||
   { echo "web-theme.pin must hold '<tag> <sha256>'" >&2; exit 1; }
 DEST=target/theme
+# Already unpacked at this pin. A theme placed here manually with a matching
+# stamp is also left alone, which is how an unreleased theme is built against.
+if [ -f "$DEST/.pin" ] && [ "$(cat "$DEST/.pin")" = "$TAG $SHA" ]; then
+  exit 0
+fi
+
 mkdir -p target
 URL="https://github.com/Isyyyue/monitor/releases/download/$TAG/theme.tar.gz"
 # 自己的 release 还没有主题包时，回退到上游
@@ -25,11 +31,6 @@ if ! curl -fsSL --retry 3 -o target/theme.tar.gz "$URL" 2>/dev/null; then
     curl -fsSL --retry 3 -o target/theme.tar.gz "$URL"
 fi
 
-# Already unpacked at this pin. A theme placed here manually with a matching
-# stamp is also left alone, which is how an unreleased theme is built against.
-if [ -f "$DEST/.pin" ] && [ "$(cat "$DEST/.pin")" = "$TAG $SHA" ]; then
-  exit 0
-fi
 
 GOT=$(sha256sum target/theme.tar.gz | cut -d' ' -f1)
 if [ "$GOT" != "$SHA" ]; then

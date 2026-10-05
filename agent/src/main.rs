@@ -1,50 +1,111 @@
 //! monitor-agent: reports system metrics to the hub and handles VPN deployment.
 //!
 //! Usage:
-//!   monitor-agent --server wss://hub.example.com/agent --token TOKEN
-//!   monitor-agent --server wss://hub.example.com/agent --token TOKEN --vpn-deploy
+//!   monitor-agent --server wss://hub.example.com/api/agent/ws --token TOKEN
+//!   MONITOR_SERVER=https://hub.example.com MONITOR_TOKEN=TOKEN monitor-agent --interval 1
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, Message},
+};
 use tracing::{error, info, warn};
 
-/// Command-line arguments
+/// Arguments also accept the environment written by install.sh.
 #[derive(Debug)]
 struct Args {
     server: String,
     token: String,
+    interval: Duration,
+    ifaces: Vec<String>,
+}
+
+fn parse_values(
+    values: impl IntoIterator<Item = String>,
+    server: String,
+    token: String,
+    iface: String,
+) -> Result<Args> {
+    let mut out = Args {
+        server,
+        token,
+        interval: Duration::from_secs(1),
+        ifaces: iface.split(',').filter(|v| !v.is_empty()).map(str::to_owned).collect(),
+    };
+    let mut args = values.into_iter();
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--server" => out.server = args.next().context("--server needs a value")?,
+            "--token" => out.token = args.next().context("--token needs a value")?,
+            "--iface" => {
+                out.ifaces = args
+                    .next()
+                    .context("--iface needs a value")?
+                    .split(',')
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            }
+            "--interval" => {
+                let seconds: f64 =
+                    args.next().context("--interval needs a value")?.parse().context("invalid interval")?;
+                if !seconds.is_finite() || !(0.5..=3600.0).contains(&seconds) {
+                    anyhow::bail!("interval must be between 0.5 and 3600 seconds");
+                }
+                out.interval = Duration::from_secs_f64(seconds);
+            }
+            "--insecure" => anyhow::bail!("--insecure is unsupported: use a trusted HTTPS certificate"),
+            _ => anyhow::bail!("unknown argument: {flag}"),
+        }
+    }
+    if out.server.is_empty() || out.token.is_empty() {
+        anyhow::bail!("set MONITOR_SERVER/MONITOR_TOKEN or --server/--token");
+    }
+    out.server = websocket_url(&out.server)?;
+    Ok(out)
+}
+
+fn websocket_url(server: &str) -> Result<String> {
+    let mut url = url::Url::parse(server).context("invalid server URL")?;
+    let scheme = match url.scheme() {
+        "http" | "ws" => "ws",
+        "https" | "wss" => "wss",
+        _ => anyhow::bail!("server must use http, https, ws or wss"),
+    };
+    url.set_scheme(scheme).map_err(|_| anyhow::anyhow!("invalid server scheme"))?;
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        anyhow::bail!("server URL must contain a host and no credentials, query or fragment");
+    }
+    if url.path().is_empty() || url.path() == "/" {
+        url.set_path("/api/agent/ws");
+    }
+    Ok(url.into())
+}
+
+fn websocket_request(server: &str, token: &str) -> Result<http::Request<()>> {
+    let mut request = server.into_client_request().context("invalid WebSocket request")?;
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {token}").parse().context("invalid token header")?);
+    Ok(request)
 }
 
 fn parse_args() -> Result<Args> {
-    let args: Vec<String> = std::env::args().collect();
-    let mut server = String::new();
-    let mut token = String::new();
-    
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--server" => {
-                i += 1;
-                server = args.get(i).context("--server needs a value")?.clone();
-            }
-            "--token" => {
-                i += 1;
-                token = args.get(i).context("--token needs a value")?.clone();
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    
-    if server.is_empty() || token.is_empty() {
-        anyhow::bail!("Usage: monitor-agent --server WS_URL --token TOKEN");
-    }
-    
-    Ok(Args { server, token })
+    parse_values(
+        std::env::args().skip(1),
+        std::env::var("MONITOR_SERVER").unwrap_or_default(),
+        std::env::var("MONITOR_TOKEN").unwrap_or_default(),
+        std::env::var("MONITOR_IFACE").unwrap_or_default(),
+    )
 }
 
 /// System metrics collected from the host
@@ -74,27 +135,28 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-fn collect_metrics(sys: &mut sysinfo::System) -> Metrics {
+fn collect_metrics(sys: &mut sysinfo::System, ifaces: &[String]) -> Metrics {
     sys.refresh_all();
-    
+
     let cpu = sys.global_cpu_info().cpu_usage();
     let load = sysinfo::System::load_average();
-    
+
     let mem_total = sys.total_memory();
     let mem_used = sys.used_memory();
-    
+
     // Disks
     let disks = sysinfo::Disks::new_with_refreshed_list();
-    let (disk_total, disk_used) = disks.iter().fold((0, 0), |(t, u), d| {
-        (t + d.total_space(), u + d.total_space() - d.available_space())
-    });
-    
+    let (disk_total, disk_used) = disks
+        .iter()
+        .fold((0, 0), |(t, u), d| (t + d.total_space(), u + d.total_space() - d.available_space()));
+
     // Networks
     let networks = sysinfo::Networks::new_with_refreshed_list();
-    let (rx, tx) = networks.iter().fold((0, 0), |(r, t), (_, n)| {
-        (r + n.total_received(), t + n.total_transmitted())
-    });
-    
+    let (rx, tx) = networks
+        .iter()
+        .filter(|(name, _)| ifaces.is_empty() || ifaces.iter().any(|wanted| wanted == *name))
+        .fold((0, 0), |(r, t), (_, n)| (r + n.total_received(), t + n.total_transmitted()));
+
     Metrics {
         boot_id: boot_id(),
         hostname: hostname(),
@@ -119,7 +181,7 @@ struct RpcMessage {
 /// Handle vpn.deploy command from hub
 async fn handle_vpn_deploy(_params: serde_json::Value) -> Result<serde_json::Value> {
     info!("Received vpn.deploy command");
-    
+
     // 1. Check if running as root
     let uid = unsafe { libc::getuid() };
     if uid != 0 {
@@ -128,30 +190,30 @@ async fn handle_vpn_deploy(_params: serde_json::Value) -> Result<serde_json::Val
             "error": "vpn.deploy requires root privileges"
         }));
     }
-    
+
     // 2. Install sing-box if not present
     if !std::path::Path::new("/usr/local/bin/sing-box").exists() {
         info!("Installing sing-box...");
         install_sing_box().await?;
     }
-    
+
     // 3. Generate credentials
-    let uuid = generate_uuid();
+    let uuid = generate_uuid()?;
     let (reality_private, reality_public) = generate_reality_keypair()?;
-    let short_id = generate_short_id();
-    let hy2_password = generate_password();
-    
+    let short_id = generate_short_id()?;
+    let hy2_password = generate_password()?;
+
     // 4. Get server IP for links
     let server_ip = get_server_ip().unwrap_or_else(|| "SERVER_IP".to_string());
-    
+
     // 5. Write sing-box config
     let config = generate_singbox_config(&uuid, &reality_private, &short_id, &hy2_password);
     std::fs::create_dir_all("/etc/sing-box")?;
     std::fs::write("/etc/sing-box/config.json", config)?;
-    
+
     // 6. Generate self-signed cert for HY2
     generate_self_signed_cert()?;
-    
+
     // 7. Create systemd service
     let service = r#"[Unit]
 Description=sing-box VPN service
@@ -167,27 +229,34 @@ RestartSec=5
 WantedBy=multi-user.target
 "#;
     std::fs::write("/etc/systemd/system/sing-box.service", service)?;
-    
+
     // 8. Start service
-    let _ = tokio::process::Command::new("systemctl")
-        .args(["daemon-reload"])
-        .output().await;
-    let _ = tokio::process::Command::new("systemctl")
-        .args(["enable", "--now", "sing-box"])
-        .output().await;
-    
+    for arguments in [
+        vec!["daemon-reload"],
+        vec!["enable", "sing-box"],
+        vec!["restart", "sing-box"],
+        vec!["is-active", "--quiet", "sing-box"],
+    ] {
+        let output = tokio::process::Command::new("systemctl")
+            .args(&arguments)
+            .output()
+            .await
+            .context("failed to run systemctl")?;
+        if !output.status.success() {
+            anyhow::bail!("systemctl {} failed", arguments.join(" "));
+        }
+    }
+
     // 9. Generate links
     let vless_link = format!(
         "vless://{}@{}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.cloudflare.com&fp=chrome&pbk={}&sid={}#VLESS",
         uuid, server_ip, reality_public, short_id
     );
-    let hy2_link = format!(
-        "hysteria2://{}@{}:443?insecure=1&sni=www.cloudflare.com#HY2",
-        hy2_password, server_ip
-    );
-    
+    let hy2_link =
+        format!("hysteria2://{}@{}:443?insecure=1&sni=www.cloudflare.com#HY2", hy2_password, server_ip);
+
     info!("VPN deployment completed");
-    
+
     Ok(json!({
         "success": true,
         "vless_link": vless_link,
@@ -198,29 +267,19 @@ WantedBy=multi-user.target
     }))
 }
 
-fn generate_uuid() -> String {
-    // Simple UUID v4 generation
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    
-    let mut hasher = DefaultHasher::new();
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos().hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    let h1 = hasher.finish();
-    
-    let mut hasher = DefaultHasher::new();
-    h1.hash(&mut hasher);
-    "seed".hash(&mut hasher);
-    let h2 = hasher.finish();
-    
-    format!("{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
-        (h1 >> 32) as u32,
-        ((h1 >> 16) & 0xffff) as u16,
-        (h1 & 0xfff) as u16,
-        ((h2 >> 48) & 0xffff) as u16,
-        h2 & 0xffffffffffff as u64
-    )
+fn random_hex(bytes: usize) -> Result<String> {
+    let mut value = vec![0u8; bytes];
+    getrandom::getrandom(&mut value).map_err(|_| anyhow::anyhow!("OS randomness unavailable"))?;
+    Ok(value.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn generate_uuid() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|_| anyhow::anyhow!("OS randomness unavailable"))?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]))
 }
 
 fn generate_reality_keypair() -> Result<(String, String)> {
@@ -229,11 +288,11 @@ fn generate_reality_keypair() -> Result<(String, String)> {
         .args(["generate", "reality-keypair"])
         .output()
         .context("Failed to generate reality keypair")?;
-    
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut private = String::new();
     let mut public = String::new();
-    
+
     for line in stdout.lines() {
         if line.starts_with("PrivateKey:") {
             private = line.replace("PrivateKey:", "").trim().to_string();
@@ -241,37 +300,24 @@ fn generate_reality_keypair() -> Result<(String, String)> {
             public = line.replace("PublicKey:", "").trim().to_string();
         }
     }
-    
+
     if private.is_empty() || public.is_empty() {
         anyhow::bail!("Failed to parse reality keypair");
     }
-    
+
     Ok((private, public))
 }
 
-fn generate_short_id() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    
-    let mut hasher = DefaultHasher::new();
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos().hash(&mut hasher);
-    format!("{:016x}", hasher.finish() & 0xffffffffffffffff)[..8].to_string()
+fn generate_short_id() -> Result<String> {
+    random_hex(4)
 }
-
-fn generate_password() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    
-    let mut hasher = DefaultHasher::new();
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos().hash(&mut hasher);
-    format!("{:x}", hasher.finish())
+fn generate_password() -> Result<String> {
+    random_hex(32)
 }
 
 async fn install_sing_box() -> Result<()> {
     info!("Downloading sing-box...");
-    
+
     // Detect architecture
     let arch = std::env::consts::ARCH;
     let sb_arch = match arch {
@@ -279,45 +325,51 @@ async fn install_sing_box() -> Result<()> {
         "aarch64" => "arm64",
         _ => anyhow::bail!("Unsupported architecture: {}", arch),
     };
-    
+
     // Get latest version (hardcode for now, or fetch from API)
     let version = "1.14.2";
     let url = format!(
         "https://github.com/SagerNet/sing-box/releases/download/v{}/sing-box-{}-linux-{}.tar.gz",
         version, version, sb_arch
     );
-    
+
     // Download using curl
     let output = tokio::process::Command::new("curl")
         .args(["-fsSL", "-o", "/tmp/sing-box.tar.gz", &url])
         .output()
         .await
         .context("Failed to download sing-box")?;
-    
+
     if !output.status.success() {
         anyhow::bail!("curl failed to download sing-box");
     }
-    
+
     // Extract
     let output = tokio::process::Command::new("tar")
         .args(["-xzf", "/tmp/sing-box.tar.gz", "-C", "/tmp"])
         .output()
         .await?;
-    
+
     if !output.status.success() {
         anyhow::bail!("Failed to extract sing-box");
     }
-    
+
     // Install binary
     let output = tokio::process::Command::new("sh")
-        .args(["-c", &format!("cp /tmp/sing-box-{0}-linux-{1}/sing-box /usr/local/bin/ && chmod +x /usr/local/bin/sing-box", version, sb_arch)])
+        .args([
+            "-c",
+            &format!(
+                "cp /tmp/sing-box-{0}-linux-{1}/sing-box /usr/local/bin/ && chmod +x /usr/local/bin/sing-box",
+                version, sb_arch
+            ),
+        ])
         .output()
         .await?;
-    
+
     if !output.status.success() {
         anyhow::bail!("Failed to install sing-box binary");
     }
-    
+
     info!("sing-box installed successfully");
     Ok(())
 }
@@ -358,25 +410,34 @@ fn generate_singbox_config(uuid: &str, reality_private: &str, short_id: &str, hy
             }
         ],
         "outbounds": [{"type": "direct", "tag": "direct"}]
-    }).to_string()
+    })
+    .to_string()
 }
 
 fn generate_self_signed_cert() -> Result<()> {
     let output = std::process::Command::new("openssl")
         .args([
-            "req", "-x509", "-newkey", "rsa:2048",
-            "-keyout", "/etc/sing-box/key.pem",
-            "-out", "/etc/sing-box/cert.pem",
-            "-days", "3650", "-nodes",
-            "-subj", "/CN=www.cloudflare.com"
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            "/etc/sing-box/key.pem",
+            "-out",
+            "/etc/sing-box/cert.pem",
+            "-days",
+            "3650",
+            "-nodes",
+            "-subj",
+            "/CN=www.cloudflare.com",
         ])
         .output()
         .context("Failed to generate self-signed cert")?;
-    
+
     if !output.status.success() {
         anyhow::bail!("openssl failed");
     }
-    
+
     Ok(())
 }
 
@@ -398,47 +459,38 @@ fn get_server_ip() -> Option<String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    
+
     let args = parse_args()?;
     info!("Connecting to {}", args.server);
-    
-    // Build WebSocket request with Bearer token in Authorization header
-    // (Hub expects Authorization: Bearer <token>, not ?token= in URL)
-    let request = http::Request::builder()
-        .uri(args.server.as_str())
-        .header("Authorization", format!("Bearer {}", args.token))
-        .header("Host", args.server.split("://").nth(1).unwrap_or("localhost").split('/').next().unwrap_or("localhost"))
-        .body(())
-        .context("Failed to build WebSocket request")?;
-    
-    let (ws_stream, _) = connect_async(request)
-        .await
-        .context("Failed to connect to hub")?;
-    
+
+    let request = websocket_request(&args.server, &args.token)?;
+
+    let (ws_stream, _) = connect_async(request).await.context("Failed to connect to hub")?;
+
     info!("Connected to hub");
-    
+
     let (mut write, mut read) = ws_stream.split();
-    
+
     // Send hello
     let hello = json!({
         "jsonrpc": "2.0",
         "method": "hello",
         "params": {
             "hostname": hostname(),
-            "version": env!("CARGO_PKG_VERSION"),
+            "agent_version": env!("CARGO_PKG_VERSION"),
         }
     });
     write.send(Message::Text(hello.to_string())).await?;
     info!("Sent hello");
-    
+
     let mut sys = sysinfo::System::new_all();
-    let mut interval = tokio::time::interval(Duration::from_secs(10));
-    
+    let mut interval = tokio::time::interval(args.interval);
+
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 // Send metrics report
-                let metrics = collect_metrics(&mut sys);
+                let metrics = collect_metrics(&mut sys, &args.ifaces);
                 let report = json!({
                     "jsonrpc": "2.0",
                     "method": "report",
@@ -470,6 +522,8 @@ async fn main() -> Result<()> {
                                         }
                                         Err(e) => {
                                             error!("vpn.deploy failed: {}", e);
+                                            let failure = json!({"jsonrpc":"2.0", "method":"vpn.result", "params":{"success":false,"error":"deployment failed; see agent log"}});
+                                            write.send(Message::Text(failure.to_string())).await?;
                                         }
                                     }
                                 }
@@ -492,6 +546,64 @@ async fn main() -> Result<()> {
             }
         }
     }
-    
-    Ok(())
+
+    anyhow::bail!("hub connection closed; service manager should reconnect")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn generated_credentials_have_uuid_v4_bits_and_independent_secrets() {
+        let uuid = generate_uuid().unwrap();
+        assert_eq!(uuid.len(), 36);
+        assert_eq!(&uuid[14..15], "4");
+        assert!(matches!(&uuid[19..20], "8" | "9" | "a" | "b"));
+        assert_eq!(generate_short_id().unwrap().len(), 8);
+        let first = generate_password().unwrap();
+        assert_eq!(first.len(), 64);
+        assert_ne!(first, generate_password().unwrap());
+    }
+    #[test]
+    fn request_contains_complete_handshake_and_bearer_auth() {
+        let r = websocket_request("ws://localhost:28080/api/agent/ws", "audit-token").unwrap();
+        for header in ["Host", "Upgrade", "Connection", "Sec-WebSocket-Version", "Sec-WebSocket-Key"] {
+            assert!(r.headers().contains_key(header), "{header}");
+        }
+        assert_eq!(r.headers()["Authorization"], "Bearer audit-token");
+        assert!(r.uri().query().is_none());
+        assert!(websocket_request("ws://localhost/api/agent/ws", "bad\r\nheader").is_err());
+    }
+    #[test]
+    fn installer_environment_and_interval_are_supported() {
+        let args = parse_values(
+            ["--interval".into(), "2".into()],
+            "https://example.com".into(),
+            "audit-token".into(),
+            "eth0,eth1".into(),
+        )
+        .unwrap();
+        assert_eq!(args.server, "wss://example.com/api/agent/ws");
+        assert_eq!(args.interval, Duration::from_secs(2));
+        assert_eq!(args.ifaces, ["eth0", "eth1"]);
+        for interval in ["0", "NaN", "-1", "3601"] {
+            assert!(parse_values(
+                ["--interval".into(), interval.into()],
+                "http://localhost".into(),
+                "t".into(),
+                String::new()
+            )
+            .is_err());
+        }
+    }
+    #[test]
+    fn endpoint_conversion_preserves_ipv6_and_rejects_url_credentials() {
+        assert_eq!(websocket_url("http://[::1]:28080").unwrap(), "ws://[::1]:28080/api/agent/ws");
+        assert_eq!(
+            websocket_url("wss://example.com/api/agent/ws").unwrap(),
+            "wss://example.com/api/agent/ws"
+        );
+        assert!(websocket_url("https://user:secret@example.com").is_err());
+        assert!(websocket_url("https://example.com?token=t").is_err());
+    }
 }

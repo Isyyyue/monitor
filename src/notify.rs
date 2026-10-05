@@ -128,13 +128,7 @@ pub fn setting_error(key: &str, value: &str) -> Option<String> {
     let problem = match key {
         "notify_login" => (!matches!(value, "on" | "off")).then_some("登录提醒只能是 on 或 off"),
         // Empty clears a channel's field, or restores a template's default.
-        "notify_telegram_token"
-        | "notify_telegram_chat"
-        | "notify_telegram_text"
-            if value.is_empty() =>
-        {
-            None
-        }
+        "notify_telegram_token" | "notify_telegram_chat" | "notify_telegram_text" if value.is_empty() => None,
         "notify_telegram_text" => None,
         // Interpolated into the request path, so only the shape BotFather issues
         // is accepted.
@@ -155,6 +149,7 @@ pub fn setting_error(key: &str, value: &str) -> Option<String> {
 }
 
 /// Values that exercise every escape the body template must survive.
+#[cfg(test)]
 fn sample() -> Note {
     Note {
         event: "test",
@@ -287,8 +282,6 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
         (Channel::Telegram { .. }, 401 | 404) => "Bot Token 不对",
         (Channel::Telegram { .. }, 400) => "Chat ID 不对，或者 bot 还没有加入这个会话",
         (Channel::Telegram { .. }, 403) => "bot 被这个会话移除或屏蔽了",
-        (_, 401 | 403) => "对方拒绝了鉴权，检查 URL 或请求头里的凭据",
-        (_, 404) => "地址不存在，检查 URL",
         (_, 429) => "发送太频繁，被对方限流",
         (_, 500..) => "对方服务器出错",
         _ => "对方拒收了这条消息，检查请求体格式",
@@ -620,6 +613,8 @@ mod tests {
 
     /// Offline alerts are only marked while a channel exists to carry them.
     fn with_channel(app: &App) {
+        app.db.set("notify_telegram_token", "123:audit-only").unwrap();
+        app.db.set("notify_telegram_chat", "42").unwrap();
     }
 
     #[test]

@@ -492,6 +492,10 @@ fn dispatch(
             }
         }
         "vpn.result" => {
+            if rpc.params.get("success").and_then(|v| v.as_bool()) != Some(true) {
+                warn!("node {node_id}: agent reported VPN deployment failure");
+                return Ok(None);
+            }
             if let Err(e) = app.db.save_vpn_result(node_id, &rpc.params) {
                 warn!("node {node_id}: failed to save vpn.result: {e}");
             } else {
@@ -847,13 +851,9 @@ pub fn push_ping_tasks(app: &App) {
 /// Send vpn.deploy command to a specific node's agent.
 /// Returns true if the node is connected and the message was queued.
 pub fn send_vpn_deploy(app: &App, node_id: i64) -> bool {
-    let sender = app
-        .agents
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&node_id)
-        .map(|agent| agent.tx.clone());
-    
+    let sender =
+        app.agents.read().unwrap_or_else(|e| e.into_inner()).get(&node_id).map(|agent| agent.tx.clone());
+
     if let Some(tx) = sender {
         let msg = json!({"jsonrpc": "2.0", "method": "vpn.deploy", "params": {}}).to_string();
         tx.try_send(msg).is_ok()
@@ -880,6 +880,24 @@ mod tests {
                 &crate::auth::random_token(),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn vpn_results_are_saved_for_the_authenticated_node_and_failures_keep_the_previous_result() {
+        let app = app();
+        let id = node(&app);
+        let mut session = Session::default();
+        let result = json!({"jsonrpc":"2.0", "method":"vpn.result", "params":{
+            "success":true, "vless_link":"vless://audit-only", "hy2_link":"hysteria2://audit-only",
+            "clash_sub_url":"https://example.invalid/audit.yaml", "v2ray_sub_url":"https://example.invalid/audit.txt"
+        }});
+        dispatch(&app, id, "127.0.0.1", &result.to_string(), &mut session, Arrival::now()).unwrap();
+        let saved = app.db.get_vpn(id).unwrap().unwrap();
+        assert_eq!(saved["vless_link"], "vless://audit-only");
+        assert_eq!(saved["clash_sub_url"], "https://example.invalid/audit.yaml");
+        let failed = json!({"method":"vpn.result", "params":{"success":false}});
+        dispatch(&app, id, "127.0.0.1", &failed.to_string(), &mut session, Arrival::now()).unwrap();
+        assert_eq!(app.db.get_vpn(id).unwrap().unwrap(), saved);
     }
 
     /// A connected agent, the precondition for filing any report: the session

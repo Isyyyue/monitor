@@ -8,24 +8,22 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
-use axum::extract::{ConnectInfo, Query, State};
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::Utc;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
 
 use crate::api::{answer, fail};
-use crate::{App, Shown};
+use crate::App;
 
 pub const COOKIE: &str = "monitor_session";
-const STATE_COOKIE: &str = "monitor_oauth_state";
 const SESSION_DAYS: i64 = 14;
 /// Failed password attempts allowed per address before it is shut out.
 const MAX_ATTEMPTS: u32 = 5;
@@ -219,7 +217,6 @@ pub async fn logout(State(app): State<crate::Shared>, headers: HeaderMap) -> Res
     )
 }
 
-
 /// Peer address, or the last hop in X-Forwarded-For when the request arrived
 /// through a local reverse proxy. Used for throttling and for the address shown
 /// beside a node, never for authorization.
@@ -355,37 +352,6 @@ mod tests {
         assert!(PASSWORD_GATE.try_acquire().is_ok(), "permits come back when the checks finish");
     }
 
-    /// Both ends of the same redirect: every form GitHub can send must parse,
-    /// or it never reaches the handler and can be neither logged nor explained,
-    /// and the reason sent back must survive its query string.
-    #[test]
-    fn every_callback_shape_parses_and_a_failure_reason_survives_the_round_trip() {
-        let parse = |q: &str| serde_urlencoded::from_str::<Callback>(q);
-
-        let ok = parse("code=abc&state=xyz").expect("the happy path");
-        assert_eq!(ok.code.as_deref(), Some("abc"));
-        assert_eq!(ok.state.as_deref(), Some("xyz"));
-
-        // GitHub reports a refusal with no code.
-        let denied = parse("error=access_denied&error_description=the+user+said+no&state=xyz")
-            .expect("a refusal must parse, not 400");
-        assert_eq!(denied.error.as_deref(), Some("access_denied"));
-        assert_eq!(denied.error_description.as_deref(), Some("the user said no"));
-        assert!(denied.code.is_none());
-
-        // Truncated or empty callbacks must still reach the handler.
-        assert!(parse("state=xyz").is_ok());
-        assert!(parse("").is_ok());
-
-        // Anything that would escape the query string must be encoded, or the
-        // reason arrives truncated at the first stray separator.
-        assert_eq!(urlencode("a&b=c#d"), "a%26b%3Dc%23d");
-        assert_eq!(urlencode("用户"), "%E7%94%A8%E6%88%B7");
-        let reason = "no allowed GitHub users configured (a&b=c)";
-        let back = parse(&format!("error={}", urlencode(reason))).expect("a reason must parse");
-        assert_eq!(back.error.as_deref(), Some(reason), "the whole reason comes back");
-    }
-
     /// A session cookie's round trip: the flags it is issued with, sharing a
     /// response with a second cookie, and being extracted from the single header
     /// the browser returns them in.
@@ -398,7 +364,8 @@ mod tests {
 
         // axum applies an array of header tuples with insert(), keeping only the
         // last Set-Cookie; this helper appends instead.
-        let response = with_cookies(StatusCode::OK, [session, set_cookie(STATE_COOKIE, "s", 0, true)]);
+        let response =
+            with_cookies(StatusCode::OK, [session, set_cookie("audit_second_cookie", "s", 0, true)]);
         let set: Vec<_> = response.headers().get_all(header::SET_COOKIE).iter().collect();
         assert_eq!(set.len(), 2, "both cookies must reach the browser");
         // Empty entries are skipped rather than emitting a blank header.

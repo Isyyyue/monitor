@@ -2013,11 +2013,11 @@ pub async fn change_password(
 ) -> Response {
     let old_password = body.get("old_password").and_then(|v| v.as_str()).unwrap_or_default();
     let new_password = body.get("new_password").and_then(|v| v.as_str()).unwrap_or_default();
-    
+
     if new_password.len() < 12 {
         return answer(StatusCode::BAD_REQUEST, "新密码至少 12 位");
     }
-    
+
     // 验证旧密码
     let Some(stored) = app.db.get("admin_password_hash") else {
         return answer(StatusCode::FORBIDDEN, "没有设置密码");
@@ -2025,7 +2025,7 @@ pub async fn change_password(
     if !crate::auth::verify_password(old_password, &stored) {
         return answer(StatusCode::UNAUTHORIZED, "旧密码错误");
     }
-    
+
     // 设置新密码，其他设备登出，当前设备保持登录
     match crate::auth::hash_password(new_password).and_then(|h| {
         app.db.replace_password(&h)?;
@@ -2037,11 +2037,7 @@ pub async fn change_password(
 }
 
 /// Trigger VPN deployment on a node via its agent.
-pub async fn vpn_deploy(
-    _: Admin,
-    State(app): State<Shared>,
-    Path(node_id): Path<i64>,
-) -> Response {
+pub async fn vpn_deploy(_: Admin, State(app): State<Shared>, Path(node_id): Path<i64>) -> Response {
     if crate::agent_ws::send_vpn_deploy(&app, node_id) {
         Json(json!({"ok": true, "message": "部署指令已发送"})).into_response()
     } else {
@@ -2050,11 +2046,7 @@ pub async fn vpn_deploy(
 }
 
 /// Get VPN info for a node.
-pub async fn vpn_info(
-    _: Admin,
-    State(app): State<Shared>,
-    Path(node_id): Path<i64>,
-) -> Response {
+pub async fn vpn_info(_: Admin, State(app): State<Shared>, Path(node_id): Path<i64>) -> Response {
     match app.db.get_vpn(node_id) {
         Ok(Some(vpn)) => Json(vpn).into_response(),
         Ok(None) => answer(StatusCode::NOT_FOUND, "该节点尚未部署 VPN").into_response(),
@@ -2085,23 +2077,6 @@ mod tests {
     /// and a test holding all of its permits would refuse a parallel one with a
     /// 503. Tokio's mutex, since the guard is held across awaits.
     static HISTORY_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    /// A lookup nobody can refresh must not hide an update all day, and a panel
-    /// left open on a screen must not ask GitHub on every load.
-    #[test]
-    fn a_release_lookup_is_held_for_six_hours_and_a_failed_one_for_ten_minutes() {
-        let now = Utc::now().timestamp();
-        let read = |read_at, hub: &str, agent: &str| crate::Releases {
-            read_at,
-            hub: hub.into(),
-            agent: agent.into(),
-        };
-        assert!(!fresh_enough(&crate::Releases::default(), now), "nothing has been read yet");
-        assert!(fresh_enough(&read(now - 5 * 3600, "1.2.0", "1.1.0"), now));
-        assert!(!fresh_enough(&read(now - 7 * 3600, "1.2.0", "1.1.0"), now));
-        assert!(fresh_enough(&read(now - 300, "", ""), now), "a failure is held briefly");
-        assert!(!fresh_enough(&read(now - 1200, "1.2.0", ""), now), "half an answer is a failure");
-    }
 
     fn app_with_site(site: &str) -> App {
         let mut state = app();
@@ -2265,10 +2240,7 @@ mod tests {
     /// fetch.
     #[test]
     fn only_a_github_repository_url_can_name_a_release_to_download() {
-        assert_eq!(
-            github_repo("https://github.com/Isyyyue/monitor"),
-            Some(("Isyyyue", "monitor"))
-        );
+        assert_eq!(github_repo("https://github.com/Isyyyue/monitor"), Some(("Isyyyue", "monitor")));
         // A link to the repository, in whatever form the author wrote it or the
         // address bar showed it.
         assert_eq!(github_repo("https://github.com/a/b.git"), Some(("a", "b")));
@@ -3603,7 +3575,6 @@ mod tests {
             "notify_login": read["notify_login"],
             "notify_telegram_chat": read["notify_telegram_chat"],
             "notify_telegram_text": read["notify_telegram_text"],
-            "notify_webhook_body": read["notify_webhook_body"],
         });
         assert_eq!(
             save_settings(Admin, State(app.clone()), HeaderMap::new(), Json(echoed)).await.status(),
@@ -3625,7 +3596,7 @@ mod tests {
         let Json(body) = settings(Admin, axum::extract::State(std::sync::Arc::new(app))).await;
         assert_eq!(body["github_client_id"], "public-id");
         assert_eq!(body["github_secret_set"], true);
-        assert_eq!(body["notify_webhook_url_set"], true);
+        assert!(body.get("notify_webhook_url_set").is_none());
         assert!(body.get("github_client_secret").is_none());
         for secret in ["super-secret", "bot-secret", "url-secret", "header-secret"] {
             assert!(!body.to_string().contains(secret), "{secret}");
