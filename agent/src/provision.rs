@@ -587,6 +587,13 @@ pub fn run(args: ProvisionArgs) -> Result<()> {
     n.reality_public_key = public_key_from_private(&n.reality_private_key)?;
 
     std::fs::create_dir_all(&args.config_dir).context("mkdir config dir")?;
+    // The certificate before the config is rendered and checked, not after:
+    // `sing-box check` opens every file the config names, and a certificate it
+    // cannot read fails the check outright. On a machine that has never run this
+    // there is no certificate yet, so the other order failed the first
+    // deployment on every new node -- and passed on the ones that worked,
+    // because an earlier run had already left the files behind.
+    ensure_cert(&n.sni_hy2)?;
     // Rendered, written aside, and accepted by sing-box *before* the live file is
     // touched. A config it refuses would otherwise take the service down on the
     // restart below, and the file already there is the one still serving.
@@ -599,7 +606,6 @@ pub fn run(args: ProvisionArgs) -> Result<()> {
         return Err(e.context("sing-box refused the rendered config; nothing was changed"));
     }
     std::fs::rename(&scratch, &config_path).context("replace sing-box config")?;
-    ensure_cert(&n.sni_hy2)?;
 
     let state = PathBuf::from(SUB_STATE);
     if let Some(parent) = state.parent() {

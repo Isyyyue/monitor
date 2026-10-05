@@ -147,6 +147,12 @@ fi
 # defaults a scheme-less URL to http://, fetching over plaintext the binary about
 # to run as root.
 if [ -n "$INSECURE" ]; then SCHEME=http; else SCHEME=https; fi
+# `--insecure` stops at this script and is never handed to the agent. The agent
+# takes its scheme from the address it is given -- `http://` becomes `ws://`, and
+# a plaintext connection has no certificate to verify -- so it has nothing to do
+# with the flag, and it refuses the flag outright if it sees it. A unit carrying
+# `--insecure` therefore exits at startup and crash-loops on RestartSec while the
+# install reports failure. Do not add it back to `command_args` or `ExecStart`.
 case "$SERVER" in *://*) ;; *) SERVER="$SCHEME://$SERVER" ;; esac
 # The agent already refuses plaintext ws:// to a remote hub, since the token
 # would travel in the clear. The same address fetches the binary about to run as
@@ -430,7 +436,7 @@ if [ "$INIT" = openrc ]; then
 #!/sbin/openrc-run
 description="monitor agent"
 command="$BIN"
-command_args="--interval $INTERVAL${INSECURE:+ --insecure}"
+command_args="--interval $INTERVAL"
 supervisor="supervise-daemon"
 command_user="monitor-agent"
 respawn_delay=5
@@ -476,7 +482,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=$ENV_FILE
-ExecStart=$BIN --interval $INTERVAL${INSECURE:+ --insecure}
+ExecStart=$BIN --interval $INTERVAL
 Restart=always
 RestartSec=5
 # A fixed user rather than DynamicUser=: when the mount namespace cannot be
