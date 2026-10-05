@@ -14,7 +14,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { api, badIfaceName, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { api, badIfaceName, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, plainEntry, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -374,6 +374,20 @@ function Command({ className = "", children }: { className?: string; children: R
     <pre className={`overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all ${className}`}>
       {children}
     </pre>
+  )
+}
+
+// Under every command a plaintext hub hands out, and nothing at all otherwise.
+// The token in the command, and the agent the node then downloads and runs as
+// root, both cross the network unverified -- which is what naming a plaintext
+// --site accepted. Said where the command is copied, since that is the moment it
+// matters.
+function PlaintextNote({ site }: { site: string }) {
+  if (!plainEntry(site)) return null
+  return (
+    <p className="text-xs leading-relaxed text-destructive">
+      面板没有域名，这条命令和它下载的 agent 都不加密：链路上谁抓到，谁就能接管这台节点。
+    </p>
   )
 }
 
@@ -1053,12 +1067,18 @@ function BillingForm({ node, onClose, onSaved }: {
   )
 }
 
-// Each command runs the hub's own install.sh and is offered only on an https
-// domain entry. `args` receives that entry, which the agent is also given as
-// --server.
+// Each command runs the hub's own install.sh and is offered on the entry --site
+// names: an https domain, or a plaintext address for a hub that has none. `args`
+// receives that entry, which the agent is also given as --server.
 function scriptCommand(site: string, args: (site: string) => string[]) {
   site = provisioningSite(site)
-  return site && `curl -fsSL ${site}/install.sh | sh -s -- ${args(site).join(" ")}`
+  if (!site) return ""
+  // install.sh refuses plain HTTP to a hub that is not on this machine, and that
+  // refusal is right: the token and the binary about to run as root both cross an
+  // unverified channel. --insecure is the operator's standing decision to accept
+  // it, which naming a plaintext --site already was.
+  const insecure = plainEntry(site) ? ["--insecure"] : []
+  return `curl -fsSL ${site}/install.sh | sh -s -- ${args(site).concat(insecure).join(" ")}`
 }
 
 // Built here rather than fetched: the node list already carries the token, so
@@ -1167,6 +1187,7 @@ function RegisterDialog({ site, reg, onClose }: {
               <Command className={`max-h-40 min-h-24 ${command ? "" : "text-muted-foreground"}`}>
                 {command || "网卡名有误，改正后显示命令"}
               </Command>
+              <PlaintextNote site={site} />
               {/* Per machine, so it cannot be part of the one command. */}
               <p className="text-xs leading-relaxed text-muted-foreground">
                 要给某台单独起名，在它执行的命令末尾加 <code>--name 名字</code>，只对新建的节点生效。
@@ -1344,6 +1365,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
             <Command className={`max-h-40 min-h-24 ${command ? "" : "text-muted-foreground"}`}>
               {command || "网卡名有误，改正后显示命令"}
             </Command>
+            <PlaintextNote site={site} />
           </section>
           <OptionRow title="换发凭证" hint="旧凭证立即作废，agent 掉线，需用新命令重装">
             <Button variant="outline" size="sm" disabled={rotating} onClick={() => setConfirmRotate(true)}>

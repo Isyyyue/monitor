@@ -255,8 +255,9 @@ export function shortAddress(address: string): string {
 /** Where a shown address comes from, which the panel gives as its tooltip. */
 export type Source = "manual" | "interface" | "exit" | "connection"
 
-/** Installation commands require a TLS origin with a domain, never an IP. */
-export function provisioningSite(site: string): string {
+/** An https entry naming a domain, never an address: a certificate is issued to
+ * a name, and the panel builds the command from this address. */
+function httpsDomain(site: string): string {
   try {
     const u = new URL(site)
     return u.protocol === "https:" && !u.hostname.startsWith("[") && !/^\d+\.\d+\.\d+\.\d+$/.test(u.hostname)
@@ -265,6 +266,35 @@ export function provisioningSite(site: string): string {
   } catch {
     return ""
   }
+}
+
+/**
+ * A plaintext entry the operator named deliberately, for a hub with no domain.
+ * `--site http://<address>` is how the hub is told to accept provisioning from
+ * it, and the command then carries that address with `--insecure`, since
+ * install.sh refuses plain HTTP to a hub that is not this machine otherwise.
+ *
+ * Not loopback, as the hub decides it too: an address on the hub's own machine
+ * names nothing a node could reach.
+ */
+export function plainEntry(site: string): string {
+  try {
+    const u = new URL(site)
+    return u.protocol === "http:" && !u.username && !u.password
+      && u.pathname === "/" && !u.search && !u.hash
+      && !loopbackOrigin(site) ? u.origin : ""
+  } catch {
+    return ""
+  }
+}
+
+/**
+ * The entry an installation command may name: an https domain, or -- for a hub
+ * with no domain -- a plaintext address that is not the hub's own machine.
+ * Anything else and there is no command to offer.
+ */
+export function provisioningSite(site: string): string {
+  return httpsDomain(site) || plainEntry(site)
 }
 
 /**
@@ -291,8 +321,20 @@ export function loopbackOrigin(origin: string): boolean {
  * same rule, and a GET carries no `Origin` for it to answer this in advance.
  */
 export function provisionRefusal(origin: string, site: string): string {
-  if (site && !provisioningSite(site)) return "hub 的 --site 不是 https 域名，改正后才能添加或安装节点。"
-  if (provisioningSite(origin) || (loopbackOrigin(origin) && site)) return ""
+  if (site && !provisioningSite(site)) {
+    return "hub 的 --site 既不是 https 域名也不是明文地址，改正后才能添加或安装节点。"
+  }
+  // A plaintext --site names one address and nothing else, so the page has to be
+  // on it -- or be a tunnel into the hub, which the command still fills from
+  // --site. An https --site takes any https origin, since the command is then
+  // built from the browser's own.
+  const plain = plainEntry(site)
+  if (plain) {
+    return origin === plain || loopbackOrigin(origin)
+      ? ""
+      : "面板是明文部署，只能从 --site 写的那一个地址进面板添加节点。"
+  }
+  if (httpsDomain(origin) || (loopbackOrigin(origin) && site)) return ""
   return loopbackOrigin(origin)
     ? "从隧道或回环地址进面板时，要给 hub 加 --site 指定节点可达的 https 域名。"
     : "请通过 HTTPS 域名访问面板后添加或安装节点。"

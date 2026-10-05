@@ -1,12 +1,22 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, shortAddress, trafficCorrection } from "./api.ts"
+import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, plainEntry, provisioningSite, provisionRefusal, shortAddress, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
 assert.deepEqual(changes({ expires_at: "2030-01-01" as string | null }, { expires_at: null }), { expires_at: null })
 assert.equal(provisioningSite("https://monitor.example.com:8443/"), "https://monitor.example.com:8443")
-for (const site of ["http://monitor.example.com", "https://127.0.0.1", "https://[::1]", "https://2130706433", "https://0x7f000001", "https://localhost", "https://user@monitor.example.com", "https://monitor.example.com/path"]) {
+for (const site of ["https://127.0.0.1", "https://[::1]", "https://2130706433", "https://0x7f000001", "https://localhost", "https://user@monitor.example.com", "https://monitor.example.com/path"]) {
+  assert.equal(provisioningSite(site), "", site)
+}
+// A hub with no domain names a plaintext address instead, and the command then
+// carries that address with --insecure. Loopback is refused here as the hub
+// refuses it: it names nothing a node could reach.
+assert.equal(provisioningSite("http://198.51.100.7:28080/"), "http://198.51.100.7:28080")
+assert.equal(plainEntry("http://198.51.100.7:28080"), "http://198.51.100.7:28080")
+assert.equal(plainEntry("https://monitor.example.com"), "")
+for (const site of ["http://127.0.0.1:28080", "http://localhost:28080", "http://[::1]:28080", "http://2130706433", "http://monitor.example.com/path", "ftp://monitor.example.com"]) {
+  assert.equal(plainEntry(site), "", site)
   assert.equal(provisioningSite(site), "", site)
 }
 // A tunnelled panel: the hub allows it alongside --site, so the panel must read
@@ -27,6 +37,13 @@ for (const [origin, site, cause] of [
   ["http://127.0.0.1:9911", "http://127.0.0.1:28080", "不是 https 域名"],
   ["https://monitor.example.com", "https://198.51.100.1", "不是 https 域名"],
   ["http://198.51.100.1:28080", "https://hub.example.com", "请通过 HTTPS 域名"],
+  // A plaintext --site names one address and nothing else, so a panel reached
+  // over https is a page that is not this one. A tunnel still stands in: the
+  // command is filled from --site either way.
+  ["http://198.51.100.7:28080", "http://198.51.100.7:28080", ""],
+  ["http://127.0.0.1:28080", "http://198.51.100.7:28080", ""],
+  ["https://monitor.example.com", "http://198.51.100.7:28080", "只能从"],
+  ["http://198.51.100.8:28080", "http://198.51.100.7:28080", "只能从"],
 ]) {
   const refusal = provisionRefusal(origin, site)
   assert.ok(cause ? refusal.includes(cause) : refusal === "", `${origin} ${site}: ${refusal}`)

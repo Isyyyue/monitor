@@ -31,9 +31,24 @@ PORT="28080"
 PORT_SET=""
 SITE=""
 SITE_SET=""
+# Self-signed HTTPS in front of the loopback hub, for a hub with no domain.
+HTTPS=""
+HTTPS_PORT="443"
+HTTPS_PORT_SET=""
+# No TLS at all: the hub listens on the public interface and the panel is
+# reached over plain HTTP. The other answer to having no domain, and the one
+# that costs nothing to run.
+PLAIN=""
+# The node this machine reports as, created during the install.
+LOCAL_NODE=""
 YES=""
 PURGE=""
 ACTION=""
+# Where the panel ends up being reached, and what nginx is found at. Both are
+# set during the install and read by the summary.
+PANEL=""
+NGINX_BIN=""
+NGINX_CONF_DIR=""
 
 # ---- ui ----
 # Colour only to a terminal, and never when NO_COLOR is set: the output of a
@@ -127,6 +142,10 @@ check_self() {
 	set --
 	[ -z "$PORT_SET" ] || set -- "$@" --port "$PORT"
 	[ -z "$SITE_SET" ] || set -- "$@" --site "$SITE"
+	[ -z "$HTTPS" ] || set -- "$@" --https
+	[ -z "$HTTPS_PORT_SET" ] || set -- "$@" --https-port "$HTTPS_PORT"
+	[ -z "$PLAIN" ] || set -- "$@" --plain
+	[ -z "$LOCAL_NODE" ] || set -- "$@" --local-node "$LOCAL_NODE"
 	[ -z "$YES" ] || set -- "$@" --yes
 	exec sh "$0" "$@"
 }
@@ -176,6 +195,10 @@ install_hub() {
 		esac
 	fi
 	check_port "$PORT"
+	# A domain is configured, so an earlier --https run's self-signed listener
+	# has to go: it holds its port as the default server and would shadow
+	# whichever certificate the domain is served with.
+	[ -z "$SITE" ] || remove_https_site
 
 	# Before anything is stopped, replaced or downloaded: a port conflict must
 	# leave the running hub untouched. The hub's own socket is never a conflict,
@@ -251,11 +274,28 @@ install_hub() {
 	rm -rf "$tmp"
 	trap - EXIT
 
-	# Loopback only: the panel and the agent tokens never traverse a network in
-	# the clear, and there is no port to firewall. Reaching it is the reverse
-	# proxy's responsibility, and 127.0.0.1 rather than [::1] because that is
-	# every proxy's default upstream; the hub binds one address, not both.
-	args="--listen 127.0.0.1:$PORT --db $DATA/monitor.db"
+	# A plaintext hub has no certificate to be reached through and no proxy in
+	# front, so it answers on the public interface directly, and the address the
+	# panel is reached at is this machine's own -- which is also what the install
+	# command has to carry, since a node has to be able to reach it.
+	#
+	# Otherwise loopback only: the panel and the agent tokens then never traverse a
+	# network in the clear, and there is no port to firewall. Reaching it is the
+	# reverse proxy's responsibility, and 127.0.0.1 rather than [::1] because that
+	# is every proxy's default upstream; the hub binds one address, not both.
+	if [ -n "$PLAIN" ]; then
+		listen="0.0.0.0:$PORT"
+		if [ -z "$SITE" ]; then
+			ip="$(public_ip)"
+			[ -n "$ip" ] ||
+				die "取不到本机公网地址，拼不出 --site。手动给一个：--site http://你的IP:$PORT"
+			SITE="http://$ip"
+			[ "$PORT" = 80 ] || SITE="$SITE:$PORT"
+		fi
+	else
+		listen="127.0.0.1:$PORT"
+	fi
+	args="--listen $listen --db $DATA/monitor.db"
 	[ -z "$SITE" ] || args="$args --site $SITE"
 	cat >"$UNIT" <<UNIT
 [Unit]
@@ -330,11 +370,20 @@ UNIT
 	rm -f "$BIN.old"
 	ok "服务" "已启动并开机自启"
 
+	# What the panel answers at. --site wins when it is given: that is the
+	# address nodes use, which is the one worth printing. setup_https replaces
+	# it with the https:// address it just made reachable.
+	PANEL="${SITE:-http://127.0.0.1:$PORT}"
+	# Both below run only after the service is up: nginx proxies to a hub that
+	# already answers, and the node goes into a database that already exists.
+	if [ -n "$HTTPS" ]; then setup_https; fi
+	add_local_node "$LOCAL_NODE"
+
 	if [ -n "$first" ]; then done_title="安装完成"; else done_title="升级完成"; fi
 	printf '\n  %s%s%s\n' "$B" "$done_title" "$N"
 	rule
 	printf '\n'
-	field "面板" "${SITE:-http://127.0.0.1:$PORT}/admin"
+	field "面板" "$PANEL/admin"
 	if [ -n "$first" ]; then
 		if [ -n "$pw" ]; then
 			field "密码" "$pw"
@@ -352,15 +401,241 @@ UNIT
 	# than optional advice. It deliberately omits --site: the panel builds install
 	# commands from the browser's own address, so once the domain works everything
 	# downstream follows.
-	if [ -z "$SITE" ]; then
+	if [ -z "$SITE" ] && [ -z "$HTTPS" ]; then
 		printf '  %s还差一步：配个反向代理%s\n' "$B" "$N"
 		printf '     面板只监听本机，公网访问不到——这是故意的，凭证不会在链路上裸奔。\n'
 		printf '     用 nginx / caddy / cf tunnel 任选一种，把 hub.example.com 换成你的域名，\n'
 		printf '     配好之后用域名访问面板，我相信这难不倒你。\n'
+		printf '     没有域名的话，重跑一次加 --https，安装器会签一张自签证书并配好 nginx。\n'
 		# The documented configurations use the default port.
 		[ "$PORT" = 28080 ] || printf '     文档里的 28080 换成 %s。\n' "$PORT"
 		printf '     反向代理文档：https://monitor-document.pages.dev/install/reverse-proxy\n'
 	fi
+	# A self-signed certificate is enough for the panel and for an agent on this
+	# same machine, which reaches the hub over loopback. It is not enough for a
+	# node elsewhere: the agent trusts public roots only, so a remote node needs a
+	# real certificate, and that needs a domain.
+	if [ -z "$SITE" ] && [ -n "$HTTPS" ]; then
+		printf '  %s只有面板和本机节点能用%s\n' "$B" "$N"
+		printf '     自签证书浏览器点一次「继续」就过了，但远程节点的 agent 只认公共 CA 签的证书，\n'
+		printf '     它会直接连不上。要有远程节点，两条路：\n'
+		printf '       · 等域名解析过来后重跑：--site https://你的域名（推荐，全程加密）\n'
+		printf '       · 或者重跑加 --plain：面板明文跑在公网，token 会裸奔\n'
+	fi
+	# The one deployment where the credentials the panel hands out really do
+	# cross the network in the clear. Said here where the operator reads it, and
+	# again by the hub at startup, where it is seen on the next restart.
+	if [ -n "$PLAIN" ]; then
+		printf '  %s面板在公网上是明文的%s\n' "$B" "$N"
+		printf '     登录密码、会话 cookie、节点 token 都不加密，抓包就能拿走；\n'
+		printf '     拿到 token 就能接管对应节点。只在你信得过的网络里这么用。\n'
+		printf '     哪天有域名了，重跑一次加 --https 或 --site https://你的域名 就能收紧。\n'
+	fi
+}
+
+# ---- https without a domain ----
+# Terminates TLS in front of the loopback hub, so a hub with no domain is still
+# reached over an encrypted hop rather than a plaintext one. The hub keeps
+# listening on 127.0.0.1 throughout; only nginx is exposed.
+#
+# The certificate is self-signed, which is what makes this work without a
+# domain and also what limits it: see the note the caller prints afterwards.
+#
+# Debian and Ubuntu include sites-enabled/; RHEL and Alpine include conf.d/.
+# Both sit inside the http block, which is where a server block belongs, so the
+# file goes wherever this nginx already looks.
+# Drops the listener an earlier --https run installed, and says so. Called when
+# a domain is configured instead: the self-signed site holds its port as the
+# default server, so leaving it would shadow the real certificate.
+remove_https_site() {
+	for dir in /etc/nginx/sites-enabled /etc/nginx/conf.d; do
+		[ -f "$dir/monitor-hub-https.conf" ] || continue
+		rm -f "$dir/monitor-hub-https.conf"
+		if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
+			systemctl reload nginx 2>/dev/null || true
+		fi
+		warn "已删掉之前 --https 装的自签配置（$dir/monitor-hub-https.conf），交回给你的域名证书"
+	done
+}
+
+# This machine's public address, as the address bar and the install command will
+# have it. Three services because any one of them can be unreachable from here,
+# and the address the default route leaves from as a last resort -- which on a
+# VPS with a public address is the one asked for, and behind NAT is not.
+public_ip() {
+	addr=""
+	for src in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+		addr="$(curl -fsS --max-time 8 "$src" 2>/dev/null | tr -d '[:space:]')"
+		case "$addr" in "" | *[!0-9.]*) addr="" ;; *) break ;; esac
+	done
+	if [ -z "$addr" ]; then
+		addr="$(ip -4 route get 1.1.1.1 2>/dev/null |
+			sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
+	fi
+	printf '%s' "$addr"
+}
+
+find_nginx() {
+	NGINX_BIN="$(command -v nginx || true)"
+	NGINX_CONF_DIR=""
+	if [ -d /etc/nginx/sites-enabled ]; then
+		NGINX_CONF_DIR=/etc/nginx/sites-enabled
+	elif [ -d /etc/nginx/conf.d ]; then
+		NGINX_CONF_DIR=/etc/nginx/conf.d
+	fi
+	if [ -n "$NGINX_BIN" ] && [ -n "$NGINX_CONF_DIR" ]; then return 0; fi
+	return 1
+}
+
+install_nginx() {
+	if command -v apt-get >/dev/null 2>&1; then
+		DEBIAN_FRONTEND=noninteractive apt-get update -qq &&
+			DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx
+	elif command -v dnf >/dev/null 2>&1; then
+		dnf install -y -q nginx
+	elif command -v yum >/dev/null 2>&1; then
+		yum install -y -q nginx
+	elif command -v apk >/dev/null 2>&1; then
+		apk add --no-cache nginx
+	else
+		return 1
+	fi
+}
+
+setup_https() {
+	command -v openssl >/dev/null 2>&1 ||
+		die "自签证书要 openssl，先装上（apt install openssl / dnf install openssl）"
+	# -addext is the only way to put an address in the subjectAltName from the
+	# command line, and a certificate without one is refused by every current
+	# browser -- CN alone has been ignored since Chrome 58.
+	openssl req -help 2>&1 | grep -q -- '-addext' ||
+		die "openssl 太旧，不支持 -addext（要 1.1.1 以上）。升级后重跑"
+
+	if ! find_nginx; then
+		printf '  装 nginx……\n'
+		install_nginx || die "装不上 nginx。手动装好再重跑，或用 --site 自己配反代"
+		find_nginx || die "装完还是找不到 nginx 和它 include 的目录"
+	fi
+
+	# Something else on the port means this listener never comes up, and the
+	# reload below would fail after the config was already written. Checked
+	# first, so a refusal leaves nginx exactly as it was.
+	if command -v ss >/dev/null 2>&1; then
+		holder="$(ss -ltnpH "sport = :$HTTPS_PORT" 2>/dev/null |
+			sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)"
+		if [ -n "$holder" ] &&
+			[ "$(readlink -f "/proc/$holder/exe" 2>/dev/null)" != "$(readlink -f "$NGINX_BIN")" ]; then
+			die "端口 $HTTPS_PORT 被别的程序占着（pid $holder）。换一个：--https-port <n>"
+		fi
+	fi
+
+	# The address the user will type into the address bar, and the one that has
+	# to be in the certificate. A domain may not resolve here yet, so the
+	# machine's own public address is what there is to name. Worth getting
+	# right: a certificate naming a different address gives the browser a name
+	# mismatch, which is a much harder warning to click through than the
+	# self-signed one this is meant to produce.
+	ip="$(public_ip)"
+	[ -n "$ip" ] || die "取不到本机公网地址，签不了证书。改用 --site 配反代"
+
+	certdir=/etc/nginx/ssl
+	cert="$certdir/monitor-hub.crt"
+	key="$certdir/monitor-hub.key"
+	if [ -f "$cert" ] && [ -f "$key" ]; then
+		ok "证书" "沿用 $certdir 里已有的"
+	else
+		install -d -m 0755 "$certdir"
+		# A leaf certificate, not a CA one. `req -x509` defaults to
+		# `basicConstraints=critical,CA:TRUE` and emits no key usage at all,
+		# which is a CA certificate pressed into service as a server
+		# certificate: rustls rejects it outright with CaUsedAsEndEntity, and
+		# browsers outside Chrome are stricter about it than they need to be.
+		openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+			-keyout "$key" -out "$cert" -subj "/CN=$ip" \
+			-addext "basicConstraints=critical,CA:FALSE" \
+			-addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+			-addext "extendedKeyUsage=serverAuth" \
+			-addext "subjectAltName=IP:$ip,IP:127.0.0.1,DNS:localhost" >/dev/null 2>&1 ||
+			die "证书生成失败"
+		chmod 0600 "$key"
+		ok "证书" "自签十年，$ip（浏览器会警告一次）"
+	fi
+
+	# Debian defines this map in its own nginx.conf. Where it is not defined --
+	# RHEL, Alpine -- it has to come from somewhere, and defining it twice is a
+	# duplicate-map error that fails the reload.
+	head=""
+	"$NGINX_BIN" -T 2>/dev/null | grep -q 'map \$http_upgrade \$connection_upgrade' ||
+		head='map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ""      close;
+}
+'
+	site="$NGINX_CONF_DIR/monitor-hub-https.conf"
+	cat >"$site" <<CONF
+${head}server {
+    listen $HTTPS_PORT ssl default_server;
+    listen [::]:$HTTPS_PORT ssl default_server;
+    server_name _;
+
+    ssl_certificate     $cert;
+    ssl_certificate_key $key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # No HSTS. It outlives the warning the user clicks through and would pin the
+    # browser to a certificate nobody can verify, leaving no way back.
+    client_max_body_size 64m;
+
+    location / {
+        proxy_pass http://127.0.0.1:$PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        # Without --site the hub decides the session cookie's Secure flag from
+        # this header alone; a proxy that omits it costs the flag.
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade           \$http_upgrade;
+        proxy_set_header Connection        \$connection_upgrade;
+        # The panel's live view is one long-lived WebSocket.
+        proxy_read_timeout 3600s;
+    }
+}
+CONF
+
+	# Written then tested, and removed again on failure, so a config this nginx
+	# will not accept never reaches a reload.
+	if ! "$NGINX_BIN" -t >/dev/null 2>&1; then
+		msg="$("$NGINX_BIN" -t 2>&1)"
+		rm -f "$site"
+		die "nginx 配置检查没过，刚写的文件已删除。$msg"
+	fi
+	if systemctl is-active --quiet nginx 2>/dev/null; then
+		systemctl reload nginx || die "nginx 重载失败"
+	else
+		systemctl enable --now nginx >/dev/null 2>&1 || die "nginx 起不来"
+	fi
+	PANEL="https://$ip"
+	[ "$HTTPS_PORT" = 443 ] || PANEL="$PANEL:$HTTPS_PORT"
+	ok "HTTPS" "$PANEL"
+}
+
+# Creates the node this machine reports as, straight in the database rather than
+# through the panel's API. The API refuses a node added from a plain-http entry,
+# which is how a hub without a domain is reached; and a token made here never
+# crosses the network. Running it twice reuses the node of that name, so an
+# upgrade does not leave a second one behind.
+add_local_node() {
+	[ -n "$1" ] || return 0
+	token="$("$BIN" --db "$DATA/monitor.db" --add-local-node "$1" |
+		sed -n 's/^Node token: //p')"
+	[ -n "$token" ] ||
+		die "建本机节点失败。手动看报错：$BIN --db $DATA/monitor.db --add-local-node $1"
+	printf '\n'
+	printf '  %s本机节点%s  %s\n' "$B" "$N" "$1"
+	printf '  %s服务器和面板是同一台机器时，再跑这一条把 agent 装上：%s\n' "$D" "$N"
+	printf '    curl -fsSL http://127.0.0.1:%s/install.sh | sudo sh -s -- --server http://127.0.0.1:%s --token %s\n' \
+		"$PORT" "$PORT" "$token"
 }
 
 # ---- password ----
@@ -438,6 +713,32 @@ menu() {
 			PORT="$(ask "监听端口" "${carried:-$PORT}")"
 			check_port "$PORT"
 			PORT_SET=1
+			# Offered as the default where an earlier run installed it, so
+			# pressing Enter on an upgrade keeps the panel reachable at the
+			# address it is already at.
+			https_default=n
+			if [ -f /etc/nginx/sites-enabled/monitor-hub-https.conf ] ||
+				[ -f /etc/nginx/conf.d/monitor-hub-https.conf ]; then
+				https_default=y
+			fi
+			reply="$(ask "没有域名？签自签证书 + 配好 nginx（浏览器会警告一次）" "$https_default")"
+			case "$reply" in y | Y | yes) HTTPS=1 ;; *) HTTPS="" ;; esac
+			# Asked only when the answer above was no: the two are alternatives
+			# to each other, not settings that combine. Offered as the default
+			# where the running unit already answers on the public interface, so
+			# pressing Enter on an upgrade leaves it there.
+			plain_default=n
+			case "$(old_exec)" in
+			0.0.0.0:* | "[::]:"*) plain_default=y ;;
+			esac
+			if [ -z "$HTTPS" ]; then
+				reply="$(ask "也不用证书？面板明文跑在公网（token 会裸奔）" "$plain_default")"
+				case "$reply" in y | Y | yes) PLAIN=1 ;; *) PLAIN="" ;; esac
+			fi
+			# Blank skips it. Asked because the hub and the agent are on one
+			# machine often enough that the panel's own install command, which
+			# needs a domain, is not the way to add this node.
+			LOCAL_NODE="$(ask "顺手把本机也建成节点？填名字，回车跳过" "")"
 			printf '\n'
 			install_hub
 			press
@@ -458,22 +759,41 @@ monitor hub 安装器
 
   sudo ./install-hub.sh                有终端时给菜单，否则按默认安装
   sudo ./install-hub.sh --port 8443    指定端口安装
+  sudo ./install-hub.sh --plain        没有域名时用：面板明文跑在公网，不加密
+  sudo ./install-hub.sh --https        没有域名时用：签自签证书 + 配好 nginx
   sudo ./install-hub.sh --uninstall    卸载，保留数据
   sudo ./install-hub.sh --purge        卸载并删除数据库
   sudo ./install-hub.sh --reset-password
                                        重置面板密码，登出所有会话
 
   --port <n>     本机监听端口，默认 $PORT
+  --plain        没有域名、也不想配证书时用。hub 直接监听公网，面板走 http://
+                 公网IP:端口。**登录密码、会话 cookie、节点 token 都不加密**，
+                 抓包就能拿走，拿到 token 就能接管节点。好处是零依赖、零维护，
+                 远程节点也能加。只在信得过的网络里这么用
+  --https        面板没有域名、但想要加密时用。安装器装好 nginx，签一张
+                 自签证书，把 443 反代到本机的 hub。浏览器第一次会警告「不安全」，
+                 点「继续」即可；流量是加密的。只有面板和本机 agent 能用——
+                 远程节点的 agent 只认公共 CA 签的证书，等域名解析过来后加
+                 --site https://你的域名 重跑一次即可
+  --https-port <n>
+                 自签 HTTPS 的监听端口，默认 443
+  --local-node <名字>
+                 顺手把本机这个节点建好，并打印装 agent 的命令。服务器和面板是
+                 同一台机器时用；token 只在本地生成，不过网。重名会复用不重复建
   --site <url>   一般不用填。面板拼安装命令用的是浏览器地址栏，配好反代
                  用域名访问就自动对了。三种情况要填：节点该连的域名和你
                  进面板的域名不是同一个；走 SSH 隧道进面板（地址栏是
                  127.0.0.1，节点连不上它）；反代不发 X-Forwarded-Proto
                  （那时会话 cookie 拿不到 Secure 标志）
+                 写 https:// 时后面必须是域名；没有域名就写 http:// 加公网
+                 IP 和端口，配合 --plain 用
   --yes, -y      跳过确认
   --help, -h     显示这段
 
-hub 只监听 127.0.0.1，公网访问不到，需要自己配 nginx / caddy / CF 隧道把
+hub 默认只监听 127.0.0.1，公网访问不到，需要自己配 nginx / caddy / CF 隧道把
 域名指过来，配法见 https://monitor-document.pages.dev/install/reverse-proxy
+没有域名就用 --https（加密，但只有本机能连）或 --plain（明文，但哪台都能连）。
 
 重跑一次就是升级：校验通过后才替换二进制，起不来会自动回滚到上一版；
 没写的参数沿用上次的，所以升级不会把端口和 --site 冲掉。
@@ -489,6 +809,10 @@ while [ $# -gt 0 ]; do
 	# this message.
 	--port) [ $# -ge 2 ] || die "--port 后面要跟端口号"; PORT="$2"; PORT_SET=1; shift 2 ;;
 	--site) [ $# -ge 2 ] || die "--site 后面要跟地址"; SITE="$2"; SITE_SET=1; shift 2 ;;
+	--https) HTTPS=1; shift ;;
+	--https-port) [ $# -ge 2 ] || die "--https-port 后面要跟端口号"; HTTPS_PORT="$2"; HTTPS_PORT_SET=1; shift 2 ;;
+	--plain) PLAIN=1; shift ;;
+	--local-node) [ $# -ge 2 ] || die "--local-node 后面要跟节点名"; LOCAL_NODE="$2"; shift 2 ;;
 	--uninstall) ACTION=uninstall; shift ;;
 	--purge) ACTION=uninstall; PURGE=1; shift ;;
 	--reset-password) ACTION=reset; shift ;;
@@ -499,6 +823,13 @@ while [ $# -gt 0 ]; do
 done
 
 check_port "$PORT"
+check_port "$HTTPS_PORT"
+# The two answer different situations, and together they contradict: --https
+# installs a self-signed listener as the port's default server, while --site
+# states that a real certificate is already in front of the hub.
+if [ -n "$HTTPS" ] && [ -n "$SITE" ]; then
+	die "--https 和 --site 别一起给。有域名就自己配反代、用 --site 告诉 hub 节点该连哪个地址；--https 是给没有域名的人签自签证书的"
+fi
 # The same form `api::https_domain` measures --site against on the hub, checked
 # here because this is where the value is entered. A hub started with a value it
 # refuses starts normally and then declines to add or install any node, which
@@ -506,23 +837,48 @@ check_port "$PORT"
 SITE="${SITE%/}"
 if [ -n "$SITE" ]; then
 	case "$SITE" in
-	https://*) ;;
-	*) die "--site 必须以 https:// 开头：$SITE" ;;
+	https://*) scheme=https ;;
+	http://*) scheme=http ;;
+	*) die "--site 要以 https:// 或 http:// 开头：$SITE" ;;
 	esac
-	rest="${SITE#https://}"
+	rest="${SITE#*://}"
 	case "$rest" in
-	*/*) die "--site 后面不能带路径，只要 https://域名[:端口]：$SITE" ;;
+	*/*) die "--site 后面不能带路径，只要 协议://主机[:端口]：$SITE" ;;
 	*@*) die "--site 里不能带用户名：$SITE" ;;
-	"["*) die "--site 必须是域名，不能是 IP 地址：$SITE" ;;
 	esac
-	# A port is permitted; what precedes it must be a name rather than an
-	# address.
-	case "${rest%%:*}" in
-	"" | localhost | *.localhost) die "--site 必须是一个域名：$SITE" ;;
-	*[!0-9.]*) ;;
-	*) die "--site 必须是域名而不是 IP 地址：$SITE" ;;
+	# IPv6 literals are bracketed, so the port is not split off at the first
+	# colon. The same shape `loopback_origin` parses on the hub.
+	case "$rest" in
+	"["*) site_host="${rest#\[}"; site_host="${site_host%%]*}" ;;
+	*) site_host="${rest%%:*}" ;;
 	esac
+	[ -n "$site_host" ] || die "--site 里要有主机名或地址：$SITE"
+	# An address on this machine names nothing a node could reach. The hub
+	# refuses the same values, in `plain_entry` and `https_domain`.
+	case "$site_host" in
+	localhost | *.localhost | 0.0.0.0 | "::" | "::1" | 127.*) die "--site 不能用本机地址：$SITE" ;;
+	esac
+	# https needs a name: a certificate is issued to one, and a browser refuses
+	# an address before the page loads. http is the no-domain path, where there
+	# is no name to use, so anything a node can reach is allowed.
+	if [ "$scheme" = https ]; then
+		case "$site_host" in
+		*[!0-9.]*) ;;
+		*) die "--site 用 https:// 时必须是域名，不能是 IP 地址：$SITE" ;;
+		esac
+	fi
 fi
+# The two answers to having no domain, and they contradict: one encrypts with a
+# certificate this machine signs for itself, the other does not encrypt at all.
+if [ -n "$HTTPS" ] && [ -n "$PLAIN" ]; then
+	die "--https 和 --plain 是相反的两条路，只能给一个：--https 签自签证书加密，--plain 完全不加密"
+fi
+case "$SITE" in
+https://*)
+	[ -z "$PLAIN" ] ||
+		die "--plain 是明文部署，--site 不能写 https://：去掉 --plain，或把 --site 改成 http://"
+	;;
+esac
 [ "$(id -u)" = 0 ] || die "需要 root：sudo sh $0"
 command -v curl >/dev/null 2>&1 || die "需要 curl"
 command -v sha256sum >/dev/null 2>&1 || die "需要 sha256sum（装 coreutils）"

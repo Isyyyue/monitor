@@ -309,6 +309,8 @@ struct Args {
     site: String,
     themes: PathBuf,
     reset_password: bool,
+    /// `Some(name)` when `--add-local-node` was given.
+    add_local_node: Option<String>,
 }
 
 /// The default listen address. A v6 wildcard also accepts IPv4 through
@@ -332,6 +334,7 @@ fn parse_args() -> Result<Args> {
     let mut site = String::new();
     let mut themes = None;
     let mut reset_password = false;
+    let mut add_local_node = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_default();
@@ -341,11 +344,13 @@ fn parse_args() -> Result<Args> {
             "--site" => site = value(),
             "--themes" => themes = Some(PathBuf::from(value())),
             "--reset-password" => reset_password = true,
+            "--add-local-node" => add_local_node = Some(value()),
             "-h" | "--help" => {
                 println!(
                     "monitor-hub {}\n\n\
                      Usage: monitor-hub [--listen [::]:28080] [--db monitor.db] [--themes themes] [--site https://hub.example.com]\n       \
-                     monitor-hub --db monitor.db --reset-password\n\n\
+                     monitor-hub --db monitor.db --reset-password\n       \
+                     monitor-hub --db monitor.db --add-local-node NAME\n\n\
                      --listen defaults to [::]:28080, one socket serving IPv6 and IPv4\n\
                      both; where the kernel has no dual-stack sockets it is 0.0.0.0:28080.\n\
                      --themes defaults to a themes/ directory beside the database.\n\
@@ -359,7 +364,13 @@ fn parse_args() -> Result<Args> {
                      X-Forwarded-Proto, since it then sets the session cookie's Secure\n\
                      flag. A value that is not an https:// domain disables adding nodes.\n\
                      --reset-password replaces the emergency password, signs every session\n\
-                     out, prints the new password and exits. The database must exist.",
+                     out, prints the new password and exits. The database must exist.\n\
+                     --add-local-node creates the node this machine reports as, prints its\n\
+                     token and exits; a node already carrying that name is reused rather\n\
+                     than a second one created. It exists because the panel's own API\n\
+                     refuses to add a node from a plain http:// entry, which is how a hub\n\
+                     without a domain is reached, and because a node created here never\n\
+                     has its token cross the network. The database must exist.",
                     env!("CARGO_PKG_VERSION")
                 );
                 std::process::exit(0);
@@ -379,6 +390,7 @@ fn parse_args() -> Result<Args> {
         site: site.trim_end_matches('/').to_owned(),
         themes,
         reset_password,
+        add_local_node,
     })
 }
 
@@ -401,6 +413,31 @@ async fn main() -> Result<()> {
         anyhow::ensure!(std::path::Path::new(&args.database).is_file(), "no database at {}", args.database);
         // install-hub.sh extracts the password by this exact line prefix.
         println!("Emergency password: {}", new_password(&Db::open(&args.database)?)?);
+        return Ok(());
+    }
+    // The node this machine reports as, created before the agent is installed so
+    // the installer can hand the agent a token without one ever crossing the
+    // network. The panel's own API refuses a node added from a plain http://
+    // entry, which is how a hub without a domain is reached, so this path exists
+    // for the install the panel cannot serve.
+    if let Some(name) = args.add_local_node.as_deref() {
+        anyhow::ensure!(std::path::Path::new(&args.database).is_file(), "no database at {}", args.database);
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "--add-local-node needs a name");
+        let db = Db::open(&args.database)?;
+        // Reused rather than duplicated: running the installer twice on one
+        // machine must not leave two nodes behind, and the token the agent
+        // already holds is the one it will keep presenting.
+        let existing = db.nodes()?.into_iter().find(|n| n.name == name);
+        // install-hub.sh extracts the token by this exact line prefix.
+        match existing {
+            Some(node) => println!("Node token: {}", node.token),
+            None => {
+                let token = auth::random_token();
+                db.create_node(&db::Node { name: name.to_owned(), ..Default::default() }, &token)?;
+                println!("Node token: {token}");
+            }
+        }
         return Ok(());
     }
     std::fs::create_dir_all(&args.themes)?;
@@ -449,18 +486,21 @@ async fn main() -> Result<()> {
         );
     }
     // Checked once here, because the answer is static: `provisioning_allowed`
-    // measures every request against --site, so a value that is not an https
-    // domain permanently refuses adding and installing nodes however the panel is
-    // reached. The panel names --site in that refusal, and this warning reaches
-    // an operator who never opens the panel. A warning rather than a fatal
-    // error: the hub still serves everything else, and an operator upgrading
-    // into this check should not lose a running hub. `install-hub.sh` refuses
-    // the same values where they are entered.
-    if !args.site.is_empty() && api::https_domain(&args.site).is_none() {
+    // measures every request against --site, so a value that is neither an https
+    // domain nor a plaintext entry permanently refuses adding and installing
+    // nodes however the panel is reached. The panel names --site in that refusal,
+    // and this warning reaches an operator who never opens the panel. A warning
+    // rather than a fatal error: the hub still serves everything else, and an
+    // operator upgrading into this check should not lose a running hub.
+    // `install-hub.sh` refuses the same values where they are entered.
+    if !args.site.is_empty()
+        && api::https_domain(&args.site).is_none()
+        && api::plain_entry(&args.site).is_none()
+    {
         warn!(
-            "--site {} is not an https domain entry, so adding and installing nodes will be refused \
-             however the panel is reached: it has to be https://, a domain rather than an address, \
-             and nothing after the host",
+            "--site {} is neither an https domain nor a plaintext entry, so adding and installing \
+             nodes will be refused however the panel is reached: it has to be https:// with a domain, \
+             or http:// with a public address, and nothing after the host",
             args.site
         );
     }

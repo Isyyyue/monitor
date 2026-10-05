@@ -13,6 +13,12 @@ fn main() {
     println!("cargo:rerun-if-changed=web-theme.pin");
     println!("cargo:rerun-if-changed=target/theme/.pin");
     println!("cargo:rerun-if-changed=scripts/theme.sh");
+    // The panel is embedded by `frontend.rs`, and a build script that emits any
+    // `rerun-if-changed` at all replaces cargo's own "something in the package
+    // changed" heuristic. Without this line a rebuilt `web-admin/dist` triggers
+    // no rebuild, and the hub keeps serving the previous bundle in silence --
+    // which is how a panel change can be built, tested and then not shipped.
+    println!("cargo:rerun-if-changed=web-admin/dist");
 
     match Command::new("sh").arg("scripts/theme.sh").status() {
         Ok(status) if status.success() => {}
