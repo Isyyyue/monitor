@@ -1901,6 +1901,9 @@ type Theme = {
   config?: unknown
   // 主题包是否带 preview.png，由 hub 告知，卡片的高度一次排定，不因图片晚到而改变。
   preview: boolean
+  // hub 知道怎么下载、但还没装的主题：卡片画「下载」而不是「使用」。装完这张卡片
+  // 就换成普通主题那张，hub 不再把它算进清单。
+  downloadable: boolean
 }
 
 // 主题在 theme.json 里声明的设置。hub 只存与默认值不同的项，其余由主题用自己的默认值补上，
@@ -2095,7 +2098,28 @@ function Themes() {
 
   // Only a theme whose manifest names a GitHub repository has a source to update
   // from; the hub refuses anything else, and this merely hides the button.
-  const updatable = (theme: Theme) => theme.url.startsWith("https://github.com/")
+  //
+  // A downloadable one is not installed yet, so there is nothing to update --
+  // its `url` is the package itself, not a repository the hub could look a
+  // release up in.
+  const updatable = (theme: Theme) => !theme.downloadable && theme.url.startsWith("https://github.com/")
+
+  // Downloads a theme the hub knows how to fetch. Only the short name goes up:
+  // the URL lives in the hub's own list, because unpacking an archive into the
+  // directory the public page is served from is not something the caller of an
+  // HTTP endpoint should get to aim.
+  async function install(theme: Theme) {
+    setBusy(`install:${theme.short}`)
+    try {
+      await api(`/themes/${theme.short}/install`, { method: "POST" })
+      toast.success(`${theme.name} 已下载`)
+      load()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setBusy("")
+    }
+  }
 
   async function update(theme: Theme) {
     setBusy(`update:${theme.short}`)
@@ -2164,9 +2188,15 @@ function Themes() {
                 </div>
               </div>
               <div className="flex shrink-0 items-center gap-1">
-                <Button size="sm" variant={theme.selected ? "secondary" : "default"} disabled={theme.selected} onClick={() => select(theme.short)}>
-                  {theme.selected ? "使用中" : "使用"}
-                </Button>
+                {theme.downloadable ? (
+                  <Button size="sm" disabled={!!busy} onClick={() => install(theme)}>
+                    {busy === `install:${theme.short}` ? "下载中…" : "下载"}
+                  </Button>
+                ) : (
+                  <Button size="sm" variant={theme.selected ? "secondary" : "default"} disabled={theme.selected} onClick={() => select(theme.short)}>
+                    {theme.selected ? "使用中" : "使用"}
+                  </Button>
+                )}
                 {configFields(theme.config).length > 0 && (
                   <Button size="icon" variant="ghost" title="主题设置" aria-label="主题设置" onClick={() => configure(theme)}>
                     <SlidersHorizontal />
@@ -2186,8 +2216,10 @@ function Themes() {
                 )}
                 {/* The built-in theme is served from the binary and has no
                     directory to delete -- it is also the fallback everything
-                    else lands on. */}
-                {!theme.builtin && (
+                    else lands on. A downloadable one has no directory either:
+                    it is not installed yet, which is what the button beside
+                    this one is for. */}
+                {!theme.builtin && !theme.downloadable && (
                   <Button size="icon" variant="ghost" title="删除主题" aria-label="删除主题" disabled={!!busy} onClick={() => setDoomed(theme)}>
                     <Trash2 />
                   </Button>
