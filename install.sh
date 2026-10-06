@@ -95,7 +95,7 @@ if [ -n "$UNINSTALL" ]; then
 	rm -rf "$SUB_HOME"
 	# nginx 前面那一段也撤掉，并重载 —— 留着一条指向已删服务的 location，
 	# 要等下一次 reload 才会发现。
-	rm -f "$SUB_NGINX_CONF"
+	rm -f "$SUB_NGINX_CONF" "$SUB_NGINX_CONF.monitor-prev"
 	if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
 		systemctl reload nginx 2>/dev/null || rc-service nginx reload >/dev/null 2>&1 || true
 	fi
@@ -613,8 +613,10 @@ setup_subscription() {
 #
 # 必须是 default_server：同端口上已经有别的 server 时，`server_name _` 那份会被
 # 盖住 —— 请求落到别人的 default 上，订阅就 404，而配置文件本身看着没问题。
-# 已经有别人占着 default_server 时 `nginx -t` 会不过，那时我们删掉刚写的、退回
-# 自己绑端口，绝不把一份 nginx 不接受的配置留在 conf.d 里。
+#
+# 返回 0 = 新配置已生效；2 = 新配置不行、但上一轮那份还原回来仍可用（继续走
+# nginx）；1 = 两边都不行，调用方退到自己绑端口。绝不把一份 nginx 起不来的配置
+# 留在 conf.d 里。
 write_sub_nginx() {
 	# 写之前先把上一轮那份留下来。`cat >` 是截断写，而 nginx -t 失败可能不是
 	# 因为这份新配置 —— 比如别人同时改坏了别的站点。那种情况下若不还原，我们

@@ -177,4 +177,22 @@ grep -q '^HTTPS_PORT="8444"' "$HUB_INSTALL" ||
 grep -q '\[ "\$HTTPS_PORT" = 443 \] || PANEL="\$PANEL:\$HTTPS_PORT"' "$HUB_INSTALL" ||
 	fail "the 443 comparison in install-hub.sh changed; 443 is https's implicit port"
 
+# --- 4. 备份文件不会被 nginx 当成配置 ----------------------------------------
+#
+# write_sub_nginx saves the previous file next to its own, and nginx loads
+# everything matching *.conf in that directory. A suffix ending in .conf would
+# make nginx read the backup as a second vhost on the same port -- two servers
+# claiming default_server, which nginx refuses to start with.
+grep -q 'backup="\$SUB_NGINX_CONF\.monitor-prev"' "$INSTALL" ||
+	fail "the nginx backup is no longer named alongside the vhost"
+backupname=$(grep -o 'backup="\$SUB_NGINX_CONF[^"]*"' "$INSTALL" | head -1)
+case $backupname in
+*.conf\") fail "the nginx backup name ends in .conf, so nginx would load it" ;;
+esac
+
+# The uninstaller has to take the backup with it, or a removed install leaves a
+# file behind in a directory nginx reads.
+grep -q 'rm -f "\$SUB_NGINX_CONF" "\$SUB_NGINX_CONF.monitor-prev"' "$INSTALL" ||
+	fail "uninstall does not remove the nginx backup"
+
 echo "install-test: ok"
