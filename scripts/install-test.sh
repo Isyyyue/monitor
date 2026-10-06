@@ -63,12 +63,13 @@ def_unit=$3
 # than the closing one matched: several of these bodies hold a function-local
 # block, whose `}` sits in column one exactly like the function's own.
 extract() {
-	start=$(grep -n "^$1() {" "$INSTALL" | cut -d: -f1)
-	[ -n "$start" ] || fail "$1 is not defined in $INSTALL"
+	from=${2:-$INSTALL}
+	start=$(grep -n "^$1() {" "$from" | cut -d: -f1)
+	[ -n "$start" ] || fail "$1 is not defined in $from"
 	awk -v s="$start" '
 		NR >= s { d += gsub(/{/, "{"); d -= gsub(/}/, "}"); print }
 		NR > s && d == 0 { exit }
-	' "$INSTALL"
+	' "$from"
 }
 
 FUNCS="pick_sub_port pick_public_port read_prev_sub write_sub_nginx sub_file_names check_subscription"
@@ -495,5 +496,68 @@ check "old_https_port reports nothing when there is no vhost" "NONE" "$(norm "$g
 # proxy must not be reachable on that path.
 grep -q 'if \[ -z "\$SITE" \] && \[ -z "\$HTTPS" \]; then' "$HUB_INSTALL" ||
 	fail "the reverse-proxy note no longer keys off HTTPS, so a re-run would print it"
+
+# --- 8. 卸载要把 nginx 那份配置一起收走 --------------------------------------
+#
+# The vhost is nginx's file, not systemd's, so disabling the unit does not take
+# it along. Left behind it holds its port and proxies to a hub that is gone:
+# a visitor gets 502, and the operator's next install finds the port taken.
+#
+# Measured on a real machine -- after `--uninstall`, nginx was still listening
+# on 0.0.0.0:8444 and answered 502 Bad Gateway. Nothing in the run said so.
+#
+# The cleanup is drop_https_site, shared with the domain path that already
+# needed it, so the two cannot drift apart.
+
+grep -q '^drop_https_site() {' "$HUB_INSTALL" ||
+	fail "install-hub.sh has no drop_https_site"
+
+# Both uninstall paths call it: the ordinary one, and the --purge branch on a
+# machine whose unit is already gone -- which is the state an older version of
+# this installer leaves behind, vhost and all.
+uninstall_body=$(awk '/^uninstall_hub\(\) \{/,/^\}$/' "$HUB_INSTALL")
+[ -n "$uninstall_body" ] || fail "uninstall_hub was not found in $HUB_INSTALL"
+# Counted with awk rather than `grep -c`: grep exits 1 when nothing matches, and
+# that code travels out of the command substitution, so `set -e` would end the
+# run right here -- with no message, on exactly the broken case this is meant to
+# report. awk prints 0 and exits 0.
+calls=$(printf '%s\n' "$uninstall_body" | awk '/drop_https_site/ { n++ } END { print n + 0 }')
+[ "$calls" -ge 2 ] ||
+	fail "uninstall_hub calls drop_https_site $calls time(s); both paths need it"
+
+# Run for real against a directory tree, with nginx and systemctl stubbed, so
+# the file handling and the return code are the installer's own.
+drop_probe() {
+	where=$1
+	root="$DIR/drop"
+	rm -rf "$root"
+	mkdir -p "$root/sites-enabled" "$root/conf.d"
+	[ -z "$where" ] || printf 'listen 8444 ssl default_server;\n' \
+		>"$root/$where/monitor-hub-https.conf"
+	(
+		cd "$root" || exit 1
+		# `command -v nginx` finds a shell function, which is what makes the
+		# guard inside drop_https_site take the reload branch.
+		nginx() { return 0; }
+		systemctl() { return 0; }
+		eval "$(extract drop_https_site "$HUB_INSTALL" | sed 's#/etc/nginx#'"$root"'#g')"
+		rc=0
+		drop_https_site || rc=$?
+		left=$(find "$root" -name 'monitor-hub-https.conf' | wc -l | tr -d ' ')
+		printf 'rc=%s left=%s' "$rc" "$left"
+	)
+}
+
+got=$(drop_probe sites-enabled)
+check "uninstall drops the vhost it wrote" "rc=0 left=0" "$got"
+
+# Debian puts it in sites-enabled, RHEL and Alpine in conf.d; both are cleaned.
+got=$(drop_probe conf.d)
+check "uninstall drops it under conf.d too" "rc=0 left=0" "$got"
+
+# A machine without one is not an error, or the caller would report a cleanup
+# it did not do.
+got=$(drop_probe '')
+check "nothing to drop reports non-zero" "rc=1 left=0" "$got"
 
 echo "install-test: ok"

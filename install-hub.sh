@@ -485,29 +485,34 @@ UNIT
 	fi
 }
 
-# ---- https without a domain ----
-# Terminates TLS in front of the loopback hub, so a hub with no domain is still
-# reached over an encrypted hop rather than a plaintext one. The hub keeps
-# listening on 127.0.0.1 throughout; only nginx is exposed.
+# Drops the listener an earlier --https run installed, and reloads nginx so the
+# port is actually let go. Silent, and hands the path back in $dropped_site: the
+# two callers have different things to say about it, one handing the port to a
+# domain certificate and the other leaving nothing behind.
 #
-# The certificate is self-signed, which is what makes this work without a
-# domain and also what limits it: see the note the caller prints afterwards.
-#
-# Debian and Ubuntu include sites-enabled/; RHEL and Alpine include conf.d/.
-# Both sit inside the http block, which is where a server block belongs, so the
-# file goes wherever this nginx already looks.
-# Drops the listener an earlier --https run installed, and says so. Called when
-# a domain is configured instead: the self-signed site holds its port as the
-# default server, so leaving it would shadow the real certificate.
-remove_https_site() {
+# Returns non-zero when there was nothing to drop, so a caller can stay quiet
+# about work it did not do.
+drop_https_site() {
+	dropped_site=""
 	for dir in /etc/nginx/sites-enabled /etc/nginx/conf.d; do
 		[ -f "$dir/monitor-hub-https.conf" ] || continue
 		rm -f "$dir/monitor-hub-https.conf"
-		if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
-			systemctl reload nginx 2>/dev/null || true
-		fi
-		warn "已删掉之前 --https 装的自签配置（$dir/monitor-hub-https.conf），交回给你的域名证书"
+		dropped_site="$dir/monitor-hub-https.conf"
 	done
+	[ -n "$dropped_site" ] || return 1
+	# Tested before reloading: a reload of a config nginx will not accept leaves
+	# the old one running, so the port would stay held while the file is gone.
+	if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
+		systemctl reload nginx 2>/dev/null || true
+	fi
+	return 0
+}
+
+# Called when a domain is configured instead: the self-signed site holds its
+# port as the default server, so leaving it would shadow the real certificate.
+remove_https_site() {
+	drop_https_site || return 0
+	warn "已删掉之前 --https 装的自签配置（$dropped_site），交回给你的域名证书"
 }
 
 # This machine's public address, as the address bar and the install command will
@@ -554,6 +559,17 @@ install_nginx() {
 	fi
 }
 
+# ---- https without a domain ----
+# Terminates TLS in front of the loopback hub, so a hub with no domain is still
+# reached over an encrypted hop rather than a plaintext one. The hub keeps
+# listening on 127.0.0.1 throughout; only nginx is exposed.
+#
+# The certificate is self-signed, which is what makes this work without a
+# domain and also what limits it: see the note the caller prints afterwards.
+#
+# Debian and Ubuntu include sites-enabled/; RHEL and Alpine include conf.d/.
+# Both sit inside the http block, which is where a server block belongs, so the
+# file goes wherever this nginx already looks.
 setup_https() {
 	command -v openssl >/dev/null 2>&1 ||
 		die "自签证书要 openssl，先装上（apt install openssl / dnf install openssl）"
@@ -733,6 +749,12 @@ uninstall_hub() {
 			rm -rf "$DATA"
 			rmdir "$ROOT" 2>/dev/null || true
 			ok "数据" "已删除"
+			# A hub uninstalled before this cleanup existed still has the vhost
+			# on disk, and this is the branch such a machine reaches. Picked up
+			# here as well, or the port would stay held for good.
+			if drop_https_site; then
+				ok "证书" "已删掉自签配置（$dropped_site），端口已释放"
+			fi
 			return 0
 		fi
 		[ ! -e "$DATA" ] || die "服务已经卸载了，数据还留在 $DATA；要一并删掉就加 --purge"
@@ -747,6 +769,14 @@ uninstall_hub() {
 	rm -f "$UNIT" "$BIN" "$BIN.old"
 	systemctl daemon-reload
 	ok "服务" "已移除"
+	# The vhost is nginx's, not systemd's, so disabling the unit leaves it
+	# behind: still listening on its port, still proxying to 127.0.0.1:$PORT,
+	# where nothing answers any more. A visitor gets 502, and the port stays
+	# taken for whatever the operator installs next. The installer wrote that
+	# file, so the uninstaller is what takes it away.
+	if drop_https_site; then
+		ok "证书" "已删掉自签配置（$dropped_site），端口已释放"
+	fi
 	if [ -n "$PURGE" ]; then
 		rm -rf "$DATA"
 		# Only when the agent is not installed alongside it.
