@@ -47,6 +47,18 @@ SUB_NGINX_CONF="/etc/nginx/conf.d/monitor-sub.conf"
 SUB_VIA_NGINX=""
 # 端口上已经有人在伺服同一批文件（手工装的那份）时置上：什么都不动，我们也不装。
 SUB_FOREIGN=""
+# 上一轮记下的订阅落位，按它决定这一轮的对外端口，而不是又猜一次 80。
+# 早读：重写 $ENV_FILE 的那一行是**截断写**，它晚于这份快照、早于用它的地方。
+SUB_PREV_PUBLIC=""
+SUB_PREV_PORT=""
+SUB_PREV_BIND=""
+read_prev_sub() {
+	[ -f "$ENV_FILE" ] || return 0
+	SUB_PREV_PUBLIC=$(sed -n 's/^MONITOR_SUB_PUBLIC_PORT=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+	SUB_PREV_PORT=$(sed -n 's/^MONITOR_SUB_PORT=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+	SUB_PREV_BIND=$(sed -n 's/^MONITOR_SUB_BIND=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+}
+read_prev_sub
 
 while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
@@ -496,19 +508,16 @@ nginx_holds() {
 }
 
 # 订阅服务在跑吗。重跑时要靠它认出「上一轮那个是我自己」。
+#
+# 只覆盖上一代那份独立服务。agent 自己伺服的那种机器没有这个服务名，它那侧的证据
+# 是 $ENV_FILE 里我们写过的订阅配置 —— 那份文件在本脚本较早的地方就被读成了
+# SUB_PREV_*（见 read_prev_sub），因为重写它的那次截断写晚于读取、又早于这里。
 sub_service_running() {
 	if [ "$INIT" = openrc ]; then
 		rc-service sub-dynamic status >/dev/null 2>&1
 	else
 		systemctl is-active --quiet sub-dynamic 2>/dev/null
 	fi
-}
-
-# agent 自己就是订阅服务（v1.9.0 起），所以「上一轮是我们装的」在那种机器上不能
-# 靠 sub-dynamic 这个服务名 —— 它已经被退役、根本不存在。看 agent 的 env 里有没有
-# 我们写过的订阅配置，那是同一个证据。
-sub_agent_serving() {
-	grep -q '^MONITOR_SUB_PORT=' "$ENV_FILE" 2>/dev/null
 }
 
 # nginx 装着、在跑 —— 才敢往里加一个 vhost。
@@ -551,6 +560,85 @@ grant_bind_capability() {
 	if ! setcap cap_net_bind_service=+ep "$BIN" 2>/dev/null; then
 		echo "warning: setcap failed; the agent may not be able to bind port $SUB_PORT" >&2
 	fi
+}
+
+# 订阅的文件名每次 provision 都会换一个随机串，只有状态文件里记着 —— 所以要验订阅
+# 得先问状态文件它叫什么。echo 出那三个名字，目录外的路径（状态文件被改过）一律忽略。
+sub_file_names() {
+	[ -f "$SUB_STATE" ] || return 0
+	# 状态文件是一行 JSON，三个键并列在同一行上，所以一个个抓而不是一次替换：
+	# 按行替换只会拿到每行的第一个匹配，另外两个会静默漏掉。
+	# 按逗号拆行再一个个看：`grep -o` 在这类单行 JSON 上一次只给一个匹配
+	# （GNU 与 BusyBox 都如此），三个键里会静默漏掉两个。
+	tr ',' '
+' <"$SUB_STATE" | while IFS= read -r pair; do
+		kind=${pair%%:*}
+		path=${pair#*:}
+		kind=${kind#*\"}
+		kind=${kind%%\"*}
+		path=${path#*\"}
+		path=${path%%\"*}
+		case "$kind" in
+		clash | v2ray_txt | v2ray_b64) ;;
+		*) continue ;;
+		esac
+		# 认文件名，不认路径：agent 也只认状态文件里那个文件的名字，比它更宽的
+		# 请求它自己就会拒掉。路径的目录部分（状态文件被改过时）直接忽略。
+		name=${path##*/}
+		[ -n "$name" ] && [ "$path" = "/var/lib/sing-box/$name" ] && echo "$name"
+	done
+}
+
+# 订阅到底能不能取到。端口在听只说明进程起来了，不代表请求有回答：状态文件在不在、
+# agent 找不找得到文件、nginx 有没有转对地方，任何一条断了都是 404 —— 而客户端把
+# 404 显示成「卡片上少了那一行」，不报错。所以这里真的取一次。
+#
+# 判据是 HTTP 200 且正文非空。subscription-userinfo 头缺失不算失败：它的值要 agent
+# 回头问 hub，hub 不可达时头就是空的，那不是订阅坏了（agent 自己就是这么设的）。
+# $1 = 对外的 URL 前缀（http://IP 或 http://IP:PORT）
+check_subscription() {
+	base=$1
+	names=$(sub_file_names)
+	[ -n "$names" ] || {
+		echo "warning: the subscription state file lists no routes: $SUB_STATE" >&2
+		return 1
+	}
+	hdr="$TMP.hdr"
+	failed=""
+	while read -r name; do
+		[ -n "$name" ] || continue
+		# 一次请求拿齐三样：状态码、正文字节数、响应头。正文不落盘 —— 这里要
+		# 知道的只是它有没有内容，不是内容本身。
+		read -r code size <<EOF
+		$(curl -sS -o /dev/null -D "$hdr" -w '%{http_code} %{size_download}' --max-time 10 \
+			"$base/$name" 2>/dev/null)
+EOF
+		case "$code" in
+		200) ;;
+		*)
+			echo "warning: $base/$name answered HTTP ${code:-nothing}" >&2
+			failed=1
+			continue
+			;;
+		esac
+		case "$size" in
+		"" | 0)
+			echo "warning: $base/$name answered 200 with an empty body" >&2
+			failed=1
+			continue
+			;;
+		esac
+	done <<NAMES
+$names
+NAMES
+	# 流量头只提示、不判失败：它的值要 agent 回头问 hub，hub 不可达时头就是空的，
+	# 那不是订阅坏了 —— agent 自己就是这么设的。最后一次请求的头留在 $hdr 里。
+	if [ -z "$failed" ]; then
+		grep -qi '^subscription-userinfo:' "$hdr" ||
+			echo "note: no subscription-userinfo header came back; clients show no traffic row" >&2
+	fi
+	rm -f "$hdr"
+	[ -z "$failed" ]
 }
 
 # 订阅伺服。**它现在就是 agent 自己** —— 不再有第二个进程、不再需要 python。
@@ -597,8 +685,8 @@ setup_subscription() {
 		fi
 	fi
 
-	# 端口真的在听才算成了。服务 active 只说明进程起来了：agent 绑不上时会记一条
-	# 警告继续跑监控，而面板和客户端上什么也看不出来。
+	# 端口真的在听，才算过了第一关：服务 active 只说明进程起来了，agent 绑不上时
+	# 会记一条警告继续跑监控，而面板和客户端上什么也看不出来。
 	i=0
 	while [ "$i" -lt 12 ] && ! listening "$served"; do
 		i=$((i + 1))
@@ -607,13 +695,69 @@ setup_subscription() {
 	if ! listening "$served"; then
 		echo "warning: nothing is listening on port $served, so the subscription is not being served" >&2
 		echo "         see: journalctl -u monitor-agent -n 20" >&2
+		return 1
+	fi
+
+	# 第二关：真的取一次。上面两关都过了、订阅仍然是 404 是可以发生的 —— 状态文件
+	# 被删、agent 找不到文件、nginx 转错了地方，都是这个结果，而客户端把它显示成
+	# 「卡片上少了那一行」，不报错。这里验不过就回到上一轮那份配置，别把一个取不到
+	# 的订阅留在原地址后面 —— 那比安装失败更难发现。
+	#
+	# 验的是**对外**那个地址，不是 agent 绑的那个：走 nginx 时后者只覆盖一半链路。
+	if check_subscription "http://127.0.0.1:$SUB_PORT"; then
+		if [ -n "$SUB_VIA_NGINX" ]; then
+			echo "subscription served by monitor-agent on port $SUB_PORT through nginx"
+		else
+			echo "subscription served by monitor-agent on port $SUB_PORT"
+		fi
 		return 0
 	fi
-	if [ -n "$SUB_VIA_NGINX" ]; then
-		echo "subscription served by monitor-agent on port $SUB_PORT through nginx"
-	else
-		echo "subscription served by monitor-agent on port $SUB_PORT"
+
+	echo "warning: the subscription could not be fetched on port $SUB_PORT" >&2
+	restore_prev_sub || {
+		echo "         there is no previous configuration to go back to" >&2
+		echo "         see: journalctl -u monitor-agent -n 20" >&2
+		return 1
+	}
+	echo "         the subscription this node served before has been put back" >&2
+	return 0
+}
+
+# 把上一轮的订阅落位放回去。装完验不过时才走这里：新配置取不到订阅，而旧的那份
+# 曾经能取到，留旧的比留新的强 —— 地址没变，客户端那边不会察觉。
+#
+# 没有上一轮（首次安装）就什么都不做并报失败，让调用方把话说清楚。
+restore_prev_sub() {
+	[ -n "$SUB_PREV_PUBLIC$SUB_PREV_PORT" ] || return 1
+	# nginx 那份 vhost 要是还在（这一轮 nginx 收了新配置，备份已删），得按旧端口
+	# 重写 —— 否则旧的回环端口配着新的对外端口，等于两边都不对。
+	if [ -f "$SUB_NGINX_CONF" ]; then
+		rm -f "$SUB_NGINX_CONF"
+		SUB_PORT="${SUB_PREV_PUBLIC:-$SUB_PREV_PORT}"
+		SUB_VIA_NGINX=""
+		if nginx_usable && nginx_holds "$SUB_PORT"; then
+			SUB_VIA_NGINX=1
+			rc=0
+			write_sub_nginx || rc=$?
+			[ "$rc" != 1 ] || {
+				SUB_VIA_NGINX=""
+				SUB_PORT="8080"
+			}
+		fi
+		if [ "$INIT" = openrc ]; then
+			rc-service nginx reload >/dev/null 2>&1 || true
+		else
+			systemctl reload nginx 2>/dev/null || true
+		fi
 	fi
+	bind="0.0.0.0"
+	served="$SUB_PORT"
+	[ -z "$SUB_VIA_NGINX" ] || {
+		bind="127.0.0.1"
+		served="$SUB_BACKEND"
+	}
+	write_sub_env "$bind" "$served"
+	restart_agent
 }
 
 # 让 nginx 把订阅路径转到我们的回环端口。写成一个独立文件，不动别人的站点。
@@ -679,6 +823,9 @@ CONF
 # PUBLIC_PORT 是**对外**那个（客户端 URL 上出现的），走 nginx 时与绑的端口不同：
 # nginx 在对外端口上听、把请求转到回环。重跑要靠它把上一轮的对外端口认回来，否则
 # 服务挪到别处、地址跟着变，客户端手里那个当场失效而没有任何地方会报错。
+#
+# 走 nginx 时 $2 是 $SUB_BACKEND，而写 nginx 配置的那段用的是同一个变量，所以
+# 两边不会各记一个回环端口。
 write_sub_env() {
 	sed -i '/^MONITOR_SUB_/d' "$ENV_FILE"
 	{
@@ -714,9 +861,52 @@ restart_agent() {
 	fi
 }
 
-# 对外端口，以及**谁在前面**。两条路给客户端的 URL 都是不带端口的
-# `http://IP/xxx.yaml`：80 空着就自己绑 80；80 上是 nginx 就把服务退到回环，
-# 由 nginx 把订阅路径转过来 —— 与已经在跑的两台一致。
+# 订阅的对外端口：客户端 URL 里带的那个。确定的顺序是**先读上一轮记下的值**、
+# 再考虑默认 80 —— 反过来就是这台机器上试出过的那个缺陷：nginx 的 vhost 还在 80
+# 上，重跑先试 80、一试就成，于是换了个端口落下，客户端手里那个地址当场作废而
+# 没有任何地方会报错。
+#
+# 三级读，全部先于重写 $ENV_FILE 的那次截断写（见顶部的 read_prev_sub）：
+#   1. agent 自己记的 MONITOR_SUB_PUBLIC_PORT（v1.9.2 起）
+#   2. 上一代 Python 服务记的 SUB_PUBLIC_PORT
+#   3. v1.9.0/1.9.1 的 agent：没有 PUBLIC_PORT 这一条，但它自己绑着对外端口，
+#      所以 MONITOR_SUB_PORT 就是对外那个 —— 判据是 BIND=0.0.0.0。绑在回环说明
+#      nginx 在前面，那个端口是回环的，当对外端口用会把地址改错，所以只提示。
+#
+# 只有「上一轮确实是我们装的」才认这些值：机器上换手过（服务名/配置都不是我们的）
+# 就退回默认，否则会把上一个装法的端口当成自己的。
+pick_public_port() {
+	[ -z "$SUB_PORT_SET" ] || return 0
+	# 「上一轮是我们装的」= agent 的订阅配置还在，或旧的独立服务在跑。判据都在
+	# 早读的那份快照里：$ENV_FILE 这时还没被重写。
+	if [ -z "$SUB_PREV_PORT" ] && ! sub_service_running; then
+		return 0
+	fi
+	prev="$SUB_PREV_PUBLIC"
+	if [ -z "$prev" ]; then
+		if [ "$SUB_PREV_BIND" = "0.0.0.0" ]; then
+			prev="$SUB_PREV_PORT"
+		elif [ -n "$SUB_PREV_PORT" ]; then
+			# 只记着回环端口 —— 那是 nginx 后面的监听口，不是对外口。不拿它
+			# 顶替，但要说出来：否则这个节点会静悄悄地换到 80。
+			echo "note: this node records no public subscription port; the one it had" >&2
+			echo "      cannot be told from the loopback port behind nginx, so it is" >&2
+			echo "      being chosen again rather than reused" >&2
+		fi
+	fi
+	if [ -z "$prev" ]; then
+		prev="$(sed -n 's/^SUB_PUBLIC_PORT=//p' "$SUB_HOME/env" 2>/dev/null | tail -n 1)"
+	fi
+	case "$prev" in
+	"" | *[!0-9]* | 0) return 0 ;;
+	esac
+	[ "$prev" -le 65535 ] 2>/dev/null || return 0
+	SUB_PORT="$prev"
+	echo "note: reusing port $SUB_PORT, where this node's subscription is already served" >&2
+}
+
+# 谁在前面。读的是**已经定下来的** $SUB_PORT，不是默认的 80：端口可能来自上面那
+# 轮的复用，而那一轮之所以存在，正是因为上一回这里的结论是「nginx 在前面」。
 #
 # 在这里就把 nginx 配置写好并验证，而不是等 setup_subscription：对外端口要拿去
 # 拼 `--sub-base`（写进面板里的订阅地址），而 nginx 有可能不收这份配置。
@@ -728,6 +918,7 @@ pick_sub_port() {
 		SUB_FOREIGN=1
 		return 0
 	fi
+	pick_public_port
 	# nginx 占着这个端口 → 让它伺服，我们退到回环。重跑时也走这条：
 	# 上一轮是我们写的 vhost，nginx 还在听，结论一样。
 	if nginx_usable && nginx_holds "$SUB_PORT"; then
@@ -751,42 +942,8 @@ pick_sub_port() {
 		echo "note: serving the subscription directly on 8080 instead" >&2
 		return 0
 	fi
-	[ -z "$SUB_PORT_SET" ] || return 0
-	# 重跑：读回上一轮的对外端口。不去看「那个端口上是不是我在听」——走 nginx 时
-	# 对外端口是 nginx 在听，把 nginx 判成冲突就会让服务挪到 8080：服务跟着走、
-	# 订阅地址跟着变，客户端手里那个不带端口的地址当场失效，且没有任何地方会报错。
-	#
-	# 两处都看：agent 自己的 env 是 v1.9.0 之后的落点，SUB_HOME/env 是它之前那个
-	# Python 服务留下的。只读后者的话，从 agent 模式装的机器再跑一次会**丢掉**
-	# 自定义端口 —— 那种机器上根本没有 SUB_HOME 这个目录。
-	prev="$(sed -n 's/^MONITOR_SUB_PUBLIC_PORT=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)"
-	case "$prev" in
-	"" | *[!0-9]*)
-		# v1.9.0/1.9.1 写的 env 里没有 PUBLIC_PORT 这一条。那时它自己绑着端口，
-		# 所以 MONITOR_SUB_PORT 就是对外那个；走 nginx 时它绑的是回环，那时才
-		# 不能拿它顶替 —— 判据是有没有绑在 0.0.0.0 上。
-		if [ "$(sed -n 's/^MONITOR_SUB_BIND=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)" = "0.0.0.0" ]; then
-			prev="$(sed -n 's/^MONITOR_SUB_PORT=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)"
-		fi
-		;;
-	esac
-	case "$prev" in
-	"" | *[!0-9]*)
-		prev="$(sed -n 's/^SUB_PUBLIC_PORT=//p' "$SUB_HOME/env" 2>/dev/null | tail -n 1)"
-		;;
-	esac
-	case "$prev" in
-	"" | *[!0-9]*) ;;
-	*)
-		if sub_service_running || sub_agent_serving; then
-			SUB_PORT="$prev"
-			echo "note: reusing port $SUB_PORT, where this node's subscription is already served" >&2
-			return 0
-		fi
-		;;
-	esac
 	# 80 被别的东西占着才退。
-	listening 80 || return 0
+	listening "$SUB_PORT" || return 0
 	SUB_PORT="8080"
 	echo "note: port 80 is taken, so the subscription will be served on 8080" >&2
 }
@@ -881,7 +1038,9 @@ RC
 	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
 	rm -f "$BIN.old"
 	provision_vpn
-	setup_subscription
+	# 订阅装不上不算安装失败：agent 已经在报数了，而它自己会记一条警告继续跑。
+	# `set -e` 下裸调用会把「已装好」变成一次失败退出，把真正的问题盖过去。
+	setup_subscription || true
 	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
 	exit 0
 fi
@@ -902,8 +1061,8 @@ systemctl restart monitor-agent
 # Checked inside that window, so a batch run shows the failure on the machine
 # where it happened rather than a line reading "installed".
 sleep 3
-	systemctl is-active --quiet monitor-agent || not_started "journalctl -u monitor-agent -n 20"
-	rm -f "$BIN.old"
-	provision_vpn
-	setup_subscription
-	echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"
+systemctl is-active --quiet monitor-agent || not_started "journalctl -u monitor-agent -n 20"
+rm -f "$BIN.old"
+provision_vpn
+setup_subscription || true
+echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"
