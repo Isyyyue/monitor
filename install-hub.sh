@@ -166,6 +166,27 @@ check_port() {
 # would silently reset the port and drop --site.
 old_exec() { sed -n 's/^ExecStart=.*--listen //p' "$UNIT" 2>/dev/null || true; }
 
+# Whether an earlier `--https` run left a self-signed listener behind, and which
+# port it is on. Empty when there is none.
+#
+# Read from the machine rather than remembered on the command line, because that
+# is where it lives: the vhost outlives the unit, so a re-run that omits --https
+# would otherwise print "still needs a reverse proxy" over a deployment that has
+# been reachable over TLS all along -- sending the operator off to configure a
+# proxy they do not need, or to add --plain and put the credentials on the wire.
+#
+# Deliberately not routed through find_nginx: the summary asks this question
+# after the install, when nginx must not be a precondition for answering it.
+old_https_port() {
+	for dir in /etc/nginx/sites-enabled /etc/nginx/conf.d; do
+		file="$dir/monitor-hub-https.conf"
+		[ -f "$file" ] || continue
+		port="$(sed -n 's/^ *listen \([0-9]*\) ssl.*/\1/p' "$file" 2>/dev/null | head -1)"
+		printf '%s: %s' "$dir" "${port:-8444}"
+		return 0
+	done
+}
+
 # The port that unit listens on, empty when there is none. Read twice: once for
 # the carry-over and once for the default the menu offers, since pressing Enter
 # there must leave a running deployment unchanged.
@@ -200,9 +221,35 @@ install_hub() {
 		esac
 	fi
 	check_port "$PORT"
+
+	# A self-signed listener an earlier run left behind counts as configured, so
+	# omitting --https on a re-run keeps it rather than quietly dropping the
+	# deployment back to loopback-only; see old_https_port. A domain takes
+	# precedence: --site serves the panel over a real certificate, and the
+	# self-signed vhost would hold its port as the default server and shadow it.
+	left="$(old_https_port)"
+	if [ -n "$left" ] && [ -z "$PLAIN" ]; then
+		port="${left##*: }"
+		if [ -n "$SITE" ]; then
+			HTTPS=""
+		else
+			# No line printed here: setup_https reports what it found, and one
+			# fact printed twice reads as two things having happened.
+			HTTPS=1
+			[ -n "$HTTPS_PORT_SET" ] || HTTPS_PORT="$port"
+		fi
+	fi
+	check_port "$HTTPS_PORT"
+
 	# A domain is configured, so an earlier --https run's self-signed listener
 	# has to go: it holds its port as the default server and would shadow
 	# whichever certificate the domain is served with.
+	#
+	# --plain deliberately leaves it alone. The two answer different questions --
+	# --https is how the panel is reached, --plain is whether that reach is
+	# encrypted -- and a hub exposed on the public interface with an encrypted
+	# entry point left standing is strictly better than one without. Removing it
+	# is the operator's call, not a side effect of passing --plain.
 	[ -z "$SITE" ] || remove_https_site
 
 	# Before anything is stopped, replaced or downloaded: a port conflict must
@@ -566,17 +613,28 @@ setup_https() {
 		ok "证书" "自签十年，$ip（浏览器会警告一次）"
 	fi
 
+	site="$NGINX_CONF_DIR/monitor-hub-https.conf"
+
 	# Debian defines this map in its own nginx.conf. Where it is not defined --
 	# RHEL, Alpine -- it has to come from somewhere, and defining it twice is a
 	# duplicate-map error that fails the reload.
+	#
+	# Asked of every config except ours, and that exclusion is the whole point:
+	# this file is about to be overwritten, so its own map cannot count as
+	# "already defined". `nginx -T` would, and it does -- on the second run the
+	# map written by the first is still there, so the check passes, the new file
+	# goes out without one, and the reload dies on `unknown "connection_upgrade"
+	# variable`. Whether that happens is a race against nginx being ready to
+	# answer `-T` at all, which is why it only showed up some of the time.
 	head=""
-	"$NGINX_BIN" -T 2>/dev/null | grep -q 'map \$http_upgrade \$connection_upgrade' ||
+	"$NGINX_BIN" -T 2>/dev/null |
+		sed -e "\#configuration file $site:#,\$d" |
+		grep -q 'map \$http_upgrade \$connection_upgrade' ||
 		head='map $http_upgrade $connection_upgrade {
     default upgrade;
     ""      close;
 }
 '
-	site="$NGINX_CONF_DIR/monitor-hub-https.conf"
 	cat >"$site" <<CONF
 ${head}server {
     listen $HTTPS_PORT ssl default_server;

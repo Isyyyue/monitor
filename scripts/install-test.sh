@@ -146,6 +146,17 @@ check() {
 	echo "  ok  $desc -> $got"
 }
 
+# `old_https_port` answers "dir: port" because the caller needs the directory to
+# write into; these cases only care about the port, and the directory is a
+# temporary one whose name would otherwise have to be predicted.
+norm() {
+	[ -n "$1" ] || {
+		printf 'NONE'
+		return 0
+	}
+	[ "$1" = "${1%%: *}" ] && printf 'FOUND' || printf 'found:%s' "${1##*: }"
+}
+
 # Each scenario runs in its own shell so a stub set here cannot reach the next.
 #
 # The scenario text is one `eval`, so a variable assignment on the text's first
@@ -412,5 +423,70 @@ esac
 # file behind in a directory nginx reads.
 grep -q 'rm -f "\$SUB_NGINX_CONF" "\$SUB_NGINX_CONF.monitor-prev"' "$INSTALL" ||
 	fail "uninstall does not remove the nginx backup"
+
+# --- 7. 重跑不会把已配好的 HTTPS 丢掉 ----------------------------------------
+#
+# Two separate failures, both found only on a real machine and both invisible to
+# a single run:
+#
+#   a) The map block was written only when `nginx -T` did not already define it.
+#      `-T` reads the config on disk, which on a second run includes the map the
+#      first run wrote -- so the check passed, the new vhost went out without a
+#      map, and nginx refused to reload: `unknown "connection_upgrade" variable`.
+#      Whether `-T` answered at all was a race, which is why it failed about one
+#      run in three rather than every time.
+#
+#   b) `HTTPS` came from the command line only, so a bare re-run reported the
+#      panel as loopback-only and told the operator to go configure a reverse
+#      proxy over a deployment that was already reachable over TLS.
+#
+# (a) is a property of the text: the map must not be sourced from a listing that
+# includes our own file. (b) is a property of the run: the port has to be read
+# back from what is on disk.
+
+# (a) The listing is cut at our own file before the question is asked. Matched
+# as a fixed string: the sed expression is mostly punctuation, and a pattern for
+# it would have to escape every one of them twice over.
+grep -qF 'configuration file $site:#' "$HUB_INSTALL" ||
+	fail "setup_https asks nginx -T for the map without excluding its own vhost"
+
+# The same defect in an earlier shape: a plain whole-output grep for the map.
+if grep -q '"$NGINX_BIN" -T 2>/dev/null | grep -q' "$HUB_INSTALL"; then
+	fail "setup_https greps nginx -T whole, so its own map counts as already defined"
+fi
+
+# (b) The carry-over exists, reads the vhost, and feeds HTTPS.
+grep -q '^old_https_port() {' "$HUB_INSTALL" ||
+	fail "install-hub.sh has no old_https_port"
+grep -q 'left="$(old_https_port)"' "$HUB_INSTALL" ||
+	fail "old_https_port is never called, so a re-run still drops the HTTPS setup"
+
+# Exercised for real against a directory tree, because the whole bug was that
+# the answer depends on what is on disk rather than on the arguments.
+probe() {
+	dir=$1
+	body=$2
+	root="$DIR/nginx"
+	rm -rf "$root"
+	mkdir -p "$root/sites-enabled" "$root/conf.d"
+	[ -z "$body" ] || printf '%s\n' "$body" >"$root/sites-enabled/monitor-hub-https.conf"
+	# shellcheck disable=SC2016  # the body is the installer's own sed, run as written
+	( cd "$root" && eval "$(sed -n '/^old_https_port() {/,/^}/p' "$HUB_INSTALL" |
+		sed 's#/etc/nginx#'"$root"'#g')" && old_https_port )
+}
+
+got=$(probe x 'listen 8444 ssl default_server;')
+check "old_https_port finds a vhost on 8444" "found:8444" "$(norm "$got")"
+
+got=$(probe x 'listen 9443 ssl default_server;')
+check "old_https_port reads the port it found" "found:9443" "$(norm "$got")"
+
+got=$(probe x '')
+check "old_https_port reports nothing when there is no vhost" "NONE" "$(norm "$got")"
+
+# And the summary: with HTTPS carried over, the note about needing a reverse
+# proxy must not be reachable on that path.
+grep -q 'if \[ -z "\$SITE" \] && \[ -z "\$HTTPS" \]; then' "$HUB_INSTALL" ||
+	fail "the reverse-proxy note no longer keys off HTTPS, so a re-run would print it"
 
 echo "install-test: ok"
