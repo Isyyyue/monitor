@@ -8,12 +8,15 @@ name = "monitor-agent"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "fs"] }
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sysinfo = "0.30"
+# default-features = false 关掉 `multithread`（也就是 Rayon）：开着时它按核数铺一池
+# 工作线程，在一台 32 核的机器上就是 32 条常驻线程，只为采几个数字。这个 agent
+# 一秒采一次，单线程绰绰有余。
+sysinfo = { version = "0.30", default-features = false }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"

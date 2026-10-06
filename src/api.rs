@@ -2120,12 +2120,20 @@ pub async fn vpn_info(_: Admin, State(app): State<Shared>, Path(node_id): Path<i
 /// installer's root; the hub can no longer ask a node to do anything, and this
 /// route only records the outcome. `save_vpn_result` keeps the previous row when
 /// `success` is not true, so a failed run never blanks a working deployment.
+/// The node whose token the request carries, or the refusal to answer with.
+///
+/// One place rather than two: `agent_vpn` and `agent_traffic` are the only routes
+/// a node calls with its own token, and an unknown token has to get the same 401
+/// on both -- a difference would say which tokens exist.
+fn agent_node(app: &App, headers: &HeaderMap) -> Result<i64, &'static str> {
+    let token = crate::agent_ws::bearer(headers).ok_or("missing token")?;
+    app.db.node_by_token(token).ok().flatten().ok_or("invalid token")
+}
+
 pub async fn agent_vpn(State(app): State<Shared>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
-    let Some(token) = crate::agent_ws::bearer(&headers) else {
-        return answer(StatusCode::UNAUTHORIZED, "missing token");
-    };
-    let Ok(Some(node_id)) = app.db.node_by_token(token) else {
-        return answer(StatusCode::UNAUTHORIZED, "invalid token");
+    let node_id = match agent_node(&app, &headers) {
+        Ok(id) => id,
+        Err(message) => return answer(StatusCode::UNAUTHORIZED, message),
     };
     match app.db.save_vpn_result(node_id, &body) {
         Ok(()) => {
@@ -2151,20 +2159,20 @@ pub async fn agent_vpn(State(app): State<Shared>, headers: HeaderMap, Json(body)
 /// show used traffic and the expiry date, and without it the row is simply
 /// missing from the client's card -- there is no error to notice.
 pub async fn agent_traffic(State(app): State<Shared>, headers: HeaderMap) -> Response {
-    let Some(token) = crate::agent_ws::bearer(&headers) else {
-        return answer(StatusCode::UNAUTHORIZED, "missing token");
+    let node_id = match agent_node(&app, &headers) {
+        Ok(id) => id,
+        Err(message) => return answer(StatusCode::UNAUTHORIZED, message),
     };
-    let Ok(Some(node_id)) = app.db.node_by_token(token) else {
-        return answer(StatusCode::UNAUTHORIZED, "invalid token");
-    };
-    let nodes = match app.db.nodes() {
-        Ok(nodes) => nodes,
+    // 只读自己那一行。这个接口是节点按定时器调的，为一行数据去读整张表，
+    // 每个请求都要在 agent 们的写后面排一次队。
+    let node = match app.db.node(node_id) {
+        Ok(node) => node,
         Err(e) => return fail(e),
     };
-    let Some(node) = nodes.into_iter().find(|n| n.id == node_id) else {
+    let Some(node) = node else {
         return answer(StatusCode::NOT_FOUND, "no such node");
     };
-    let traffic = app.db.all_traffic().remove(&node_id).unwrap_or_default();
+    let traffic = app.db.traffic(node_id);
     Json(json!({
         "traffic_limit": node.traffic_limit,
         "expires_at": node.expires_at,

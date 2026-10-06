@@ -222,7 +222,11 @@ impl Rate {
 }
 
 fn collect_metrics(sys: &mut sysinfo::System, ifaces: &[String], rate: &mut Rate) -> Metrics {
-    sys.refresh_all();
+    // 只刷 CPU 与内存。`refresh_all()` 还会走一遍**每个进程**去建一张没人读的列表
+    // —— 在忙一点的机器上那是这个 agent 最大的一笔开销，而它采完就扔。
+    // 进程数是从 /proc 数的，磁盘和网卡在下面各自刷新自己的列表。
+    sys.refresh_cpu();
+    sys.refresh_memory();
 
     let cpu = sys.global_cpu_info().cpu_usage();
     let load = sysinfo::System::load_average();
@@ -512,7 +516,7 @@ impl Probes {
     ///
     /// 目标和间隔都没变的探针**原样留着**：hub 只要有一个任务改动就会推整个列表，
     /// 把其余的重启会重置它们的计时，还会丢掉正要发出的那一次读数。
-    fn reconcile(&mut self, tasks: Vec<PingTask>, results: &tokio::sync::mpsc::UnboundedSender<Message>) {
+    fn reconcile(&mut self, tasks: Vec<PingTask>, results: &tokio::sync::mpsc::Sender<Message>) {
         let mut keep = std::collections::HashSet::new();
         for task in runnable(tasks) {
             keep.insert(task.id);
@@ -544,12 +548,7 @@ impl Probes {
 /// 一条探针的循环：连、回报、等。
 ///
 /// 第一次立刻做，面板上刚加的监控不用等满一个间隔才有数字。
-async fn run_probe(
-    id: i64,
-    target: String,
-    interval: i64,
-    results: tokio::sync::mpsc::UnboundedSender<Message>,
-) {
+async fn run_probe(id: i64, target: String, interval: i64, results: tokio::sync::mpsc::Sender<Message>) {
     let period = Duration::from_secs(interval.max(MIN_PROBE_INTERVAL) as u64);
     loop {
         let latency = probe_once(&target).await;
@@ -559,21 +558,31 @@ async fn run_probe(
             "params": { "task_id": id, "latency_ms": latency },
         });
         // 写端已经走了就收工；留在这里只会攒下一堆没人要的帧。
-        if results.send(Message::Text(frame.to_string())).is_err() {
+        if results.send(Message::Text(frame.to_string())).await.is_err() {
             return;
         }
         tokio::time::sleep(period).await;
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // `provision` 是安装器以 root 调用的一次性动作，与常驻服务无关。
-    // 在起 tracing、连 hub 之前就分派掉。
+    // 在起 tracing、连 hub 之前就分派掉 —— 也就不用先起一个 runtime。
     if std::env::args().nth(1).as_deref() == Some("provision") {
         return provision::run(provision::parse_args(std::env::args().skip(2))?);
     }
 
+    // 单线程 runtime。`#[tokio::main]` 默认开的是多线程的，按核数铺 worker 线程，
+    // 每个都带自己的栈 —— 而这个 agent 的活是「每秒发一帧、几条探针各自睡等」，
+    // 用不上它们。阻塞线程数也压到 4。
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(4)
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = parse_args()?;
@@ -587,7 +596,10 @@ async fn main() -> Result<()> {
 
     let (mut write, mut read) = ws_stream.split();
 
-    let mut sys = sysinfo::System::new_all();
+    // 不用 `new_all()`：那会走一遍每个进程，建一张没人读的列表。
+    let mut sys = sysinfo::System::new();
+    sys.refresh_cpu();
+    sys.refresh_memory();
 
     // Send hello: the facts the panel shows and never changes. Sent as a struct
     // rather than a hand-written object so a renamed field is a compile error here
@@ -604,7 +616,10 @@ async fn main() -> Result<()> {
     let mut interval = tokio::time::interval(args.interval);
     // 探针各自跑在 spawn 出来的任务里，读数从这里回到唯一的写端：一个 WebSocket
     // 只能有一个写者，几条探针各写各的会交错成坏帧。
-    let (results_tx, mut results_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    //
+    // 有界：hub 那头慢下来时，无限队列会一直攒帧。有界则让探针在写端堵住时等一等，
+    // 而 64 条正好是一个节点能跑的最大探针数。
+    let (results_tx, mut results_rx) = tokio::sync::mpsc::channel::<Message>(MAX_PROBES);
     let mut probes = Probes::default();
 
     loop {

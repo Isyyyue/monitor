@@ -1395,23 +1395,39 @@ impl Db {
 
     /// Every node's counters in one query, because the node list renders a row per
     /// node and a query per node would queue the agents' writes behind it.
+    pub fn all_traffic(&self) -> HashMap<i64, Traffic> {
+        self.traffic_rows(None)
+    }
+
+    /// One node's counters. For a caller that only ever wants its own row -- a node
+    /// asking for its allowance on a timer -- reading the whole table would be
+    /// wasted work on every request.
     ///
+    /// Same query and same period gate as the list. Two readers that disagreed
+    /// about the gate would show one node two different months.
+    pub fn traffic(&self, node_id: i64) -> Traffic {
+        self.traffic_rows(Some(node_id)).remove(&node_id).unwrap_or_default()
+    }
+
     /// The period counters are gated on the period they were written for. They
     /// restart lazily in `accumulate`, on the node's next report, so a node
     /// offline since before a boundary still holds the previous period's bytes on
-    /// disk. This is the only reader, so the rule lives in one place.
-    pub fn all_traffic(&self) -> HashMap<i64, Traffic> {
+    /// disk. Both readers come through here, so the rule lives in one place.
+    fn traffic_rows(&self, node_id: Option<i64>) -> HashMap<i64, Traffic> {
         let conn = self.conn();
-        let Ok(mut stmt) = conn.prepare_cached(
-            "SELECT t.node_id, t.total_rx, t.total_tx, t.month_rx, t.month_tx, t.month_start,
+        let query = "SELECT t.node_id, t.total_rx, t.total_tx, t.month_rx, t.month_tx, t.month_start,
                     t.day_rx, t.day_tx, t.day_start, n.traffic_reset_day
-                 FROM traffic t JOIN node n ON n.id = t.node_id",
-        ) else {
+                 FROM traffic t JOIN node n ON n.id = t.node_id";
+        let query = match node_id {
+            Some(_) => format!("{query} WHERE t.node_id = ?1"),
+            None => query.to_owned(),
+        };
+        let Ok(mut stmt) = conn.prepare_cached(&query) else {
             return HashMap::new();
         };
         let today = Local::now().date_naive();
         let day = today.to_string();
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(rusqlite::params_from_iter(node_id), |r| {
             // Zero rather than absent: a theme drawing a meter requires a
             // number.
             let current = |stored: String, now: &str, rx: i64, tx: i64| {
@@ -2974,6 +2990,27 @@ mod tests {
         let token = format!("token-{}", rand::random::<u32>());
         db.create_node(&Node { name: "n".into(), traffic_reset_day: reset_day, ..Default::default() }, &token)
             .unwrap()
+    }
+
+    /// 单节点读要和列表读**一模一样**。两边要是对「这个月从哪天算」有分歧，
+    /// 同一个节点会在面板上显示成两个月。
+    #[test]
+    fn single_node_traffic_matches_the_list() {
+        let db = db();
+        let id = node(&db, 15);
+        let other = node(&db, 1);
+        db.set_traffic(id, &TrafficPatch { month_rx: Some(123), month_tx: Some(456), ..Default::default() })
+            .unwrap();
+
+        let listed = db.all_traffic();
+        let read = db.traffic(id);
+        assert_eq!(read.month_rx, listed[&id].month_rx);
+        assert_eq!(read.month_tx, listed[&id].month_tx);
+        assert_eq!(read.month_start, listed[&id].month_start);
+
+        // 没有流量的节点、和不存在的节点，都返回零而不是缺行 —— 主题画刻度要数字。
+        assert_eq!(db.traffic(other).month_rx, 0);
+        assert_eq!(db.traffic(i64::MAX).month_rx, 0);
     }
 
     /// The country is derived from the address, so it must be dropped the moment
