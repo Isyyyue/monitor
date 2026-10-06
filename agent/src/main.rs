@@ -21,6 +21,7 @@ use tokio_tungstenite::{
 use tracing::{error, info, warn};
 
 mod provision;
+mod subscription;
 
 /// Arguments also accept the environment written by install.sh.
 #[derive(Debug)]
@@ -545,6 +546,18 @@ impl Probes {
     }
 }
 
+/// 会话结束时把它的探针收掉。
+///
+/// 进程现在活得比一个会话长（断了会在原地重连），所以丢掉 JoinHandle 不等于任务
+/// 停了 —— 它们会一直跑，每到一个间隔就往一个已经没有人读的通道里写一帧。
+impl Drop for Probes {
+    fn drop(&mut self) {
+        for probe in self.running.values() {
+            probe.handle.abort();
+        }
+    }
+}
+
 /// 一条探针的循环：连、回报、等。
 ///
 /// 第一次立刻做，面板上刚加的监控不用等满一个间隔才有数字。
@@ -586,6 +599,24 @@ async fn run() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = parse_args()?;
+
+    // 订阅和监控是两件事：一个坏了不该把另一个带走。这里起不来只记一条警告，
+    // 安装器会独立确认监听到底有没有起来。
+    if let Err(e) = subscription::start(&args.server, &args.token).await {
+        warn!("subscription listener unavailable: {e:#}");
+    }
+
+    loop {
+        if let Err(e) = session(&args).await {
+            error!("Hub session ended: {e:#}");
+        }
+        // 订阅要一直在，所以这里重连而不是退出：退出会让服务管理器重启进程，
+        // 端口跟着断一下 —— 而客户端可能正好在这时候来取订阅。
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+async fn session(args: &Args) -> Result<()> {
     info!("Connecting to {}", args.server);
 
     let request = websocket_request(&args.server, &args.token)?;
@@ -682,7 +713,7 @@ async fn run() -> Result<()> {
         }
     }
 
-    anyhow::bail!("hub connection closed; service manager should reconnect")
+    anyhow::bail!("hub connection closed")
 }
 
 #[cfg(test)]

@@ -31,3 +31,10 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 # hello 上报本机地址用。节点在反代后面时，hub 看到的来源是 127.0.0.1，
 # 只有接口上的地址能确定国家。
 if-addrs = "0.13"
+# 订阅伺服跟着 agent 一起跑，不再单独常驻一个 Python 进程。
+# axum 只挂一个只读路由；reqwest 只用来问 hub 要本节点的额度与用量。
+# TLS 走 rustls，与 WebSocket 那条路一致，不引入 OpenSSL。
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# 只用来把 `2026-11-01` 换成订阅头里的 unix 时间戳。
+chrono = { version = "0.4", default-features = false, features = ["std"] }

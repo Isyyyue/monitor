@@ -85,8 +85,9 @@ if [ -n "$UNINSTALL" ]; then
 	rc-update del monitor-agent default >/dev/null 2>&1 || true
 	systemctl disable --now monitor-agent 2>/dev/null || true
 	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE"
-	# The subscription server came in with the agent and leaves with it: it holds
-	# this node's token, and nothing would restart it afterwards.
+	# 订阅现在由 agent 自己伺服，随它一起走 —— 上面那行已经删了它的环境文件，
+	# 订阅的三条配置就在里面。这里再收掉上一代那份独立服务，以及 nginx 前面
+	# 那一段：留着一条指向已删服务的 location，要等下一次 reload 才会发现。
 	rc-service sub-dynamic stop 2>/dev/null || true
 	rc-update del sub-dynamic default >/dev/null 2>&1 || true
 	systemctl disable --now sub-dynamic 2>/dev/null || true
@@ -482,128 +483,6 @@ provision_vpn() {
 # 密码放到每台节点上 —— 那等于一台节点被攻破就是面板被攻破。
 SUB_STATE="/var/lib/sing-box/subscription.json"
 
-# 订阅伺服要用的解释器。没有就装一个：这个头是订阅的一部分，不是可选装饰。
-ensure_python() {
-	command -v python3 >/dev/null 2>&1 && return 0
-	if command -v apt-get >/dev/null 2>&1; then
-		DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >/dev/null 2>&1 || true
-	elif command -v dnf >/dev/null 2>&1; then
-		dnf install -y -q python3 >/dev/null 2>&1 || true
-	elif command -v apk >/dev/null 2>&1; then
-		apk add --no-cache python3 >/dev/null 2>&1 || true
-	fi
-	command -v python3 >/dev/null 2>&1
-}
-
-write_sub_server() {
-	install -d -m 0755 "$SUB_HOME"
-	cat >"$SUB_HOME/server.py" <<'PYSERVER'
-#!/usr/bin/env python3
-"""Serve this node's subscription, with the header clients read.
-
-The file names come from the state file `provision` maintains, and are re-read on
-every request. It mints a new random name on each run, so a hard-coded or cached
-one turns every fetch into a 404 -- which a client shows as nothing at all: just
-a card with the traffic row missing, and no error anywhere.
-"""
-import datetime, json, os, urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
-STATE = os.environ.get("SUB_STATE", "/var/lib/sing-box/subscription.json")
-HUB = os.environ.get("HUB_URL", "").rstrip("/")
-TOKEN = os.environ.get("HUB_TOKEN", "")
-BIND = os.environ.get("SUB_BIND", "0.0.0.0")
-PORT = int(os.environ.get("SUB_PORT", "80"))
-CTYPE = {"clash": "text/yaml", "v2ray_txt": "text/plain", "v2ray_b64": "text/plain"}
-
-
-def routes():
-    with open(STATE) as f:
-        state = json.load(f)
-    return {"/" + os.path.basename(v): (v, CTYPE.get(k, "text/plain")) for k, v in state.items()}
-
-
-def traffic():
-    """upload, download, total, expire -- or None, which only omits the header."""
-    if not HUB or not TOKEN:
-        return None
-    try:
-        req = urllib.request.Request(
-            HUB + "/api/agent/traffic", headers={"Authorization": "Bearer " + TOKEN})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            d = json.load(r)
-        exp = d.get("expires_at") or ""
-        ts = int(datetime.datetime.fromisoformat(exp).replace(
-            tzinfo=datetime.timezone.utc).timestamp()) if exp else 0
-        return (int(d.get("month_tx") or 0), int(d.get("month_rx") or 0),
-                int(d.get("traffic_limit") or 0), ts)
-    except Exception as e:
-        print("[sub-dynamic] traffic read failed:", e, flush=True)
-        return None
-
-
-class Handler(BaseHTTPRequestHandler):
-    def _serve(self, head_only=False):
-        try:
-            route = routes().get(self.path)
-        except Exception as e:
-            print("[sub-dynamic] state read failed:", e, flush=True)
-            route = None
-        if not route:
-            self.send_response(404)
-            self.end_headers()
-            return
-        path, ctype = route
-        try:
-            with open(path, "rb") as f:
-                body = f.read()
-        except FileNotFoundError:
-            self.send_response(404)
-            self.end_headers()
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Cache-Control", "no-store")
-        t = traffic()
-        if t:
-            self.send_header(
-                "subscription-userinfo",
-                "upload=%d; download=%d; total=%d; expire=%d" % t)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        if not head_only:
-            self.wfile.write(body)
-
-    def do_GET(self):
-        self._serve(False)
-
-    def do_HEAD(self):
-        self._serve(True)
-
-    def log_message(self, *args):
-        pass
-
-
-HTTPServer((BIND, PORT), Handler).serve_forever()
-PYSERVER
-	chmod 0755 "$SUB_HOME/server.py"
-}
-
-# The token and the hub address are the node's own; the file is 0600 because the
-# token is a credential for this node and nothing else needs to read it.
-write_sub_env() {
-	umask 077
-	cat >"$SUB_HOME/env" <<ENV
-HUB_URL=$SERVER
-HUB_TOKEN=$TOKEN
-SUB_STATE=$SUB_STATE
-SUB_BIND=$1
-SUB_PORT=$2
-SUB_PUBLIC_PORT=$3
-ENV
-	chmod 0600 "$SUB_HOME/env"
-}
-
 # 某个端口上有没有人在听。
 listening() {
 	ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
@@ -649,6 +528,87 @@ foreign_sub_server() {
 	curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$SUB_PORT/$(basename "$clash")" 2>/dev/null
 }
 
+# OpenRC 没有 ambient capabilities，只能把能力打在二进制上。那意味着**任何本地用户**
+# 跑这个二进制都能绑低端口，所以顺带把可执行权限收到 root 与 agent 所在的组 ——
+# 这样那个能力就只有它们够得着。
+grant_bind_capability() {
+	[ -n "$SUB_CAPS" ] || return 0
+	command -v setcap >/dev/null 2>&1 || {
+		echo "warning: no setcap, so a non-root agent cannot bind port $SUB_PORT" >&2
+		echo "         install libcap (or re-run with --sub-port 8080) and try again" >&2
+		return 0
+	}
+	group="$(id -gn monitor-agent 2>/dev/null || echo monitor-agent)"
+	chown "root:$group" "$BIN" 2>/dev/null || true
+	chmod 0750 "$BIN"
+	if ! setcap cap_net_bind_service=+ep "$BIN" 2>/dev/null; then
+		echo "warning: setcap failed; the agent may not be able to bind port $SUB_PORT" >&2
+	fi
+}
+
+# 订阅伺服。**它现在就是 agent 自己** —— 不再有第二个进程、不再需要 python。
+#
+# 三条路，给客户端的 URL 都是 `http://IP/xxx.yaml`（不带端口）：
+#   80 空着          → agent 自己绑 80
+#   80 上是 nginx    → agent 绑回环 $SUB_BACKEND，nginx 转过来；agent 不开公网端口
+#   80 被别人占着    → 退到 8080
+setup_subscription() {
+	# --no-vpn 没有订阅可伺服；没写过订阅也一样。
+	[ -f "$SUB_STATE" ] || return 0
+	# 别人已经在这个端口上伺服同一批文件（手工装的那份）—— 不接管。
+	# 判断在 pick_sub_port 里就做过了，那里才拿得到「改端口之前」的端口号。
+	if [ -n "$SUB_FOREIGN" ]; then
+		echo "note: the subscription on port $SUB_PORT is already served by something else" >&2
+		echo "      leaving it alone; the agent will not serve it" >&2
+		return 0
+	fi
+
+	bind="0.0.0.0"
+	served="$SUB_PORT"
+	if [ -n "$SUB_VIA_NGINX" ]; then
+		bind="127.0.0.1"
+		served="$SUB_BACKEND"
+	fi
+
+	# 单元里的能力是按端口算的，而端口比写单元晚定 —— 所以按最终结论再写一次。
+	sub_caps
+	if [ "$INIT" = openrc ]; then
+		grant_bind_capability
+	else
+		write_agent_unit
+		systemctl daemon-reload
+	fi
+
+	write_sub_env "$bind" "$served"
+	retire_legacy_sub_service
+	restart_agent
+	if [ -n "$SUB_VIA_NGINX" ]; then
+		if [ "$INIT" = openrc ]; then
+			rc-service nginx reload >/dev/null 2>&1 || true
+		else
+			systemctl reload nginx 2>/dev/null || true
+		fi
+	fi
+
+	# 端口真的在听才算成了。服务 active 只说明进程起来了：agent 绑不上时会记一条
+	# 警告继续跑监控，而面板和客户端上什么也看不出来。
+	i=0
+	while [ "$i" -lt 12 ] && ! listening "$served"; do
+		i=$((i + 1))
+		sleep 0.5
+	done
+	if ! listening "$served"; then
+		echo "warning: nothing is listening on port $served, so the subscription is not being served" >&2
+		echo "         see: journalctl -u monitor-agent -n 20" >&2
+		return 0
+	fi
+	if [ -n "$SUB_VIA_NGINX" ]; then
+		echo "subscription served by monitor-agent on port $SUB_PORT through nginx"
+	else
+		echo "subscription served by monitor-agent on port $SUB_PORT"
+	fi
+}
+
 # 让 nginx 把订阅路径转到我们的回环端口。写成一个独立文件，不动别人的站点。
 #
 # 必须是 default_server：同端口上已经有别的 server 时，`server_name _` 那份会被
@@ -680,6 +640,41 @@ CONF
 	fi
 	rm -f "$SUB_NGINX_CONF"
 	return 1
+}
+
+# 订阅的三条配置写进 agent 自己的环境文件 —— 它自己就是订阅服务，不再有第二个进程。
+# $1 = 绑的地址，$2 = 绑的端口（走 nginx 时是回环那个）。
+write_sub_env() {
+	sed -i '/^MONITOR_SUB_/d' "$ENV_FILE"
+	{
+		printf 'MONITOR_SUB_BIND=%s
+' "$1"
+		printf 'MONITOR_SUB_PORT=%s
+' "$2"
+		printf 'MONITOR_SUB_STATE=%s
+' "$SUB_STATE"
+	} >>"$ENV_FILE"
+}
+
+# 旧的那份独立订阅服务（Python 那个 sub-dynamic）该退了：它和 agent 抢同一个端口，
+# 而且现在 agent 自己就能伺服。文件留着，回退时还能用。
+retire_legacy_sub_service() {
+	if [ "$INIT" = openrc ]; then
+		rc-service sub-dynamic stop >/dev/null 2>&1 || true
+		rc-update del sub-dynamic default >/dev/null 2>&1 || true
+	else
+		systemctl disable --now sub-dynamic >/dev/null 2>&1 || true
+	fi
+	rm -f "$SUB_UNIT" "$SUB_RC"
+	# 它自己那份 env 和脚本留着不动：里面有上一轮记的端口，回退时还要用。
+}
+
+restart_agent() {
+	if [ "$INIT" = openrc ]; then
+		rc-service monitor-agent restart >/dev/null 2>&1 || true
+	else
+		systemctl restart monitor-agent 2>/dev/null || true
+	fi
 }
 
 # 对外端口，以及**谁在前面**。两条路给客户端的 URL 都是不带端口的
@@ -730,105 +725,6 @@ pick_sub_port() {
 	echo "note: port 80 is taken, so the subscription will be served on 8080" >&2
 }
 
-# 服务本身：单元（或 openrc 脚本）与启动。与端口无关，两种暴露方式共用。
-start_sub_service() {
-	if [ "$INIT" = openrc ]; then
-		cat >"$SUB_RC" <<RC
-#!/sbin/openrc-run
-description="monitor subscription server"
-command="/usr/bin/python3"
-command_args="$SUB_HOME/server.py"
-supervisor="supervise-daemon"
-respawn_delay=5
-
-start_pre() {
-	set -a
-	. $SUB_HOME/env
-	set +a
-}
-RC
-		chmod 0755 "$SUB_RC"
-		rc-update add sub-dynamic default >/dev/null 2>&1 || true
-		rc-service sub-dynamic restart >/dev/null 2>&1 || true
-	else
-		cat >"$SUB_UNIT" <<UNIT
-[Unit]
-Description=monitor subscription server
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-EnvironmentFile=$SUB_HOME/env
-ExecStart=/usr/bin/python3 $SUB_HOME/server.py
-Restart=always
-RestartSec=5
-# 只读订阅文件和自己的配置，别的都不需要。
-NoNewPrivileges=yes
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-		systemctl daemon-reload
-		systemctl enable --now sub-dynamic >/dev/null 2>&1 || true
-		systemctl restart sub-dynamic 2>/dev/null || true
-	fi
-}
-
-setup_subscription() {
-	# --no-vpn 没有订阅可伺服；没写过订阅也一样。
-	[ -f "$SUB_STATE" ] || return 0
-	ensure_python || {
-		echo "warning: no python3, so this node will not serve its own subscription" >&2
-		echo "         the VPN itself is up; install python3 and re-run to add it" >&2
-		return 0
-	}
-	# 别人已经在这个端口上伺服同一批文件（手工装的那份）—— 不接管。
-	# 判断在 pick_sub_port 里就做过了，那里才拿得到「改端口之前」的端口号。
-	if [ -n "$SUB_FOREIGN" ]; then
-		echo "note: the subscription on port $SUB_PORT is already served by something else" >&2
-		echo "      leaving it alone; no server of ours was installed" >&2
-		return 0
-	fi
-
-	# 对外端口归谁：走 nginx 时我们绑回环，vhost 在 pick_sub_port 里已经写好并验过。
-	bind="0.0.0.0"
-	served="$SUB_PORT"
-	if [ -n "$SUB_VIA_NGINX" ]; then
-		bind="127.0.0.1"
-		served="$SUB_BACKEND"
-	fi
-
-	write_sub_server
-	write_sub_env "$bind" "$served" "$SUB_PORT"
-	start_sub_service
-	if [ -n "$SUB_VIA_NGINX" ]; then
-		if [ "$INIT" = openrc ]; then
-			rc-service nginx reload >/dev/null 2>&1 || true
-		else
-			systemctl reload nginx 2>/dev/null || true
-		fi
-	fi
-
-	# 端口真的在听才算成了。systemd 报 active 只说明进程起来了：bind 失败时
-	# `Restart=always` 会一直重试，日志里翻得到，而面板和客户端上什么也看不出来。
-	i=0
-	while [ "$i" -lt 12 ] && ! listening "$served"; do
-		i=$((i + 1))
-		sleep 0.5
-	done
-	if ! listening "$served"; then
-		echo "warning: nothing is listening on port $served, so the subscription is not being served" >&2
-		echo "         see: journalctl -u sub-dynamic -n 20" >&2
-		return 0
-	fi
-	if [ -n "$SUB_VIA_NGINX" ]; then
-		echo "subscription served on port $SUB_PORT through nginx (backend 127.0.0.1:$served)"
-	else
-		echo "subscription served on port $SUB_PORT from $SUB_HOME/server.py"
-	fi
-}
-
 if [ "$INIT" = openrc ]; then
 	cat >"$RC_FILE" <<RC
 #!/sbin/openrc-run
@@ -872,7 +768,24 @@ RC
 	exit 0
 fi
 
-cat >"$UNIT_FILE" <<UNIT
+# 订阅要绑 80（低端口）时给 agent 那**一个**能力，别的不给：`CapabilityBoundingSet`
+# 把它限定成只有这一个，`AmbientCapabilities` 让它对非 root 的 agent 生效。
+# 走 nginx 时不绑低端口，这里就是空的 —— 能力不白给。
+sub_caps() {
+	SUB_CAPS=""
+	case "$SUB_PORT" in
+	"" | *[!0-9]*) return 0 ;;
+	esac
+	[ -z "$SUB_VIA_NGINX" ] || return 0
+	[ "$SUB_PORT" -lt 1024 ] || return 0
+	SUB_CAPS="AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
+}
+
+# agent 的单元。抽成函数是因为订阅那边可能还要再写一次：绑 80 需要能力，而那是
+# 等端口定下来才知道的，比这里晚。
+write_agent_unit() {
+	cat >"$UNIT_FILE" <<UNIT
 [Unit]
 Description=monitor agent
 After=network-online.target
@@ -900,10 +813,15 @@ PrivateDevices=yes
 # kernel; without it the agent reports none.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
 MemoryMax=64M
+$SUB_CAPS
 
 [Install]
 WantedBy=multi-user.target
 UNIT
+}
+
+sub_caps
+write_agent_unit
 
 systemctl daemon-reload
 systemctl enable monitor-agent >/dev/null

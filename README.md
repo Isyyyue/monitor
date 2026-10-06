@@ -103,19 +103,21 @@ curl -fsSL https://<面板地址>/install.sh | sudo sh -s -- --upgrade --vpn-ip 
 目前的边界：
 
 - **订阅由节点自己伺服，并且带上 `subscription-userinfo` 头**：`provision` 把三件套写到
-  `/var/www/sub/`，安装器随后装一个 `sub-dynamic` 服务把它们伺服出去，该节点自己的额度与
-  用量从 Hub 读（用节点 token 调 `/api/agent/traffic`，面板管理员密码不会落到节点上），
-  写进 `subscription-userinfo`。
+  `/var/www/sub/`，**agent 自己把它们伺服出去**（不再有第二个进程，也不需要 python），
+  该节点自己的额度与用量从 Hub 读（用节点 token 调 `/api/agent/traffic`，面板管理员密码
+  不会落到节点上），写进 `subscription-userinfo`。
 
   客户端读这个头来显示「已用 / 总量」和到期日。**没有它，客户端那一行是直接不见的** ——
   不报错，只是卡片上少了它，所以这个头不是装饰，是订阅显示得对的全部。文件每次请求都按
   `/var/lib/sing-box/subscription.json` 重找：`provision` 每次重跑都会换一个随机文件名，
   写死或缓存过的名字会让每次抓取都变成 404。
 
-  对外端口默认 `80`：机器上有 nginx 就让 nginx 伺服（订阅服务退到回环 `18081`），
-  没有就订阅服务自己绑 `80` —— 两种情况客户端拿到的地址都不带端口。只有 `80` 被别的
+  对外端口默认 `80`：机器上有 nginx 就让 nginx 伺服（agent 退到回环 `18081`），
+  没有就 agent 自己绑 `80` —— 两种情况客户端拿到的地址都不带端口。只有 `80` 被别的
   东西占着、nginx 又收不下这份配置时才退到 `8080` 并提示，订阅 URL 跟着带上端口。
   `--sub-port` 可以指定。**已有的独立订阅服务不由此模块自动接管**。
+  agent 绑低端口时安装器只给它 `CAP_NET_BIND_SERVICE` 这一个能力；走 nginx 时不绑
+  低端口，这个能力就不给。
 - **真实连通需要实测**：仓库内的测试覆盖内容生成与 Hub 侧的收发，不覆盖目标机器上的
   sing-box 启动与实际代理连接。
 - **凭据默认不轮换**：重跑复用现有凭据是刻意的。需要轮换时，先删掉节点上的
@@ -243,7 +245,7 @@ mkdir -p data
   127.0.0.1:28080  Hub 自己
   127.0.0.1:9443   面板 vhost，证书在这里
   127.0.0.1:9444   面板的第二个入口，只给 SSH 隧道用
-  127.0.0.1:18081  订阅伺服，加 subscription-userinfo 的那个
+  127.0.0.1:18081  agent 的订阅监听（加 subscription-userinfo 的那个），走 nginx 时用
 ```
 
 **面板为什么不直接放 `443`**：`443` 要给 sing-box。REALITY 靠「不认识的 SNI 就转发给
@@ -288,7 +290,7 @@ server {
 
 ```
 公网
-  80/tcp    订阅（nginx 在 80 上时由它转给 127.0.0.1:18081；否则订阅服务自己绑 80）
+  80/tcp    订阅（nginx 在 80 上时由它转给 127.0.0.1:18081；否则 agent 自己绑 80）
   443/tcp   sing-box   VLESS + REALITY
   443/udp   sing-box   Hysteria2
   22/tcp    ssh
@@ -301,14 +303,14 @@ server {
 
 | 端口 | 谁 | 绑在哪 | 用途 |
 |---|---|---|---|
-| `80/tcp` | nginx，或订阅伺服自己 | 公网 | 订阅。机器上有 nginx 就由它转给 `18081`，没有就订阅服务自己绑 `80` |
+| `80/tcp` | nginx，或 agent 自己 | 公网 | 订阅。机器上有 nginx 就由它转给 `18081`，没有就 agent 自己绑 `80` |
 | `443/tcp` | sing-box | 公网 | VLESS + REALITY 入站 |
 | `443/udp` | sing-box | 公网 | Hysteria2 入站 |
 | `8444/tcp` | nginx stream | 公网 | 按 SNI 分流：伪装 SNI 给 REALITY，其余给面板 |
 | `28080/tcp` | monitor-hub | 回环 | Hub 自己。`--port` 可改；`--plain` 时绑公网 |
 | `9443/tcp` | nginx | 回环 | 面板 vhost，证书在这里，从 `8444` 分流进来 |
 | `9444/tcp` | nginx | 回环 | 面板的第二个入口，给 SSH 隧道用 |
-| `18081/tcp` | 订阅伺服 | 回环 | 走 nginx 时订阅服务绑这里，按当前订阅文件伺服并带上 `subscription-userinfo` |
+| `18081/tcp` | monitor-agent | 回环 | 走 nginx 时 agent 绑这里，按当前订阅文件伺服并带上 `subscription-userinfo` |
 
 **Agent 不占任何入站端口**：它主动连 Hub 的 `/api/agent/ws`，节点不需要为它开防火墙。
 
@@ -317,7 +319,7 @@ server {
 | 安装器 | 装出来的端口 |
 |---|---|
 | `install-hub.sh` | Hub 监听 `28080`（回环）。`--https`（没有域名时的自签证书那条路）另外装 nginx 把面板放到 `8444` —— 和标准形态同一个端口，`443` 留给 sing-box。`--https-port` 可改 |
-| `install.sh` | 节点的 sing-box（`443`），以及订阅伺服。订阅**对外永远在 `80`**（`--sub-port` 可改），内部怎么摆看机器上有什么：`80` 空着就自己绑 `80`；`80` 上是 nginx 就把服务退到 `127.0.0.1:18081`，由 nginx 把订阅路径转过来（写的是一份独立的 `conf.d` 文件，不动别人的站点）；`80` 被别的东西占着、nginx 又收不下这份配置，才退到 `8080` 并说明。**已经有别人在伺服同一批文件时不接管** —— 那可能是一份手工装的订阅服务。**重跑（`--upgrade`）复用上一轮的落位**，不会把自己判成冲突而挪走。它不装 nginx，也不动 `80` 上已有的站点 |
+| `install.sh` | 节点的 sing-box（`443`），以及订阅 —— **由 agent 自己伺服，不再有第二个进程、不需要 python**。订阅**对外永远在 `80`**（`--sub-port` 可改），内部怎么摆看机器上有什么：`80` 空着就自己绑 `80`；`80` 上是 nginx 就把服务退到 `127.0.0.1:18081`，由 nginx 把订阅路径转过来（写的是一份独立的 `conf.d` 文件，不动别人的站点）；`80` 被别的东西占着、nginx 又收不下这份配置，才退到 `8080` 并说明。**已经有别人在伺服同一批文件时不接管** —— 那可能是一份手工装的订阅服务。**重跑（`--upgrade`）复用上一轮的落位**，不会把自己判成冲突而挪走。它不装 nginx，也不动 `80` 上已有的站点。绑低端口时只给 agent `CAP_NET_BIND_SERVICE` 一个能力（systemd 用 `AmbientCapabilities`，OpenRC 用 `setcap` 并把二进制权限收到 root 与 agent 那个组）|
 
 `80` 上是 nginx 时，安装器自己写一份 `/etc/nginx/conf.d/monitor-sub.conf` 把订阅路径
 转到 `127.0.0.1:18081`，写完先 `nginx -t`，不过就删掉、退回自己绑端口。
