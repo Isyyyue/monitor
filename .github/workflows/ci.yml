@@ -22,21 +22,33 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The default theme arrives as a published archive, verified against the
-      # hash in web-theme.pin. Run here rather than left to build.rs so the
-      # download happens on the runner: release builds go through cross, whose
-      # container does not necessarily carry curl.
-      - run: ./scripts/theme.sh
-
       - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: web-admin/package-lock.json
+          cache-dependency-path: |
+            web-admin/package-lock.json
+            web-theme/package-lock.json
 
-      # rust-embed requires the panel's dist/ to exist before cargo runs.
+      # rust-embed requires both dists to exist before cargo runs.
       - run: npm ci && npm run lint && npm test && npm run build
         working-directory: web-admin
+
+      # The public theme is built here too, from the source in web-theme/. It
+      # used to be a published archive fetched by scripts/theme.sh; that is now
+      # a staging step, run below, and this is what puts something there to
+      # stage.
+      #
+      # `dist/` is not committed -- the same as web-admin's -- so a stale one
+      # cannot be the thing that gets shipped. `TZ=UTC` because the format tests
+      # read clock times out of timestamps, and the runner is UTC while a
+      # developer's machine is not; without it they pass here and fail there.
+      - run: npm ci && npm run lint && TZ=UTC npm test && npm run build
+        working-directory: web-theme
+
+      # Stages web-theme/dist/ into target/theme/, where build.rs and rust-embed
+      # look. Also what release.yml packs as the installable theme archive.
+      - run: ./scripts/theme.sh
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -59,10 +71,13 @@ jobs:
       # does not, so neither shows up until a fresh install or an upgrade.
       - run: scripts/install-test.sh
 
-      # This commit's hub against the latest released agent: the field contract
-      # between the two repositories, and what the public view withholds.
+      # This commit's hub against the latest agent we have released: the field
+      # contract between a hub and an agent already running in the field, and
+      # what the public view withholds. Ours, not another project's -- the
+      # agent this hub ships beside is the one it has to keep talking to, and a
+      # rename on either side is exactly the breakage this catches.
       - run: cargo build
       - run: |
-          curl -fsSL --retry 3 -o target/upstream-monitor-agent https://github.com/monitor-probe/agent/releases/latest/download/monitor-agent-x86_64-unknown-linux-musl
-          chmod +x target/upstream-monitor-agent
-      - run: scripts/e2e.sh target/debug/monitor-hub target/upstream-monitor-agent
+          curl -fsSL --retry 3 -o target/released-monitor-agent https://github.com/Isyyyue/monitor/releases/latest/download/monitor-agent-x86_64-unknown-linux-musl
+          chmod +x target/released-monitor-agent
+      - run: scripts/e2e.sh target/debug/monitor-hub target/released-monitor-agent

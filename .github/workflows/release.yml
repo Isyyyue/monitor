@@ -26,21 +26,25 @@ jobs:
           [ "$V" = "$A" ] || { echo "::error::hub and agent versions disagree"; exit 1; }
           [ "$GITHUB_REF_NAME" = "$V" ] || { echo "::error::tag $GITHUB_REF_NAME, Cargo.toml $V"; exit 1; }
 
-      # The default theme arrives as a published archive, verified against the
-      # hash in web-theme.pin. Run on the runner rather than left to build.rs,
-      # because the cross container below does not necessarily carry curl; it
-      # finds the theme already unpacked.
-      - run: ./scripts/theme.sh
-
       - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: web-admin/package-lock.json
+          cache-dependency-path: |
+            web-admin/package-lock.json
+            web-theme/package-lock.json
 
       # The hub embeds the panel, so its dist/ must exist before cargo runs.
       - run: npm ci && npm run build
         working-directory: web-admin
+
+      # The public theme is built from the source in web-theme/ and staged into
+      # target/theme/ by scripts/theme.sh below. Run on the runner rather than
+      # left to build.rs, because the cross container below does not carry node
+      # either; it finds both the theme and the panel already in place.
+      - run: npm ci && npm run build
+        working-directory: web-theme
+      - run: ./scripts/theme.sh
 
       - uses: dtolnay/rust-toolchain@stable
         with:

@@ -1,17 +1,17 @@
-//! Puts the pinned default theme where `rust-embed` will find it.
+//! Puts the public theme where `rust-embed` will find it.
 //!
-//! The hub embeds a built theme, which `scripts/theme.sh` fetches. Running it
-//! here lets a plain `cargo build` proceed without a setup step, taking its
-//! input from `web-theme.pin` rather than a hand-maintained directory.
+//! The theme's source lives in `web-theme/`; `scripts/theme.sh` stages its
+//! built output into `target/theme/`. Running it here lets a plain
+//! `cargo build` proceed without a setup step.
 
 use std::process::Command;
 
 fn main() {
-    // Cargo reruns this only when one of these changes. The stamp is listed as
-    // well, so deleting `target/theme` triggers a refetch rather than a later
-    // failure inside rust-embed.
-    println!("cargo:rerun-if-changed=web-theme.pin");
-    println!("cargo:rerun-if-changed=target/theme/.pin");
+    // Cargo reruns this only when one of these changes. The theme's own files
+    // are listed rather than the staging directory, so editing the theme and
+    // rebuilding its dist/ is what triggers the restage.
+    println!("cargo:rerun-if-changed=web-theme/dist");
+    println!("cargo:rerun-if-changed=web-theme/theme.json");
     println!("cargo:rerun-if-changed=scripts/theme.sh");
     // The panel is embedded by `frontend.rs`, and a build script that emits any
     // `rerun-if-changed` at all replaces cargo's own "something in the package

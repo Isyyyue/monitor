@@ -2,9 +2,9 @@
 
 自托管的服务器监控面板：一个后台管理多台 Linux 服务器的状态、流量、延迟与到期信息，并通过 Telegram 告警。
 
-Hub 用 Rust + axum + SQLite，后台用 React + TypeScript。后台与默认主题嵌入 Hub 二进制，运行时不依赖 Node.js，也不需要独立数据库服务。
+Hub 用 Rust + axum + SQLite，后台用 React + TypeScript，公开页用 React + Vite。后台与公开页主题都嵌入 Hub 二进制，运行时不依赖 Node.js，也不需要独立数据库服务。
 
-本项目基于 [monitor-probe/monitor](https://github.com/monitor-probe/monitor) 开发，增加了定制后台、自研 Agent 与 VPN 部署模块。
+最初参考 [monitor-probe/monitor](https://github.com/monitor-probe/monitor) 起家，此后已独立演进：定制后台、自研 Agent、VPN 部署模块与公开页主题的源码都在本仓库内，构建与发布不依赖任何外部仓库。
 
 ## 能做什么
 

@@ -1,54 +1,34 @@
 #!/bin/sh
-# Materialises the pinned default theme into target/theme/, where rust-embed
-# picks it up. The hub embeds a built theme derived from web-theme.pin, placed
-# outside any working tree so nothing can drift from the pin.
+# Puts the public theme where rust-embed picks it up.
 #
-# Called by build.rs, and by CI before cargo runs so that the download happens
-# on the runner rather than inside the cross container, which does not
-# necessarily carry curl.
+# The theme's source lives in web-theme/ beside the hub's own code. It used to
+# be downloaded -- from this repository's release, falling back to the upstream
+# project's -- which is what this script did before. Keeping the source here is
+# what makes the theme changeable at all: it is the page visitors look at, and
+# what they ask of it (a way back to the list, a background) are edits to it.
+#
+# Copies built output rather than building it. web-theme/dist/ is committed,
+# because a build needs node and an `npm install`, and this script runs from
+# build.rs -- so `cargo build` would otherwise need a JavaScript toolchain to
+# produce a Rust binary. Rebuilding the theme is a step of its own:
+#
+#     cd web-theme && npm install && npm run build
+#
+# then commit dist/. CI rebuilds it before building the hub and fails if the
+# result differs, so a stale dist/ cannot reach a release.
 set -eu
 
 cd "$(dirname "$0")/.."
-# read returns 1 at EOF, which is also what a pin file without a trailing
-# newline produces; the fields are set either way. Unguarded, set -e would exit
-# here silently and build.rs would report only the empty output.
-read -r TAG SHA <web-theme.pin || true
-[ -n "${TAG:-}" ] && [ -n "${SHA:-}" ] ||
-  { echo "web-theme.pin must hold '<tag> <sha256>'" >&2; exit 1; }
+SRC=web-theme
 DEST=target/theme
-# Already unpacked at this pin. A theme placed here manually with a matching
-# stamp is also left alone, which is how an unreleased theme is built against.
-if [ -f "$DEST/.pin" ] && [ "$(cat "$DEST/.pin")" = "$TAG $SHA" ]; then
-  exit 0
-fi
 
-mkdir -p target
-URL="https://github.com/Isyyyue/monitor/releases/download/$TAG/theme.tar.gz"
-# 自己的 release 还没有主题包时，回退到上游
-if ! curl -fsSL --retry 3 -o target/theme.tar.gz "$URL" 2>/dev/null; then
-    echo "fallback to upstream theme"
-    URL="https://github.com/monitor-probe/monitor-theme-default/releases/download/$TAG/theme.tar.gz"
-    curl -fsSL --retry 3 -o target/theme.tar.gz "$URL"
-fi
-
-
-GOT=$(sha256sum target/theme.tar.gz | cut -d' ' -f1)
-if [ "$GOT" != "$SHA" ]; then
-  echo "theme $TAG hashes to $GOT, not the $SHA that web-theme.pin names" >&2
-  echo "the release asset was replaced or the pin is wrong; neither is safe to build" >&2
-  exit 1
-fi
+[ -f "$SRC/theme.json" ] || { echo "$SRC/theme.json 不在" >&2; exit 1; }
+[ -f "$SRC/dist/index.html" ] ||
+  { echo "$SRC/dist/index.html 不在：先 cd web-theme && npm install && npm run build" >&2; exit 1; }
 
 rm -rf "$DEST"
 mkdir -p "$DEST"
-tar xzf target/theme.tar.gz --no-same-owner -C "$DEST"
-
-# The archive is an installable theme directory, the same layout frontend.rs
-# reads from disk. Without it the hub would embed nothing.
-if [ ! -f "$DEST/dist/index.html" ] || [ ! -f "$DEST/theme.json" ]; then
-  echo "theme $TAG unpacked without dist/index.html and theme.json" >&2
-  exit 1
-fi
-
-printf '%s %s\n' "$TAG" "$SHA" >"$DEST/.pin"
-echo "default theme $TAG unpacked into $DEST"
+cp -r "$SRC/dist" "$DEST/dist"
+cp "$SRC/theme.json" "$DEST/theme.json"
+[ -f "$SRC/preview.png" ] && cp "$SRC/preview.png" "$DEST/preview.png"
+echo "theme staged from $SRC/dist"
