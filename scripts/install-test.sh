@@ -462,26 +462,33 @@ grep -q 'left="$(old_https_port)"' "$HUB_INSTALL" ||
 	fail "old_https_port is never called, so a re-run still drops the HTTPS setup"
 
 # Exercised for real against a directory tree, because the whole bug was that
-# the answer depends on what is on disk rather than on the arguments.
+# the answer depends on what is on disk rather than on the arguments. `where` is
+# the directory the vhost is planted in, which is also what old_https_port
+# reports back -- Debian uses sites-enabled, RHEL and Alpine use conf.d, and the
+# function has to find the file in either.
 probe() {
-	dir=$1
+	where=$1
 	body=$2
 	root="$DIR/nginx"
 	rm -rf "$root"
 	mkdir -p "$root/sites-enabled" "$root/conf.d"
-	[ -z "$body" ] || printf '%s\n' "$body" >"$root/sites-enabled/monitor-hub-https.conf"
+	[ -z "$body" ] || printf '%s\n' "$body" >"$root/$where/monitor-hub-https.conf"
 	# shellcheck disable=SC2016  # the body is the installer's own sed, run as written
 	( cd "$root" && eval "$(sed -n '/^old_https_port() {/,/^}/p' "$HUB_INSTALL" |
 		sed 's#/etc/nginx#'"$root"'#g')" && old_https_port )
 }
 
-got=$(probe x 'listen 8444 ssl default_server;')
+got=$(probe sites-enabled 'listen 8444 ssl default_server;')
 check "old_https_port finds a vhost on 8444" "found:8444" "$(norm "$got")"
 
-got=$(probe x 'listen 9443 ssl default_server;')
+got=$(probe sites-enabled 'listen 9443 ssl default_server;')
 check "old_https_port reads the port it found" "found:9443" "$(norm "$got")"
 
-got=$(probe x '')
+# The other layout: no sites-enabled on the machine, the file under conf.d.
+got=$(probe conf.d 'listen 9443 ssl default_server;')
+check "old_https_port finds a vhost under conf.d too" "found:9443" "$(norm "$got")"
+
+got=$(probe sites-enabled '')
 check "old_https_port reports nothing when there is no vhost" "NONE" "$(norm "$got")"
 
 # And the summary: with HTTPS carried over, the note about needing a reverse
