@@ -219,41 +219,119 @@ mkdir -p data
 
 ### 端口占用
 
-一套完整部署就用这几个端口。**动端口之前先看这张表**：订阅地址和面板地址里都带着端口，
-挪一个就会打断已经发出去的链接，而且**客户端不一定报错** —— 它只是少显示一些东西，
-或者干脆连不上。
+一套完整部署就用下面这些端口。**动端口之前先看这张表**：订阅地址和面板地址里都带着
+端口，挪一个就会打断已经发出去的链接，而且**客户端不一定报错** —— 它只是少显示一些
+东西，或者干脆连不上。
 
-**Hub（跑 `install-hub.sh` 的那台）**
+#### 标准形态
 
-| 端口 | 用途 |
-|---|---|
-| `28080/tcp` | Hub 自己监听。默认只绑 `127.0.0.1`，公网访问不到；`--plain` 时绑 `0.0.0.0`。`--port` 可改 |
-| `443/tcp` | 面板入口。只在 `--https`（自签证书）或前面挂了反向代理时才有；`--https-port` 可改 |
+一句话：**`443` 归 sing-box，面板另占一个端口，两者不抢。** 一台机器既当 Hub 又当节点时
+这是唯一不打架的分法。
 
-**节点（跑 `install.sh` 的那台）**
+```
+公网
+  80/tcp    nginx        订阅；域名走 301 到 https
+  443/tcp   sing-box     VLESS + REALITY
+  443/udp   sing-box     Hysteria2
+  8444/tcp  nginx stream 按 SNI 分流
+              ├ www.cloudflare.com → 127.0.0.1:8443   REALITY 的伪装 SNI
+              └ 其它（你的域名）    → 127.0.0.1:9443   面板
 
-| 端口 | 用途 |
-|---|---|
-| `443/tcp` | sing-box 的 VLESS + REALITY 入站 |
-| `443/udp` | sing-box 的 Hysteria2 入站 |
-| `80/tcp` | 订阅伺服。被别的服务占了会退到 `8080`，安装时会说明，订阅地址跟着带上端口；`--sub-port` 可改 |
-| `22/tcp` | ssh，安装器不动它 |
+回环
+  127.0.0.1:28080  Hub 自己
+  127.0.0.1:9443   面板 vhost，证书在这里
+  127.0.0.1:9444   面板的第二个入口，只给 SSH 隧道用
+  127.0.0.1:18081  订阅伺服，加 subscription-userinfo 的那个
+```
+
+**面板为什么不直接放 `443`**：`443` 要给 sing-box。REALITY 靠「不认识的 SNI 就转发给
+伪装站」来隐藏自己，所以面板不能和它挤在同一个端口 —— 同一个 SNI 没法既当代理又当面板。
+
+**`8444` 上为什么还要按 SNI 再分一次**：代理客户端握手时带的是伪装站的 SNI
+（`www.cloudflare.com`），面板来的是你的域名。两个都落到 `8444`，靠 SNI 分开，代理和
+面板就都能用同一个对外端口，而 `443` 始终留给 sing-box。
+
+nginx 的 `stream` 块就长这样：
+
+```nginx
+stream {
+    map $ssl_preread_server_name $tls_backend {
+        www.cloudflare.com reality;   # REALITY 的伪装 SNI
+        default            panel;     # 其它一律当面板
+    }
+    upstream reality { server 127.0.0.1:8443; }
+    upstream panel   { server 127.0.0.1:9443; }
+    server {
+        listen 8444;
+        listen [::]:8444 ipv6only=on;
+        ssl_preread on;
+        proxy_pass $tls_backend;
+    }
+}
+```
+
+面板的 vhost 因此只监听回环，证书也放在那里：
+
+```nginx
+server {
+    listen 127.0.0.1:9443 ssl http2;
+    server_name your-domain.example;
+    ssl_certificate     /etc/letsencrypt/live/your-domain.example/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/your-domain.example/privkey.pem;
+    location / { proxy_pass http://127.0.0.1:28080; }   # Hub
+}
+```
+
+**纯节点**（只跑 `install.sh`，不跑 Hub）少掉 Hub 和面板那几条：
+
+```
+公网
+  80/tcp    nginx      订阅
+  443/tcp   sing-box   VLESS + REALITY
+  443/udp   sing-box   Hysteria2
+  22/tcp    ssh
+回环
+  127.0.0.1:18081  订阅伺服
+```
+
+#### 谁在听哪个端口
+
+| 端口 | 谁 | 绑在哪 | 用途 |
+|---|---|---|---|
+| `80/tcp` | nginx | 公网 | 订阅；域名 301 到 https |
+| `443/tcp` | sing-box | 公网 | VLESS + REALITY 入站 |
+| `443/udp` | sing-box | 公网 | Hysteria2 入站 |
+| `8444/tcp` | nginx stream | 公网 | 按 SNI 分流：伪装 SNI 给 REALITY，其余给面板 |
+| `28080/tcp` | monitor-hub | 回环 | Hub 自己。`--port` 可改；`--plain` 时绑公网 |
+| `9443/tcp` | nginx | 回环 | 面板 vhost，证书在这里，从 `8444` 分流进来 |
+| `9444/tcp` | nginx | 回环 | 面板的第二个入口，给 SSH 隧道用 |
+| `18081/tcp` | 订阅伺服 | 回环 | 按当前订阅文件伺服，并带上 `subscription-userinfo` |
 
 **Agent 不占任何入站端口**：它主动连 Hub 的 `/api/agent/ws`，节点不需要为它开防火墙。
 
-**同一台机器既当 Hub 又当节点**时，两边的 `443` 会撞：Hub 的 `--https` 要用它，节点的
-sing-box 也要用它。三种解法任选一种：
+#### 安装器装了什么
 
-- 面板换端口：`install-hub.sh --https --https-port 8443`，面板走 `https://IP:8443`
-- 前面放一层按 SNI 分流的代理，一个 `443` 分给两边
-- 节点上改 sing-box 的监听端口（`/etc/sing-box/config.json` 里）
+| 安装器 | 装出来的端口 |
+|---|---|
+| `install-hub.sh` | Hub 监听 `28080`（回环）。`--https` 时另外装 nginx 把面板放到 `443`（`--https-port` 可改）—— **这条路和 sing-box 抢 `443`，同机部署别用**，按上面的标准形态把面板放到别的端口 |
+| `install.sh` | 节点的 sing-box（`443`），以及订阅伺服：默认绑 `80`；`80` 被占（比如机器上已经有 nginx）就退到 `8080` 并在安装时说明，订阅地址跟着带上端口。`--sub-port` 可改。**它不装 nginx，也不动 `80` 上已有的东西** |
 
-**出站**
+`80` 上已经有 nginx 时，想让订阅继续走 `80`，给它加一条。端口填订阅伺服**实际**绑的那个：
+`80` 被占时它退到了 `8080`，安装输出里会写。
+
+```nginx
+location ~ ^/(sub-[0-9a-f]+\.yaml|v2-[0-9a-f]+\.(txt|b64))$ {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $host;
+}
+```
+
+#### 出站
 
 | 从 | 到 | 用途 |
 |---|---|---|
 | Hub | `github.com` | 取 Agent 与主题的发布包，再转给节点 |
-| 节点 | Hub 的 `28080` 或反向代理端口 | 上报指标、收探测任务、读自己的额度与用量（订阅头用） |
+| 节点 | Hub 的 `28080` 或反代端口 | 上报指标、收探测任务、读自己的额度与用量（订阅头用） |
 | 节点 | `deb.sagernet.org` | 装 sing-box |
 | 客户端 | 节点的 `80`（订阅）与 `443`（代理） | 取订阅、走代理 |
 
