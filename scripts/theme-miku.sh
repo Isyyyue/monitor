@@ -43,7 +43,31 @@ cp "$MIKU/miku-bg.mp4" "$STAGE/dist/assets/miku-bg.mp4"
 #   the css    draws the background and clears the cards
 #   the video  the element the stylesheet positions; without it the page is the
 #              default theme with transparent cards and nothing behind them
-python3 "$(dirname "$0")/theme-miku-html.py" "$STAGE/dist/index.html"
+#
+# `sed` rather than a helper in another language: this runs on a runner that has
+# nothing beyond a POSIX shell, and a `.py` beside it would also put Python back
+# into the repository's language statistics, which `.gitattributes` had
+# deliberately taken out.
+ADMIN='<script>(function(){function apply(){var a=location.pathname.indexOf("/admin")===0;document.body.classList.toggle("is-admin",a);if(!a){try{if(!localStorage.getItem("theme"))localStorage.setItem("theme","dark")}catch(e){}}}apply();addEventListener("popstate",apply);var p=history.pushState.bind(history);history.pushState=function(){p.apply(null,arguments);apply()}})();</script>'
+LINK='<link rel="stylesheet" href="/assets/miku-bg.css">'
+VIDEO='<video id="miku-bg" autoplay muted loop playsinline preload="auto" src="/assets/miku-bg.mp4"></video>'
+
+HTML="$STAGE/dist/index.html"
+# Checked first: sed replaces nothing when the anchor is missing and still
+# exits 0, so a theme that renamed its mount point would ship a miku package
+# with no miku in it.
+for anchor in '</head>' '<div id="root">'; do
+  grep -qF "$anchor" "$HTML" ||
+    { echo "index.html 里没有 $anchor：默认主题改了结构，组装脚本要跟着改" >&2; exit 1; }
+done
+
+# `#` as the separator, since both the anchors and the text between them
+# contain `/`. Nothing here contains `&` or a backslash, which sed would read as
+# a backreference and an escape.
+sed -i \
+  -e "s#</head>#${ADMIN}\n    ${LINK}\n  </head>#" \
+  -e "s#<div id=\"root\">#${VIDEO}\n    <div id=\"root\">#" \
+  "$HTML"
 
 # Packed with -C into the staging directory, so the archive holds relative
 # paths and theme.json sits at its root -- which is where `frontend::install`
