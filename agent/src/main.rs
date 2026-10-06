@@ -423,11 +423,128 @@ fn collect_facts(sys: &sysinfo::System) -> Facts {
 
 /// JSON-RPC message from hub。
 ///
-/// 只有 `method`：`vpn.deploy` 分支删除后，唯一还会到达的是 `ping.tasks`，
-/// 而它尚未实现、参数也不用。等 ping.tasks 落地时再把 `params` 加回来。
+/// `params` 只有 `ping.tasks` 用。`vpn.deploy` 分支删除后这里不再是指令通道，
+/// 运行期依旧不存在任何 root 动作 —— 探针只做一次 TCP 连接。
 #[derive(Debug, Deserialize)]
 struct RpcMessage {
     method: String,
+    #[serde(default)]
+    params: serde_json::Value,
+}
+
+/// hub 派给本节点的探针：每 `interval` 秒对 `target` 做一次 TCP 连接，回报耗时。
+///
+/// 只有 `host:port` 一种形态，面板的输入提示就是这么写的，hub 也照原样下发。
+#[derive(Debug, Deserialize)]
+struct PingTask {
+    id: i64,
+    target: String,
+    interval: i64,
+}
+
+/// hub 保存任务时夹到同一个下限（`Db::MIN_PROBE_INTERVAL`）。这里再夹一次是兜底：
+/// 跑得比 hub 收得下的还快，多出来的结果只会被丢掉，不会变成更细的曲线。
+const MIN_PROBE_INTERVAL: i64 = 5;
+/// 同上，对应 `Db::MAX_PROBES_PER_NODE`。
+const MAX_PROBES: usize = 64;
+/// 够一次跨洋握手，又不至于让黑洞目标把下一次探测挤到间隔之外。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 一次 TCP 连接的耗时，毫秒；连不上回报 -1。
+///
+/// 失败必须**回报**而不是跳过：hub 把负值记为丢包，而缺 `latency_ms` 的帧会被
+/// 当成畸形帧丢掉 —— 沉默会在图上画出一段空白，而不是一次丢包。
+async fn probe_once(target: &str) -> i64 {
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(target)).await {
+        Ok(Ok(_)) => started.elapsed().as_millis() as i64,
+        _ => -1,
+    }
+}
+
+/// 值得跑的探针，夹到 hub 收得下的范围内。
+///
+/// hub 在保存任务时已经拦过一遍，这里是兜底：一个越界的列表会让多出来的探针跑了
+/// 却发不出去，节点白忙，面板上却什么都没有。
+fn runnable(tasks: Vec<PingTask>) -> Vec<PingTask> {
+    tasks
+        .into_iter()
+        .filter(|t| t.id > 0 && !t.target.trim().is_empty())
+        .take(MAX_PROBES)
+        .map(|t| PingTask { interval: t.interval.max(MIN_PROBE_INTERVAL), ..t })
+        .collect()
+}
+
+/// 一条正在跑的探针。
+struct Running {
+    target: String,
+    interval: i64,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// 本会话在跑的探针，按任务 id。
+#[derive(Default)]
+struct Probes {
+    running: std::collections::HashMap<i64, Running>,
+}
+
+impl Probes {
+    /// 把在跑的对齐到 hub 刚下发的列表。
+    ///
+    /// 目标和间隔都没变的探针**原样留着**：hub 只要有一个任务改动就会推整个列表，
+    /// 把其余的重启会重置它们的计时，还会丢掉正要发出的那一次读数。
+    fn reconcile(&mut self, tasks: Vec<PingTask>, results: &tokio::sync::mpsc::UnboundedSender<Message>) {
+        let mut keep = std::collections::HashSet::new();
+        for task in runnable(tasks) {
+            keep.insert(task.id);
+            let unchanged = self
+                .running
+                .get(&task.id)
+                .is_some_and(|r| r.target == task.target && r.interval == task.interval);
+            if unchanged {
+                continue;
+            }
+            if let Some(old) = self.running.remove(&task.id) {
+                old.handle.abort();
+            }
+            let handle =
+                tokio::spawn(run_probe(task.id, task.target.clone(), task.interval, results.clone()));
+            self.running.insert(task.id, Running { target: task.target, interval: task.interval, handle });
+        }
+        // 这一轮没提到的任务：面板删了它，或者本节点被取消了分配。
+        self.running.retain(|id, r| {
+            let gone = !keep.contains(id);
+            if gone {
+                r.handle.abort();
+            }
+            !gone
+        });
+    }
+}
+
+/// 一条探针的循环：连、回报、等。
+///
+/// 第一次立刻做，面板上刚加的监控不用等满一个间隔才有数字。
+async fn run_probe(
+    id: i64,
+    target: String,
+    interval: i64,
+    results: tokio::sync::mpsc::UnboundedSender<Message>,
+) {
+    let period = Duration::from_secs(interval.max(MIN_PROBE_INTERVAL) as u64);
+    loop {
+        let latency = probe_once(&target).await;
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "ping.result",
+            "params": { "task_id": id, "latency_ms": latency },
+        });
+        // 写端已经走了就收工；留在这里只会攒下一堆没人要的帧。
+        if results.send(Message::Text(frame.to_string())).is_err() {
+            return;
+        }
+        tokio::time::sleep(period).await;
+    }
 }
 
 #[tokio::main]
@@ -466,6 +583,10 @@ async fn main() -> Result<()> {
 
     let mut rate = Rate::default();
     let mut interval = tokio::time::interval(args.interval);
+    // 探针各自跑在 spawn 出来的任务里，读数从这里回到唯一的写端：一个 WebSocket
+    // 只能有一个写者，几条探针各写各的会交错成坏帧。
+    let (results_tx, mut results_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let mut probes = Probes::default();
 
     loop {
         tokio::select! {
@@ -482,14 +603,27 @@ async fn main() -> Result<()> {
                     break;
                 }
             }
+            Some(frame) = results_rx.recv() => {
+                if let Err(e) = write.send(frame).await {
+                    error!("Failed to send probe result: {}", e);
+                    break;
+                }
+            }
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(rpc) = serde_json::from_str::<RpcMessage>(&text) {
                             match rpc.method.as_str() {
                                 "ping.tasks" => {
-                                    // TODO: Handle ping tasks
-                                    info!("Received ping.tasks (not implemented)");
+                                    // 整个列表，不是增量：hub 只在任务变化时推，收到的
+                                    // 就是本节点当前该跑的全部。
+                                    match serde_json::from_value::<Vec<PingTask>>(rpc.params) {
+                                        Ok(tasks) => {
+                                            info!("Received {} ping task(s)", tasks.len());
+                                            probes.reconcile(tasks, &results_tx);
+                                        }
+                                        Err(e) => warn!("Unusable ping.tasks payload: {}", e),
+                                    }
                                 }
                                 // `vpn.deploy` 曾在这里处理，需要 root 才能写 /etc 与调 systemctl。
                                 // 那条通道已删除：部署改由 `provision` 在安装期以 root 完成。
@@ -681,5 +815,41 @@ mod tests {
         assert_eq!(socket_count(&[f.to_str().unwrap()]), 2, "表头不算");
         assert_eq!(socket_count(&["/proc/net/does-not-exist"]), 0, "缺失的文件算 0");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 探针要么量到一个耗时，要么回报丢包。沉默不是选项：hub 把负值记为丢包，
+    /// 而缺 `latency_ms` 的帧会被当畸形帧丢掉 —— 图上就成了空白而不是一次丢包。
+    #[tokio::test]
+    async fn a_probe_measures_a_handshake_and_reports_a_refusal() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+        assert!(probe_once(&addr.to_string()).await >= 0, "连得上的目标应该量到耗时");
+
+        // 绑过再放掉：端口已经关掉，没人应答。
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = closed.local_addr().unwrap();
+        drop(closed);
+        assert_eq!(probe_once(&dead.to_string()).await, -1, "连不上要回报丢包");
+    }
+
+    /// hub 保存任务时拦过一遍，agent 这边是兜底：越界的探针跑了却发不出去，
+    /// 节点白忙而面板上什么都没有。
+    #[test]
+    fn probes_are_clamped_to_what_the_hub_will_accept() {
+        let task = |id, target: &str, interval| PingTask { id, target: target.into(), interval };
+        let kept = runnable(vec![
+            task(1, "1.1.1.1:443", 60),
+            task(0, "1.1.1.1:443", 60),
+            task(-3, "1.1.1.1:443", 60),
+            task(2, "   ", 60),
+            task(3, "1.1.1.1:443", 1),
+        ]);
+        assert_eq!(kept.len(), 2, "只有 id 和目标都成立的留下");
+        assert_eq!(kept[0].id, 1);
+        assert_eq!(kept[1].interval, MIN_PROBE_INTERVAL, "低于下限的间隔夹到下限");
+
+        let many: Vec<_> = (1..=MAX_PROBES as i64 + 10).map(|i| task(i, "1.1.1.1:443", 60)).collect();
+        assert_eq!(runnable(many).len(), MAX_PROBES, "超出上限的截掉");
     }
 }
