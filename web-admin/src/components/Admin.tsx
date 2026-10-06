@@ -14,7 +14,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { api, badIfaceName, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, plainEntry, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { api, badIfaceName, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, plainEntry, provisioningSite, selfSignedEntry, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -1077,7 +1077,12 @@ function scriptCommand(site: string, args: (site: string) => string[]) {
   // refusal is right: the token and the binary about to run as root both cross an
   // unverified channel. --insecure is the operator's standing decision to accept
   // it, which naming a plaintext --site already was.
-  const insecure = plainEntry(site) ? ["--insecure"] : []
+  //
+  // A self-signed address is the same decision taken for an encrypted channel
+  // whose certificate nobody vouches for. Without the flag the node fetches the
+  // binary from a TLS handshake it cannot verify and, worse, the agent dials a
+  // hub it refuses -- so the panel would hand out a command that cannot work.
+  const insecure = plainEntry(site) || selfSignedEntry(site) ? ["--insecure"] : []
   return `curl -fsSL ${site}/install.sh | sh -s -- ${args(site).concat(insecure).join(" ")}`
 }
 

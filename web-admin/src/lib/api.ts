@@ -269,6 +269,33 @@ function httpsDomain(site: string): string {
 }
 
 /**
+ * An https entry reached at an address rather than a name: a hub with no domain
+ * serves a certificate it signed itself. `--insecure` is how a node is told to
+ * accept it -- install.sh fetches the binary over that same unverified channel
+ * and hands the flag on to the agent, which trusts public roots otherwise.
+ *
+ * The address test is what separates this from an ordinary https entry. A name
+ * can hold a certificate a public CA vouches for; an address cannot, so a name
+ * here means the operator has something to lose by skipping the check and this
+ * is not the case for it.
+ *
+ * Not loopback, for the same reason as `plainEntry`: an address on the hub's
+ * own machine names nothing a node could reach.
+ */
+export function selfSignedEntry(site: string): string {
+  try {
+    const u = new URL(site)
+    const host = u.hostname
+    const address = host.startsWith("[") || /^\d+(\.\d+){3}$/.test(host)
+    return u.protocol === "https:" && !u.username && !u.password
+      && u.pathname === "/" && !u.search && !u.hash
+      && address && !loopbackOrigin(site) ? u.origin : ""
+  } catch {
+    return ""
+  }
+}
+
+/**
  * A plaintext entry the operator named deliberately, for a hub with no domain.
  * `--site http://<address>` is how the hub is told to accept provisioning from
  * it, and the command then carries that address with `--insecure`, since

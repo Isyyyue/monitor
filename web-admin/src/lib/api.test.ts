@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, plainEntry, provisioningSite, provisionRefusal, shortAddress, trafficCorrection } from "./api.ts"
+import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, plainEntry, provisioningSite, provisionRefusal, selfSignedEntry, shortAddress, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
@@ -18,6 +18,16 @@ assert.equal(plainEntry("https://monitor.example.com"), "")
 for (const site of ["http://127.0.0.1:28080", "http://localhost:28080", "http://[::1]:28080", "http://2130706433", "http://monitor.example.com/path", "ftp://monitor.example.com"]) {
   assert.equal(plainEntry(site), "", site)
   assert.equal(provisioningSite(site), "", site)
+}
+// The other half of --insecure: a hub with no domain serves a certificate it
+// signed itself, at an address rather than a name. An address is the test -- a
+// name can hold a certificate a public CA vouches for, and skipping the check
+// there would be giving something up for nothing.
+assert.equal(selfSignedEntry("https://198.51.100.7:8444"), "https://198.51.100.7:8444")
+assert.equal(selfSignedEntry("https://[2001:db8::1]:8444"), "https://[2001:db8::1]:8444")
+assert.equal(selfSignedEntry("https://monitor.example.com"), "", "域名有真证书，不需要跳过校验")
+for (const site of ["https://127.0.0.1:8444", "https://localhost", "https://[::1]:8444", "http://198.51.100.7:8444", "https://198.51.100.7:8444/path", "https://user@198.51.100.7:8444"]) {
+  assert.equal(selfSignedEntry(site), "", site)
 }
 // A tunnelled panel: the hub allows it alongside --site, so the panel must read
 // the same addresses as loopback, and a name merely beginning with one as not.

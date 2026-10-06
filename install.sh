@@ -146,6 +146,9 @@ fi
 	echo "--sub-port PORT is where this node serves its own subscription, default 80;" >&2
 	echo "  the subscription URL carries it, and clients read the traffic header from" >&2
 	echo "  that response -- without the header their card loses the traffic row" >&2
+	echo "--insecure accepts a hub whose certificate cannot be verified, which is a" >&2
+	echo "  self-signed address or a plain HTTP one. It skips the check for this" >&2
+	echo "  download and for the agent's connection, and is remembered across upgrades" >&2
 	exit 2
 }
 # Names the node a registration creates. A token belongs to a node that already
@@ -193,13 +196,29 @@ fi
 # Without this the two diverge: the agent would dial wss:// while curl below
 # defaults a scheme-less URL to http://, fetching over plaintext the binary about
 # to run as root.
+#
+# Read back from the env file first, like --iface: an upgrade re-runs this script
+# without the flags the first install used, and a node that suddenly refuses its
+# hub's certificate is one that stops reporting -- which is the failure this
+# whole flag exists to avoid.
+if [ -z "$INSECURE" ]; then
+	INSECURE=$(sed -n 's/^MONITOR_INSECURE=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+	[ -z "$INSECURE" ] || echo "keeping --insecure from the previous install"
+fi
 if [ -n "$INSECURE" ]; then SCHEME=http; else SCHEME=https; fi
-# `--insecure` stops at this script and is never handed to the agent. The agent
-# takes its scheme from the address it is given -- `http://` becomes `ws://`, and
-# a plaintext connection has no certificate to verify -- so it has nothing to do
-# with the flag, and it refuses the flag outright if it sees it. A unit carrying
-# `--insecure` therefore exits at startup and crash-loops on RestartSec while the
-# install reports failure. Do not add it back to `command_args` or `ExecStart`.
+# `--insecure` reaches the agent, as MONITOR_INSECURE below. It used to stop at
+# this script, back when the flag only meant "the hub has no TLS, so download
+# over plain HTTP" and the agent had nothing to verify either way.
+#
+# A hub with no domain now serves its panel under a certificate it signed
+# itself, which is an encrypted channel the agent still refuses: it trusts
+# public roots unless told otherwise. So the flag has to travel -- the fetch
+# below skips the check with -k, and the unit gets MONITOR_INSECURE=1.
+#
+# Not passed as a command-line flag to the agent: it would land in `systemctl
+# cat`, and the env file is 0600 for a reason.
+CURL_INSECURE=""
+[ -z "$INSECURE" ] || CURL_INSECURE="-k"
 case "$SERVER" in *://*) ;; *) SERVER="$SCHEME://$SERVER" ;; esac
 # The agent already refuses plaintext ws:// to a remote hub, since the token
 # would travel in the clear. The same address fetches the binary about to run as
@@ -257,6 +276,18 @@ http://*)
 		echo "         installed below is fetched over the same unverified channel" >&2
 	fi
 	;;
+https://*)
+	# A name can hold a certificate a public CA vouches for; an address cannot,
+	# which is why a hub with no domain is reached at one. Both halves of the
+	# flag are in play here, so both are said: this fetch, and the agent's own
+	# connection -- an agent that refuses the hub's certificate is a node that
+	# silently stops reporting.
+	if [ -n "$INSECURE" ] && [ -z "$LOCAL" ]; then
+		echo "warning: --insecure over $SERVER" >&2
+		echo "         the certificate is not verified, here or by the agent. Traffic is" >&2
+		echo "         still encrypted; what is given up is who vouches for the far end" >&2
+	fi
+	;;
 esac
 if command -v systemctl >/dev/null; then
 	INIT=systemd
@@ -305,7 +336,7 @@ echo "downloading monitor-agent ($ARCH)"
 # final and shown with the hub's own reason, which --fail would discard.
 TRIES=0
 while :; do
-	CODE=$(curl -sSL --max-time 300 -w '%{http_code}' "$URL" -o "$TMP") || exit 1
+	CODE=$(curl -sSL $CURL_INSECURE --max-time 300 -w '%{http_code}' "$URL" -o "$TMP") || exit 1
 	[ "$CODE" = 503 ] && [ "$TRIES" -lt 5 ] || break
 	TRIES=$((TRIES + 1))
 	echo "the hub is busy relaying to other machines; retrying in 5 seconds"
@@ -413,6 +444,10 @@ MONITOR_SERVER=$SERVER
 MONITOR_TOKEN=$TOKEN
 ENV
 	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$ENV_FILE"
+	# Read by the agent at startup; see CURL_INSECURE above for why the flag has
+	# to reach it at all. Written here rather than in the unit so it stays out of
+	# `systemctl cat`.
+	[ -z "$INSECURE" ] || printf 'MONITOR_INSECURE=1\n' >>"$ENV_FILE"
 )
 
 # The new agent is not running. The binary it replaced is put back and started
