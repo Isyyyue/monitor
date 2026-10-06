@@ -50,7 +50,40 @@ pub struct Theme {
     /// only, so it lays each card out once rather than when the image arrives.
     #[serde(skip_deserializing)]
     pub preview: bool,
+    /// Set for an entry the hub can fetch but has not yet: the panel draws it
+    /// with a 「下载」 button where an installed theme gets 「使用」. Never read
+    /// from a manifest -- a theme on disk is by definition already downloaded.
+    #[serde(skip_deserializing)]
+    pub downloadable: bool,
 }
+
+/// A theme the hub knows how to fetch, offered in the panel before it is
+/// installed.
+///
+/// A theme used to be all or nothing: the list showed what was on disk, and
+/// getting another one meant finding a `theme.tar.gz` and uploading it. The
+/// entries here appear whether or not they are installed, and
+/// `POST /api/themes/{short}/install` pulls one in.
+pub struct Downloadable {
+    pub short: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+    /// Where the package lives. A release asset of this repository, published
+    /// by the release workflow beside the binaries.
+    ///
+    /// `latest/download` on purpose: the package is rebuilt from the default
+    /// theme on every release (see `scripts/theme-miku.sh`), so pinning a tag
+    /// would freeze it at whatever the default theme looked like back then --
+    /// and the drift would be invisible, because the page would still render.
+    pub url: &'static str,
+}
+
+pub const DOWNLOADABLE: &[Downloadable] = &[Downloadable {
+    short: "miku",
+    name: "初音主题",
+    description: "初音未来动态壁纸：全屏背景视频铺满页面，面板卡片透明",
+    url: "https://github.com/Isyyyue/monitor/releases/latest/download/theme-miku.tar.gz",
+}];
 
 pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
@@ -226,6 +259,31 @@ pub fn themes(app: &App) -> std::io::Result<Vec<Theme>> {
                 }
             }
         }
+    }
+
+    // Offered before they are installed: entries the panel draws with a 「下载」
+    // button where an installed theme gets 「使用」. Skipped once the theme is on
+    // disk -- the directory walk above already listed it, and two cards for one
+    // theme would be a puzzle rather than a convenience.
+    for entry in DOWNLOADABLE {
+        if list.iter().any(|theme| theme.short == entry.short) {
+            continue;
+        }
+        list.push(Theme {
+            name: entry.name.into(),
+            short: entry.short.into(),
+            description: entry.description.into(),
+            // Left blank rather than invented: nothing is installed, so there
+            // is no version to report and no author to credit.
+            version: String::new(),
+            author: String::new(),
+            url: entry.url.into(),
+            config: None,
+            selected: false,
+            builtin: false,
+            preview: false,
+            downloadable: true,
+        });
     }
 
     let configured = app.db.get("theme").unwrap_or_default();

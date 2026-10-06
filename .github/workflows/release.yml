@@ -87,11 +87,18 @@ jobs:
       # releases old, and this entry is what lets that copy recognise itself as
       # such. It is published per release rather than read from main, so the
       # script a release was tested with is the one it is measured against.
+      #
+      # theme-miku.tar.gz is the miku theme, assembled here from the default
+      # theme that build.rs has already unpacked into target/theme/. Rebuilt on
+      # every release rather than committed as a copy, so it cannot go stale
+      # behind a default theme that moved on -- see scripts/theme-miku.sh. The
+      # panel fetches it by name through /api/themes/{short}/install.
       - if: startsWith(github.ref, 'refs/tags/')
         run: |
           cp install-hub.sh install.sh bin/
-          (cd bin && sha256sum monitor-hub-* monitor-agent-* install-hub.sh install.sh > sha256sums.txt)
-          gh release create "$GITHUB_REF_NAME" bin/monitor-hub-* bin/monitor-agent-* bin/install-hub.sh bin/install.sh bin/sha256sums.txt \
+          sh scripts/theme-miku.sh bin/theme-miku.tar.gz
+          (cd bin && sha256sum monitor-hub-* monitor-agent-* install-hub.sh install.sh theme-miku.tar.gz > sha256sums.txt)
+          gh release create "$GITHUB_REF_NAME" bin/monitor-hub-* bin/monitor-agent-* bin/install-hub.sh bin/install.sh bin/theme-miku.tar.gz bin/sha256sums.txt \
             --generate-notes --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}

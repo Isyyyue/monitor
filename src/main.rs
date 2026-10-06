@@ -551,6 +551,10 @@ async fn main() -> Result<()> {
         .route("/api/themes/{short}", delete(api::delete_theme))
         .route("/api/themes/{short}/preview", get(api::theme_preview))
         .route("/api/themes/{short}/update", post(api::update_theme))
+        // The 「下载」 button on a theme the hub can fetch but has not. Beside
+        // `update` rather than `theme-install`: that one takes an archive in the
+        // request body, this one fetches from a URL the hub picked.
+        .route("/api/themes/{short}/install", post(api::install_downloadable))
         // Not under /api/themes/: a fixed segment there would shadow the theme
         // of that name for the routes keyed by `{short}`.
         .route("/api/theme-install", post(api::install_theme))

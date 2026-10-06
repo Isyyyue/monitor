@@ -1678,6 +1678,77 @@ pub async fn update_theme(_: Admin, State(app): State<Shared>, Path(short): Path
     }
 }
 
+/// Installs a theme the hub knows how to fetch, by short name.
+///
+/// The 「下载」 button's endpoint. The URL comes from `frontend::DOWNLOADABLE`
+/// and never from the request, so a caller cannot point the hub at an archive
+/// of their choosing -- which matters because the hub unpacks whatever it
+/// fetches into the directory it serves the public page from.
+pub async fn install_downloadable(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(short): Path<String>,
+) -> Response {
+    let Some(entry) = crate::frontend::DOWNLOADABLE.iter().find(|e| e.short == short) else {
+        return fail(anyhow::anyhow!("没有这个可下载主题：{short}"));
+    };
+    match install_from_url(&app, entry.url, &short).await {
+        Ok(theme) => Json(json!({"theme": theme})).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// Downloads a theme package from a URL the hub itself chose, and installs it.
+///
+/// The sibling of `fetch_theme`, which walks a GitHub release for the
+/// repository named in an installed theme's manifest. This one takes the URL
+/// from `frontend::DOWNLOADABLE` and skips the release lookup, because the
+/// asset is published under a moving `latest` tag -- pinning a tag there would
+/// freeze the package at whatever the default theme looked like on that day.
+async fn install_from_url(
+    app: &App,
+    url: &str,
+    expect: &str,
+) -> Result<crate::frontend::Theme, anyhow::Error> {
+    use anyhow::Context;
+
+    let url = crate::proxied(app, url.to_owned());
+    let unreachable =
+        || crate::Shown("下载主题包失败：hub 连不上 github.com 时，在设置里填 GitHub 代理".into());
+    let response = app
+        .http
+        .get(url)
+        .timeout(std::time::Duration::from_secs(75))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .with_context(unreachable)?;
+    // Stopping at Content-Length is what makes this check the body too: a header
+    // understating the archive cannot make more arrive. A proxy that sends none
+    // is refused rather than read unbounded.
+    match response.content_length() {
+        Some(size) if size <= MAX_THEME => {}
+        Some(size) => {
+            refuse!("主题包 {} MiB，超过 {} MiB 的上限", size / 1024 / 1024, MAX_THEME / 1024 / 1024)
+        }
+        None => refuse!("下载没有给出大小，无法确认它在 {} MiB 以内", MAX_THEME / 1024 / 1024),
+    }
+    let archive = response.bytes().await.with_context(unreachable)?;
+    // A proxy answers with a page of its own -- a block notice, a sign-in wall --
+    // under a 200, and `install` would report that as a corrupt archive.
+    if !archive.starts_with(&crate::frontend::GZIP_MAGIC) {
+        refuse!("下载到的不是主题包，检查 hub 的网络或代理设置");
+    }
+
+    // The same unpacking, validation and atomic replace an upload undergoes.
+    let (themes, expect) = (app.themes.clone(), expect.to_owned());
+    tokio::task::spawn_blocking(move || {
+        crate::frontend::install(&themes, std::io::Cursor::new(archive), Some(&expect))
+    })
+    .await
+    .context("主题安装线程没跑完")?
+}
+
 async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error> {
     let Some(installed) = crate::frontend::themes(app)?.into_iter().find(|theme| theme.short == short) else {
         refuse!("没有这个主题");
