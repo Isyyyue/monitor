@@ -982,6 +982,47 @@ impl Db {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Creates the two latency tasks the proxy prober files its measurements
+    /// under, if they are not there yet.
+    ///
+    /// `probe/probe.py` measures real proxy latency through sing-box and writes
+    /// it to `ping_record` against a task id. Until now nothing on this side
+    /// created those rows, while the prober hardcoded which id meant what
+    /// (1=VLESS, 2=HY2) -- so on any database where those two were not the
+    /// first tasks made, every measurement landed on another curve and nothing
+    /// anywhere said so.
+    ///
+    /// Called from the startup path rather than from `open`, because the tests
+    /// open databases too and most of them count the probes they made.
+    ///
+    /// Matched on `target` rather than on the name: that is what the prober
+    /// looks up, and renaming a task is the operator's business. A rename must
+    /// not make this add a second copy.
+    ///
+    /// Nodes that were here first join it too, the same way a node added later
+    /// would through `auto_join`. Without that an upgraded hub would carry both
+    /// tasks with nobody probing them, and the agent would never be told about
+    /// them either.
+    pub fn ensure_default_ping_tasks(&self) -> Result<()> {
+        let conn = self.conn();
+        for (name, target, sort) in [("VLESS", "proxy:vless", 0), ("HY2", "proxy:hy2", 1)] {
+            let present: i64 =
+                conn.query_row("SELECT COUNT(*) FROM ping_task WHERE target = ?1", [target], |r| r.get(0))?;
+            if present > 0 {
+                continue;
+            }
+            conn.execute(
+                "INSERT INTO ping_task (name, target, interval, auto_join, sort) VALUES (?1, ?2, 60, 1, ?3)",
+                params![name, target, sort],
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO ping_node (task_id, node_id) SELECT ?1, id FROM node",
+                [conn.last_insert_rowid()],
+            )?;
+        }
+        Ok(())
+    }
+
     /// The connection the history charts read through: the read-only one, or
     /// the writer for `:memory:`.
     ///

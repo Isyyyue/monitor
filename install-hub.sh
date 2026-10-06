@@ -44,8 +44,6 @@ HTTPS_PORT_SET=""
 # reached over plain HTTP. The other answer to having no domain, and the one
 # that costs nothing to run.
 PLAIN=""
-# The node this machine reports as, created during the install.
-LOCAL_NODE=""
 YES=""
 PURGE=""
 ACTION=""
@@ -150,7 +148,6 @@ check_self() {
 	[ -z "$HTTPS" ] || set -- "$@" --https
 	[ -z "$HTTPS_PORT_SET" ] || set -- "$@" --https-port "$HTTPS_PORT"
 	[ -z "$PLAIN" ] || set -- "$@" --plain
-	[ -z "$LOCAL_NODE" ] || set -- "$@" --local-node "$LOCAL_NODE"
 	[ -z "$YES" ] || set -- "$@" --yes
 	exec sh "$0" "$@"
 }
@@ -158,6 +155,41 @@ check_self() {
 check_port() {
 	case "$1" in "" | *[!0-9]*) die "端口必须是 1-65535 的整数：$1" ;; esac
 	[ "$1" -ge 1 ] && [ "$1" -le 65535 ] || die "端口必须是 1-65535 的整数：$1"
+}
+
+# Checks --site and pulls the host out of it.
+#
+# A function rather than a block, because the value typed at the prompt has to
+# pass the same checks as the one from the command line. Two copies of this
+# drift, and the drift that matters is an address on this machine reaching
+# --site: no node could ever connect to it.
+check_site() {
+	case "$SITE" in
+	https://* | http://*) ;;
+	*) die "--site 要以 https:// 或 http:// 开头：$SITE" ;;
+	esac
+	rest="${SITE#*://}"
+	case "$rest" in
+	*/*) die "--site 后面不能带路径，只要 协议://主机[:端口]：$SITE" ;;
+	*@*) die "--site 里不能带用户名：$SITE" ;;
+	esac
+	# IPv6 literals are bracketed, so the port is not split off at the first
+	# colon. The same shape `loopback_origin` parses on the hub.
+	case "$rest" in
+	"["*) site_host="${rest#\[}"; site_host="${site_host%%]*}" ;;
+	*) site_host="${rest%%:*}" ;;
+	esac
+	[ -n "$site_host" ] || die "--site 里要有主机名或地址：$SITE"
+	# An address on this machine names nothing a node could reach. The hub
+	# refuses the same values, in `plain_entry` and `https_entry`.
+	case "$site_host" in
+	localhost | *.localhost | 0.0.0.0 | "::" | "::1" | 127.*) die "--site 不能用本机地址：$SITE" ;;
+	esac
+	# Nothing more either way. An https entry may name a domain or a bare
+	# address: a hub with no domain serves its panel under a self-signed
+	# certificate on an address, and the node installing from it takes
+	# `--insecure` for that certificate. An http entry is the no-domain path,
+	# where anything a node can reach is allowed.
 }
 
 # The `--listen ...` tail of the installed unit's ExecStart, empty when nothing
@@ -426,10 +458,11 @@ UNIT
 	# address nodes use, which is the one worth printing. setup_https replaces
 	# it with the https:// address it just made reachable.
 	PANEL="${SITE:-http://127.0.0.1:$PORT}"
-	# Both below run only after the service is up: nginx proxies to a hub that
-	# already answers, and the node goes into a database that already exists.
+	# Runs only after the service is up: nginx proxies to a hub that already
+	# answers. No node is built here -- the panel's own 「添加节点」 does that,
+	# which keeps this a panel installer and leaves one way to add a node
+	# instead of two.
 	if [ -n "$HTTPS" ]; then setup_https; fi
-	add_local_node "$LOCAL_NODE"
 
 	if [ -n "$first" ]; then done_title="安装完成"; else done_title="升级完成"; fi
 	printf '\n  %s%s%s\n' "$B" "$done_title" "$N"
@@ -463,16 +496,16 @@ UNIT
 		[ "$PORT" = 28080 ] || printf '     文档里的 28080 换成 %s。\n' "$PORT"
 		printf '     反向代理文档：https://monitor-document.pages.dev/install/reverse-proxy\n'
 	fi
-	# A self-signed certificate is enough for the panel and for an agent on this
-	# same machine, which reaches the hub over loopback. It is not enough for a
-	# node elsewhere: the agent trusts public roots only, so a remote node needs a
-	# real certificate, and that needs a domain.
+	# A self-signed certificate is what lets a hub with no domain encrypt at all,
+	# and the node installing from it has to be told to accept it: the agent
+	# trusts public roots unless `--insecure` says otherwise. The panel writes
+	# that switch into the command it hands out, so the operator copies it and
+	# never has to know. This note is for whoever is reading the terminal.
 	if [ -z "$SITE" ] && [ -n "$HTTPS" ]; then
-		printf '  %s只有面板和本机节点能用%s\n' "$B" "$N"
-		printf '     自签证书浏览器点一次「继续」就过了，但远程节点的 agent 只认公共 CA 签的证书，\n'
-		printf '     它会直接连不上。要有远程节点，两条路：\n'
-		printf '       · 等域名解析过来后重跑：--site https://你的域名（推荐，全程加密）\n'
-		printf '       · 或者重跑加 --plain：面板明文跑在公网，token 会裸奔\n'
+		printf '  %s节点装 agent 时要带 --insecure%s\n' "$B" "$N"
+		printf '     自签证书没有公共 CA 背书，agent 默认不认它。面板给出的安装命令里\n'
+		printf '     已经带好了这个开关，照抄即可；浏览器那一次「继续」是同一件事。\n'
+		printf '     等域名解析过来后重跑一次加 --site https://你的域名，就能去掉它。\n'
 	fi
 	# The one deployment where the credentials the panel hands out really do
 	# cross the network in the clear. Said here where the operator reads it, and
@@ -702,24 +735,6 @@ CONF
 	ok "HTTPS" "$PANEL"
 }
 
-# Creates the node this machine reports as, straight in the database rather than
-# through the panel's API. The API refuses a node added from a plain-http entry,
-# which is how a hub without a domain is reached; and a token made here never
-# crosses the network. Running it twice reuses the node of that name, so an
-# upgrade does not leave a second one behind.
-add_local_node() {
-	[ -n "$1" ] || return 0
-	token="$("$BIN" --db "$DATA/monitor.db" --add-local-node "$1" |
-		sed -n 's/^Node token: //p')"
-	[ -n "$token" ] ||
-		die "建本机节点失败。手动看报错：$BIN --db $DATA/monitor.db --add-local-node $1"
-	printf '\n'
-	printf '  %s本机节点%s  %s\n' "$B" "$N" "$1"
-	printf '  %s服务器和面板是同一台机器时，再跑这一条把 agent 装上：%s\n' "$D" "$N"
-	printf '    curl -fsSL http://127.0.0.1:%s/install.sh | sudo sh -s -- --server http://127.0.0.1:%s --token %s\n' \
-		"$PORT" "$PORT" "$token"
-}
-
 # ---- password ----
 # Prints nothing on failure; the hub's own error reaches stderr. Running as root
 # is safe: SQLite gives the -wal and -shm files it creates the database file's
@@ -787,66 +802,41 @@ uninstall_hub() {
 	fi
 }
 
-menu() {
-	while :; do
-		banner
-		printf '    1  安装 / 升级\n'
-		printf '    2  卸载\n'
-		printf '    3  状态\n'
-		printf '    4  日志\n'
-		printf '    5  重置密码\n'
-		printf '    q  退出\n\n'
-		printf '  %s›%s ' "$B" "$N"
-		read -r choice || exit 0
-		printf '\n'
-		case "$choice" in
-		1)
-			# The default offered is what the unit already listens on, so Enter
-			# leaves a running deployment unchanged. PORT_SET marks the answer as
-			# supplied: without it the carry-over in install_hub would read the port
-			# back out of that same unit and discard the answer given here.
-			carried="$(old_port)"
-			PORT="$(ask "监听端口" "${carried:-$PORT}")"
-			check_port "$PORT"
-			PORT_SET=1
-			# Offered as the default where an earlier run installed it, so
-			# pressing Enter on an upgrade keeps the panel reachable at the
-			# address it is already at.
-			https_default=n
-			if [ -f /etc/nginx/sites-enabled/monitor-hub-https.conf ] ||
-				[ -f /etc/nginx/conf.d/monitor-hub-https.conf ]; then
-				https_default=y
-			fi
-			reply="$(ask "没有域名？签自签证书 + 配好 nginx（浏览器会警告一次）" "$https_default")"
-			case "$reply" in y | Y | yes) HTTPS=1 ;; *) HTTPS="" ;; esac
-			# Asked only when the answer above was no: the two are alternatives
-			# to each other, not settings that combine. Offered as the default
-			# where the running unit already answers on the public interface, so
-			# pressing Enter on an upgrade leaves it there.
-			plain_default=n
-			case "$(old_exec)" in
-			0.0.0.0:* | "[::]:"*) plain_default=y ;;
-			esac
-			if [ -z "$HTTPS" ]; then
-				reply="$(ask "也不用证书？面板明文跑在公网（token 会裸奔）" "$plain_default")"
-				case "$reply" in y | Y | yes) PLAIN=1 ;; *) PLAIN="" ;; esac
-			fi
-			# Blank skips it. Asked because the hub and the agent are on one
-			# machine often enough that the panel's own install command, which
-			# needs a domain, is not the way to add this node.
-			LOCAL_NODE="$(ask "顺手把本机也建成节点？填名字，回车跳过" "")"
-			printf '\n'
-			install_hub
-			press
-			;;
-		2) uninstall_hub; press ;;
-		3) systemctl status "$SERVICE" --no-pager || true; press ;;
-		4) journalctl -u "$SERVICE" -f --no-pager ;;
-		5) reset_password; press ;;
-		q | Q | exit | "") exit 0 ;;
-		*) ;;
+# 装面板之前要问的只有一件事：有没有域名。
+#
+# 有域名就用它签真证书 —— 浏览器和远程节点都认；没有就签自签证书，加密照旧，
+# 只是证书由这台机器自己签，浏览器第一次要点一次「继续」。这两条就是 README
+# 里「没有域名时」的默认路径，所以不再往下追问端口、证书类型、本机节点。
+#
+# 菜单没有了：装是这个脚本唯一的默认动作。卸载和重置密码走参数，状态与日志
+# 本来就是 systemctl / journalctl 两条命令，安装摘要末尾会把它们打出来。
+ask_install() {
+	banner
+	# --site 已经在命令行给过了，问「有没有域名」就成了一句废话。
+	if [ -n "$SITE_SET" ]; then
+		install_hub
+		press
+		return
+	fi
+	reply="$(ask "你有域名吗？（有就用它签真证书；没有就自签，浏览器会警告一次）" "n")"
+	case "$reply" in
+	y | Y | yes | YES)
+		SITE="$(ask "域名（只写域名就行，例如 example.com）" "")"
+		[ -n "$SITE" ] || die "没有填域名。要么填一个，要么重跑并回答 n，用自签证书"
+		# 只写域名时补上协议：让人少打七个字符，也少一处打错的地方。
+		case "$SITE" in
+		*://*) ;;
+		*) SITE="https://$SITE" ;;
 		esac
-	done
+		check_site
+		;;
+	*)
+		HTTPS=1
+		;;
+	esac
+	printf '\n'
+	install_hub
+	press
 }
 
 usage() {
@@ -869,16 +859,14 @@ monitor hub 安装器
                  远程节点也能加。只在信得过的网络里这么用
   --https        面板没有域名、但想要加密时用。安装器装好 nginx，签一张
                  自签证书，把 8444 反代到本机的 hub。浏览器第一次会警告「不安全」，
-                 点「继续」即可；流量是加密的。只有面板和本机 agent 能用——
-                 远程节点的 agent 只认公共 CA 签的证书，等域名解析过来后加
-                 --site https://你的域名 重跑一次即可
+                 点「继续」即可；流量是加密的。节点装 agent 时要带 --insecure
+                 —— 自签证书没有公共 CA 背书，agent 默认不认它；面板给出的
+                 安装命令里已经带好了这个开关。等域名解析过来后加
+                 --site https://你的域名 重跑一次，就可以去掉它
   --https-port <n>
                  自签 HTTPS 的监听端口，默认 8444。443 让给 sing-box ——
                  同一台机器既当面板又当节点时，REALITY 会把不认识的握手转发
                  给伪装站，面板放 443 根本进不去
-  --local-node <名字>
-                 顺手把本机这个节点建好，并打印装 agent 的命令。服务器和面板是
-                 同一台机器时用；token 只在本地生成，不过网。重名会复用不重复建
   --site <url>   一般不用填。面板拼安装命令用的是浏览器地址栏，配好反代
                  用域名访问就自动对了。三种情况要填：节点该连的域名和你
                  进面板的域名不是同一个；走 SSH 隧道进面板（地址栏是
@@ -910,7 +898,6 @@ while [ $# -gt 0 ]; do
 	--https) HTTPS=1; shift ;;
 	--https-port) [ $# -ge 2 ] || die "--https-port 后面要跟端口号"; HTTPS_PORT="$2"; HTTPS_PORT_SET=1; shift 2 ;;
 	--plain) PLAIN=1; shift ;;
-	--local-node) [ $# -ge 2 ] || die "--local-node 后面要跟节点名"; LOCAL_NODE="$2"; shift 2 ;;
 	--uninstall) ACTION=uninstall; shift ;;
 	--purge) ACTION=uninstall; PURGE=1; shift ;;
 	--reset-password) ACTION=reset; shift ;;
@@ -933,39 +920,7 @@ fi
 # refuses starts normally and then declines to add or install any node, which
 # surfaces only in the journal and the panel, long after the value was typed.
 SITE="${SITE%/}"
-if [ -n "$SITE" ]; then
-	case "$SITE" in
-	https://*) scheme=https ;;
-	http://*) scheme=http ;;
-	*) die "--site 要以 https:// 或 http:// 开头：$SITE" ;;
-	esac
-	rest="${SITE#*://}"
-	case "$rest" in
-	*/*) die "--site 后面不能带路径，只要 协议://主机[:端口]：$SITE" ;;
-	*@*) die "--site 里不能带用户名：$SITE" ;;
-	esac
-	# IPv6 literals are bracketed, so the port is not split off at the first
-	# colon. The same shape `loopback_origin` parses on the hub.
-	case "$rest" in
-	"["*) site_host="${rest#\[}"; site_host="${site_host%%]*}" ;;
-	*) site_host="${rest%%:*}" ;;
-	esac
-	[ -n "$site_host" ] || die "--site 里要有主机名或地址：$SITE"
-	# An address on this machine names nothing a node could reach. The hub
-	# refuses the same values, in `plain_entry` and `https_domain`.
-	case "$site_host" in
-	localhost | *.localhost | 0.0.0.0 | "::" | "::1" | 127.*) die "--site 不能用本机地址：$SITE" ;;
-	esac
-	# https needs a name: a certificate is issued to one, and a browser refuses
-	# an address before the page loads. http is the no-domain path, where there
-	# is no name to use, so anything a node can reach is allowed.
-	if [ "$scheme" = https ]; then
-		case "$site_host" in
-		*[!0-9.]*) ;;
-		*) die "--site 用 https:// 时必须是域名，不能是 IP 地址：$SITE" ;;
-		esac
-	fi
-fi
+[ -z "$SITE" ] || check_site
 # The two answers to having no domain, and they contradict: one encrypts with a
 # certificate this machine signs for itself, the other does not encrypt at all.
 if [ -n "$HTTPS" ] && [ -n "$PLAIN" ]; then
@@ -989,7 +944,7 @@ reset) banner; reset_password ;;
 *)
 	check_self
 	if [ -t 0 ]; then
-		menu
+		ask_install
 	else
 		banner
 		install_hub

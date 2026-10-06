@@ -10,6 +10,13 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "fs"] }
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+# --insecure 用：装一个接受任何证书的 verifier，给自签证书的 hub 用。
+# 版本必须与 tokio-tungstenite 0.21 拉进来的那一个一致（它经 tokio-rustls 0.25
+# 依赖 rustls 0.22），否则 `Connector::Rustls` 拿到的是另一个 ClientConfig 类型，
+# 编译不过。
+# 不带任何 feature：0.21 及更早要 `dangerous_configuration` 才放行 `dangerous()`，
+# 0.22 起取消了那个开关（实测可用 feature 里没有它），直接用即可。
+rustls = "0.22"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

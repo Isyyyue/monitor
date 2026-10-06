@@ -13,10 +13,12 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::{
-    connect_async,
+    connect_async, connect_async_tls_with_config,
     tungstenite::{client::IntoClientRequest, Message},
+    Connector,
 };
 use tracing::{error, info, warn};
 
@@ -30,6 +32,11 @@ struct Args {
     token: String,
     interval: Duration,
     ifaces: Vec<String>,
+    /// Accept whatever certificate the hub presents. Needed for a hub with no
+    /// domain, whose panel is served under a self-signed certificate no public
+    /// CA will vouch for; off by default, because the same switch accepts a
+    /// forged certificate just as happily.
+    insecure: bool,
 }
 
 fn parse_values(
@@ -37,12 +44,14 @@ fn parse_values(
     server: String,
     token: String,
     iface: String,
+    insecure: bool,
 ) -> Result<Args> {
     let mut out = Args {
         server,
         token,
         interval: Duration::from_secs(1),
         ifaces: iface.split(',').filter(|v| !v.is_empty()).map(str::to_owned).collect(),
+        insecure,
     };
     let mut args = values.into_iter();
     while let Some(flag) = args.next() {
@@ -66,7 +75,12 @@ fn parse_values(
                 }
                 out.interval = Duration::from_secs_f64(seconds);
             }
-            "--insecure" => anyhow::bail!("--insecure is unsupported: use a trusted HTTPS certificate"),
+            // Accepted here rather than refused: a hub with no domain serves its
+            // panel under a self-signed certificate, and this is what lets a
+            // node reach it. It is still an explicit choice -- the installer
+            // only writes MONITOR_INSECURE when the operator asked for it, and
+            // the note printed at the end says what it gives up.
+            "--insecure" => out.insecure = true,
             _ => anyhow::bail!("unknown argument: {flag}"),
         }
     }
@@ -107,12 +121,90 @@ fn websocket_request(server: &str, token: &str) -> Result<http::Request<()>> {
     Ok(request)
 }
 
+/// A connector that accepts any certificate the hub presents.
+///
+/// Reached only through `--insecure` / `MONITOR_INSECURE`. A hub with no domain
+/// serves its panel under a self-signed certificate that no public CA vouches
+/// for, and the alternative is not a stronger check -- it is plaintext HTTP,
+/// where the node token crosses the network in the clear. This keeps the
+/// traffic encrypted and gives up the identity check instead; the installer
+/// says which one it took when it writes the setting.
+///
+/// `dangerous()` has carried no feature gate of its own since rustls 0.22 -- the
+/// name is the warning. What keeps this out of a normal deployment is that
+/// nothing calls it unless `--insecure` / `MONITOR_INSECURE` was set.
+fn any_certificate() -> Connector {
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate))
+        .with_no_client_auth();
+    Connector::Rustls(Arc::new(config))
+}
+
+/// Says yes to every certificate, which is the whole point of `--insecure`.
+///
+/// The three verification methods are the ones rustls asks; returning the
+/// "assertion" value from each is what turns a check into a formality. The
+/// scheme list stays the real one -- offering to verify nothing is not the same
+/// as offering to speak no TLS at all, and a short list here would break the
+/// handshake against a perfectly good certificate.
+#[derive(Debug)]
+struct AcceptAnyCertificate;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// A switch that comes from the environment rather than the command line.
+///
+/// Anything but empty, `0`, `no` and `false` turns it on: install.sh writes
+/// `1`, and someone setting it by hand should not have to guess which spelling
+/// this build wants. The same reading as `MONITOR_IFACE` being non-empty.
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "no" | "false"),
+        Err(_) => false,
+    }
+}
+
 fn parse_args() -> Result<Args> {
     parse_values(
         std::env::args().skip(1),
         std::env::var("MONITOR_SERVER").unwrap_or_default(),
         std::env::var("MONITOR_TOKEN").unwrap_or_default(),
         std::env::var("MONITOR_IFACE").unwrap_or_default(),
+        env_flag("MONITOR_INSECURE"),
     )
 }
 
@@ -621,7 +713,18 @@ async fn session(args: &Args) -> Result<()> {
 
     let request = websocket_request(&args.server, &args.token)?;
 
-    let (ws_stream, _) = connect_async(request).await.context("Failed to connect to hub")?;
+    // `connect_async` keeps webpki's roots and is what every normal deployment
+    // takes. The TLS-aware entry point is the only one that accepts a
+    // connector, so it is reached only when the operator asked for it -- a
+    // deployment that did not ask cannot end up with the loosened connector by
+    // accident.
+    let (ws_stream, _) = if args.insecure {
+        connect_async_tls_with_config(request, None, false, Some(any_certificate()))
+            .await
+            .context("Failed to connect to hub")?
+    } else {
+        connect_async(request).await.context("Failed to connect to hub")?
+    };
 
     info!("Connected to hub");
 
@@ -736,20 +839,43 @@ mod tests {
             "https://example.com".into(),
             "audit-token".into(),
             "eth0,eth1".into(),
+            false,
         )
         .unwrap();
         assert_eq!(args.server, "wss://example.com/api/agent/ws");
         assert_eq!(args.interval, Duration::from_secs(2));
         assert_eq!(args.ifaces, ["eth0", "eth1"]);
+        assert!(!args.insecure, "证书校验默认开着");
         for interval in ["0", "NaN", "-1", "3601"] {
             assert!(parse_values(
                 ["--interval".into(), interval.into()],
                 "http://localhost".into(),
                 "t".into(),
-                String::new()
+                String::new(),
+                false
             )
             .is_err());
         }
+    }
+
+    /// `--insecure` is how a node reaches a hub with no domain, whose panel is
+    /// served under a self-signed certificate. It has to survive the trip in
+    /// from the environment, because that is where install.sh puts it.
+    #[test]
+    fn insecure_is_off_by_default_and_on_when_asked() {
+        let from_flag = parse_values(
+            ["--insecure".into()],
+            "https://198.51.100.1:8444".into(),
+            "t".into(),
+            String::new(),
+            false,
+        )
+        .unwrap();
+        assert!(from_flag.insecure, "--insecure 要能打开");
+
+        let from_env =
+            parse_values([], "https://198.51.100.1:8444".into(), "t".into(), String::new(), true).unwrap();
+        assert!(from_env.insecure, "环境变量那条路也要能打开");
     }
     #[test]
     fn endpoint_conversion_preserves_ipv6_and_rejects_url_credentials() {

@@ -602,10 +602,26 @@ fn loopback_origin(origin: &str) -> bool {
         && (host == "localhost" || host.ends_with(".localhost") || ip.is_ok_and(|ip| ip.is_loopback()))
 }
 
-pub(crate) fn https_domain(site: &str) -> Option<reqwest::Url> {
+/// An https entry, whether it names a domain or a bare address.
+///
+/// A hub with no domain serves its panel under a self-signed certificate on an
+/// address, and the node installing from it reaches that address with
+/// `--insecure`. Refusing an address here left such a hub with no way to add a
+/// node at all -- the button greyed out and the install command unavailable --
+/// and the only route left was `--plain`, where the token crosses the network
+/// in the clear. Accepting the address is strictly better than that: the
+/// transport is still encrypted, and what is given up is who vouches for the
+/// certificate.
+///
+/// The rest is the same check as [`https_domain`]: one entry, nothing after the
+/// host. `loopback_origin` is excluded for the reason `plain_entry` excludes
+/// it -- an address on this machine names nothing a node could reach, so a
+/// command built from it would be one no node can run.
+pub(crate) fn https_entry(site: &str) -> Option<reqwest::Url> {
     let url = reqwest::Url::parse(site).ok()?;
     (url.scheme() == "https"
-        && url.domain().is_some_and(|d| d != "localhost" && !d.ends_with(".localhost"))
+        && url.host_str().is_some()
+        && !loopback_origin(site)
         && url.username().is_empty()
         && url.password().is_none()
         && url.path() == "/"
@@ -680,7 +696,7 @@ fn provisioning_allowed(app: &App, headers: &HeaderMap) -> Result<(), &'static s
     // A plaintext --site is an operator's deliberate choice for a hub with no
     // domain; anything else the value may be is an https domain, which is what
     // the panel builds install commands from.
-    let plain = if app.site.is_empty() || https_domain(&app.site).is_some() {
+    let plain = if app.site.is_empty() || https_entry(&app.site).is_some() {
         None
     } else if let Some(url) = plain_entry(&app.site) {
         Some(url)
@@ -700,7 +716,7 @@ fn provisioning_allowed(app: &App, headers: &HeaderMap) -> Result<(), &'static s
     // since the command is then built from the browser's own origin.
     let named = match &plain {
         Some(site) => same_entry(site, origin),
-        None => https_domain(origin).is_some(),
+        None => https_entry(origin).is_some(),
     }
     // A tunnel into the hub reads as loopback, which names no address a node
     // could reach, so it stands in only alongside a --site that names a real one.
@@ -2228,14 +2244,15 @@ mod tests {
         proxied.insert("x-forwarded-proto", "http".parse().unwrap());
         assert!(provisioning_allowed(&app, &proxied).is_ok());
 
-        for origin in [
-            "http://monitor.example.com",
-            "https://198.51.100.1",
-            "null",
-            // A registered name resolving wherever its owner points it, which is
-            // not the loopback entry below however it is spelled.
-            "http://127.0.0.1.example.com",
-        ] {
+        // Entries the panel may not build a command from. `https://198.51.100.1`
+        // used to be here; it is an entry a node can reach now that the agent
+        // takes `--insecure` for a self-signed certificate, and it has its own
+        // test below.
+        //
+        // `http://127.0.0.1.example.com` is a registered name resolving wherever
+        // its owner points it, which is not the loopback entry further down
+        // however it is spelled.
+        for origin in ["http://monitor.example.com", "null", "http://127.0.0.1.example.com"] {
             let mut headers = good.clone();
             headers.insert(header::ORIGIN, origin.parse().unwrap());
             assert_eq!(provisioning_allowed(&app, &headers), Err(PROVISIONING_DENIED), "{origin}");
@@ -2272,15 +2289,40 @@ mod tests {
         assert!(app.db.get("register_key").is_none());
 
         // --site takes the origin's place in the command, so a value that is
-        // neither an https domain nor a plaintext entry refuses every entry. The
+        // neither an https entry nor a plaintext one refuses every entry. The
         // plaintext case is its own test below, where it is not an accident that
-        // it is refused but the point.
-        for site in
-            ["https://198.51.100.1", "https://user@monitor.example.com", "https://monitor.example.com/path"]
-        {
-            assert!(https_domain(site).is_none());
+        // it is refused but the point. `https://198.51.100.1` is no longer in
+        // this list: an https address is an entry now.
+        for site in ["https://user@monitor.example.com", "https://monitor.example.com/path"] {
+            assert!(https_entry(site).is_none());
             assert_eq!(provisioning_allowed(&app_with_site(site), &good), Err(PROVISIONING_DENIED), "{site}");
         }
+    }
+
+    /// A hub with no domain serves its panel under a self-signed certificate on
+    /// an address. That address is an entry a node can reach -- the installer
+    /// turns on `--insecure` for exactly this case -- so the panel may build a
+    /// command from it. Before it was accepted the only route left was
+    /// `--plain`, where the token crosses the network in the clear.
+    #[tokio::test]
+    async fn a_self_signed_address_is_an_entry_the_panel_may_use() {
+        // Reached at an address with no --site: the panel builds the command
+        // from its own origin.
+        let bare = std::sync::Arc::new(app_with_site(""));
+        let mut headers = panel_headers();
+        headers.insert(header::ORIGIN, "https://198.51.100.1:8444".parse().unwrap());
+        assert!(provisioning_allowed(&bare, &headers).is_ok());
+
+        // The same address named in --site, for a panel reached through a
+        // tunnel or on another port.
+        let named = std::sync::Arc::new(app_with_site("https://198.51.100.1:8444"));
+        assert!(provisioning_allowed(&named, &headers).is_ok());
+
+        // An address on this machine is still not an entry: no node can reach
+        // it, so a command built from it would be one no node can run.
+        let mut loopback = panel_headers();
+        loopback.insert(header::ORIGIN, "https://127.0.0.1:8444".parse().unwrap());
+        assert_eq!(provisioning_allowed(&bare, &loopback), Err(PROVISIONING_DENIED));
     }
 
     /// A hub with no domain names its plaintext address in `--site`, and that

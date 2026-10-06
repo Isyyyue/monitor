@@ -11,3 +11,6 @@
 /CLAUDE.md
 /.claude/
 /agent/target
+
+# Python 的字节码缓存，本地跑一次就出现
+__pycache__/

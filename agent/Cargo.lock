@@ -666,6 +666,7 @@ dependencies = [
  "if-addrs",
  "libc",
  "reqwest",
+ "rustls 0.22.4",
  "serde",
  "serde_json",
  "sysinfo",

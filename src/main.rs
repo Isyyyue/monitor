@@ -445,7 +445,12 @@ async fn main() -> Result<()> {
         warn!("SQLite keeps its temporary files in its default directory: {e:#}");
     }
     let (notes, inbox) = tokio::sync::mpsc::channel(notify::QUEUE);
-    let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes, notes));
+    // The two latency tasks the proxy prober files under. Done here rather than
+    // inside `Db::open` so the tests, which open databases too and mostly count
+    // the probes they made, are not handed a pair they did not ask for.
+    let db = Db::open(&args.database)?;
+    db.ensure_default_ping_tasks()?;
+    let app = Arc::new(App::new(db, args.site.clone(), args.themes, notes));
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
     let port = args.listen.port();
@@ -487,20 +492,21 @@ async fn main() -> Result<()> {
     }
     // Checked once here, because the answer is static: `provisioning_allowed`
     // measures every request against --site, so a value that is neither an https
-    // domain nor a plaintext entry permanently refuses adding and installing
+    // entry nor a plaintext entry permanently refuses adding and installing
     // nodes however the panel is reached. The panel names --site in that refusal,
     // and this warning reaches an operator who never opens the panel. A warning
     // rather than a fatal error: the hub still serves everything else, and an
     // operator upgrading into this check should not lose a running hub.
     // `install-hub.sh` refuses the same values where they are entered.
     if !args.site.is_empty()
-        && api::https_domain(&args.site).is_none()
+        && api::https_entry(&args.site).is_none()
         && api::plain_entry(&args.site).is_none()
     {
         warn!(
-            "--site {} is neither an https domain nor a plaintext entry, so adding and installing \
-             nodes will be refused however the panel is reached: it has to be https:// with a domain, \
-             or http:// with a public address, and nothing after the host",
+            "--site {} is neither an https entry nor a plaintext one, so adding and installing \
+             nodes will be refused however the panel is reached: it has to be https:// with a \
+             domain or a public address, or http:// with a public address, and nothing after the \
+             host",
             args.site
         );
     }
