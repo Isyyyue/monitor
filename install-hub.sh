@@ -33,7 +33,12 @@ SITE=""
 SITE_SET=""
 # Self-signed HTTPS in front of the loopback hub, for a hub with no domain.
 HTTPS=""
-HTTPS_PORT="443"
+# 8444, not 443. The hub frequently shares a machine with a node, where sing-box
+# holds 443 -- and REALITY hides itself by forwarding a handshake it does not
+# recognise to its camouflage site, so a panel on that port would never be
+# reached at all: the visitor would get cloudflare.com instead of a login page.
+# 8444 is the port the standard form puts the panel on.
+HTTPS_PORT="8444"
 HTTPS_PORT_SET=""
 # No TLS at all: the hub listens on the public interface and the panel is
 # reached over plain HTTP. The other answer to having no domain, and the one
@@ -616,6 +621,9 @@ CONF
 		systemctl enable --now nginx >/dev/null 2>&1 || die "nginx 起不来"
 	fi
 	PANEL="https://$ip"
+	# 443 is https's implicit port, not ours: it is the only value that can be
+	# left out of the URL. Whatever HTTPS_PORT is set to otherwise -- 8444 by
+	# default -- has to be written down, or the printed address points at nothing.
 	[ "$HTTPS_PORT" = 443 ] || PANEL="$PANEL:$HTTPS_PORT"
 	ok "HTTPS" "$PANEL"
 }
@@ -758,7 +766,7 @@ usage() {
 monitor hub 安装器
 
   sudo ./install-hub.sh                有终端时给菜单，否则按默认安装
-  sudo ./install-hub.sh --port 8443    指定端口安装
+  sudo ./install-hub.sh --port 28081    指定端口安装
   sudo ./install-hub.sh --plain        没有域名时用：面板明文跑在公网，不加密
   sudo ./install-hub.sh --https        没有域名时用：签自签证书 + 配好 nginx
   sudo ./install-hub.sh --uninstall    卸载，保留数据
@@ -772,12 +780,14 @@ monitor hub 安装器
                  抓包就能拿走，拿到 token 就能接管节点。好处是零依赖、零维护，
                  远程节点也能加。只在信得过的网络里这么用
   --https        面板没有域名、但想要加密时用。安装器装好 nginx，签一张
-                 自签证书，把 443 反代到本机的 hub。浏览器第一次会警告「不安全」，
+                 自签证书，把 8444 反代到本机的 hub。浏览器第一次会警告「不安全」，
                  点「继续」即可；流量是加密的。只有面板和本机 agent 能用——
                  远程节点的 agent 只认公共 CA 签的证书，等域名解析过来后加
                  --site https://你的域名 重跑一次即可
   --https-port <n>
-                 自签 HTTPS 的监听端口，默认 443
+                 自签 HTTPS 的监听端口，默认 8444。443 让给 sing-box ——
+                 同一台机器既当面板又当节点时，REALITY 会把不认识的握手转发
+                 给伪装站，面板放 443 根本进不去
   --local-node <名字>
                  顺手把本机这个节点建好，并打印装 agent 的命令。服务器和面板是
                  同一台机器时用；token 只在本地生成，不过网。重名会复用不重复建
