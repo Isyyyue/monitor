@@ -462,6 +462,21 @@ async fn probe_once(target: &str) -> i64 {
     }
 }
 
+/// 这个目标是不是一个拨得动的 `host:port`。
+///
+/// 面板上的任务不全是给 agent 的。`proxy:vless` 这类是给 `probe/` 那条代理探针的
+/// 标签 —— 探针按 task id 认它，自己去量代理链路的 HTTP 耗时，写的是同一张
+/// `ping_record`。agent 拨不动它：端口位不是数字。
+///
+/// 照拨的后果不是「少一个数据点」：每 `interval` 秒会写一条 -1，而 hub 把负值记成
+/// 丢包 —— 探针量出来的曲线被每分钟一次的假丢包污染，且看不出哪条是假的。
+fn dialable(target: &str) -> bool {
+    let Some((host, port)) = target.rsplit_once(':') else {
+        return false;
+    };
+    !host.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// 值得跑的探针，夹到 hub 收得下的范围内。
 ///
 /// hub 在保存任务时已经拦过一遍，这里是兜底：一个越界的列表会让多出来的探针跑了
@@ -469,9 +484,13 @@ async fn probe_once(target: &str) -> i64 {
 fn runnable(tasks: Vec<PingTask>) -> Vec<PingTask> {
     tasks
         .into_iter()
-        .filter(|t| t.id > 0 && !t.target.trim().is_empty())
+        .filter(|t| t.id > 0 && dialable(t.target.trim()))
         .take(MAX_PROBES)
-        .map(|t| PingTask { interval: t.interval.max(MIN_PROBE_INTERVAL), ..t })
+        .map(|t| PingTask {
+            target: t.target.trim().to_owned(),
+            interval: t.interval.max(MIN_PROBE_INTERVAL),
+            ..t
+        })
         .collect()
 }
 
@@ -851,5 +870,30 @@ mod tests {
 
         let many: Vec<_> = (1..=MAX_PROBES as i64 + 10).map(|i| task(i, "1.1.1.1:443", 60)).collect();
         assert_eq!(runnable(many).len(), MAX_PROBES, "超出上限的截掉");
+    }
+
+    /// 面板上的任务不全是给 agent 的：`proxy:vless` 这类是给代理探针的标签。
+    /// 拨它只会得到 -1，而 hub 把负值记成丢包 —— 探针的曲线会被假丢包污染。
+    #[test]
+    fn only_dialable_targets_are_probed() {
+        assert!(dialable("1.1.1.1:443"));
+        assert!(dialable("example.com:80"));
+        assert!(dialable("[2606:4700::1111]:443"), "带方括号的 IPv6 也算");
+        assert!(!dialable("proxy:vless"), "端口位不是数字，拨不动");
+        assert!(!dialable("proxy:hy2"));
+        assert!(!dialable("example.com"), "没有端口");
+        assert!(!dialable(":443"), "没有主机");
+        assert!(!dialable("example.com:"));
+        assert!(!dialable(""));
+
+        // 这一条是真正要防的：探针占着 task 1/2，agent 不能去写同一批行。
+        let tasks = vec![
+            PingTask { id: 1, target: "proxy:vless".into(), interval: 60 },
+            PingTask { id: 2, target: "proxy:hy2".into(), interval: 60 },
+            PingTask { id: 3, target: "1.1.1.1:443".into(), interval: 60 },
+        ];
+        let kept = runnable(tasks);
+        assert_eq!(kept.len(), 1, "只留拨得动的那条");
+        assert_eq!(kept[0].id, 3);
     }
 }
