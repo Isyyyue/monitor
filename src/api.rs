@@ -2138,6 +2138,42 @@ pub async fn agent_vpn(State(app): State<Shared>, headers: HeaderMap, Json(body)
     }
 }
 
+/// The calling node's own allowance and usage, for the subscription server the
+/// installer sets up beside the agent.
+///
+/// The node token is the credential, exactly as on `agent_vpn`, so a machine
+/// reads only its own numbers. That is the point of the route: the alternative
+/// is putting the panel's admin password on every node, which turns one
+/// compromised node into the panel.
+///
+/// The numbers are here rather than on the node because this is where they are
+/// kept. A client reads `subscription-userinfo` off the subscription response to
+/// show used traffic and the expiry date, and without it the row is simply
+/// missing from the client's card -- there is no error to notice.
+pub async fn agent_traffic(State(app): State<Shared>, headers: HeaderMap) -> Response {
+    let Some(token) = crate::agent_ws::bearer(&headers) else {
+        return answer(StatusCode::UNAUTHORIZED, "missing token");
+    };
+    let Ok(Some(node_id)) = app.db.node_by_token(token) else {
+        return answer(StatusCode::UNAUTHORIZED, "invalid token");
+    };
+    let nodes = match app.db.nodes() {
+        Ok(nodes) => nodes,
+        Err(e) => return fail(e),
+    };
+    let Some(node) = nodes.into_iter().find(|n| n.id == node_id) else {
+        return answer(StatusCode::NOT_FOUND, "no such node");
+    };
+    let traffic = app.db.all_traffic().remove(&node_id).unwrap_or_default();
+    Json(json!({
+        "traffic_limit": node.traffic_limit,
+        "expires_at": node.expires_at,
+        "month_rx": traffic.month_rx,
+        "month_tx": traffic.month_tx,
+    }))
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3372,6 +3408,71 @@ mod tests {
         // A rerun replaces the row rather than adding one.
         assert_eq!(post(Some("token-of-mine".into()), report("u2")).await.status(), StatusCode::OK);
         assert_eq!(app.db.get_vpn(mine).unwrap().unwrap()["uuid"], "u2");
+    }
+
+    /// The subscription server on a node reads that node's own numbers, and only
+    /// its own.
+    ///
+    /// This route exists so the panel's admin password never has to live on a
+    /// node: the token is the node's own credential, so a compromised node gets
+    /// its own allowance and nothing else. A token that opens nothing gets the
+    /// same 401 as everywhere else rather than an empty answer, which a client
+    /// would render as "no limit".
+    #[tokio::test]
+    async fn a_node_reads_its_own_traffic_and_no_other() {
+        let app = std::sync::Arc::new(app());
+        let mine = node(&app, "mine", true);
+        let _other = node(&app, "other", true);
+        app.db
+            .update_node(
+                mine,
+                &NodePatch {
+                    traffic_limit: Some(536870912000),
+                    expires_at: Some(Some("2026-11-01".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        app.db
+            .set_traffic(
+                mine,
+                &TrafficPatch {
+                    month_rx: Some(15032385536),
+                    month_tx: Some(15676630630),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let get = |token: Option<String>| {
+            let app = app.clone();
+            async move {
+                let mut headers = HeaderMap::new();
+                if let Some(t) = token {
+                    headers.insert("authorization", format!("Bearer {t}").parse().unwrap());
+                }
+                let answer = agent_traffic(State(app), headers).await;
+                let status = answer.status();
+                let body = axum::body::to_bytes(answer.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null))
+            }
+        };
+
+        assert_eq!(get(None).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(get(Some("guess".into())).await.0, StatusCode::UNAUTHORIZED);
+
+        let (status, mine_body) = get(Some("token-of-mine".into())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(mine_body["traffic_limit"], 536870912000i64);
+        assert_eq!(mine_body["expires_at"], "2026-11-01");
+        assert_eq!(mine_body["month_rx"], 15032385536i64);
+        assert_eq!(mine_body["month_tx"], 15676630630i64);
+
+        // The other node's own defaults, not mine's: the token decides whose
+        // numbers come back, not the request.
+        let (_, other_body) = get(Some("token-of-other".into())).await;
+        assert_eq!(other_body["traffic_limit"], 0i64);
+        assert_eq!(other_body["month_rx"], 0i64);
     }
 
     /// A rerun of the batch command on a registered machine keeps its node, also

@@ -30,12 +30,20 @@ UNINSTALL=""
 UPGRADE=""
 VPN_IP=""
 NO_VPN=""
+# The subscription server, installed alongside the agent. Its paths are here
+# rather than beside its functions because --uninstall runs long before those are
+# defined.
+SUB_HOME="/opt/sub-dynamic"
+SUB_UNIT="/etc/systemd/system/sub-dynamic.service"
+SUB_RC="/etc/init.d/sub-dynamic"
+SUB_PORT="80"
+SUB_PORT_SET=""
 
 while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
 	# message rather than the usage below, and `shift 2` cannot proceed.
 	case "$1" in
-	--server | --token | --register | --name | --iface | --interval | --vpn-ip)
+	--server | --token | --register | --name | --iface | --interval | --vpn-ip | --sub-port)
 		[ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;
 	esac
 	case "$1" in
@@ -46,6 +54,7 @@ while [ $# -gt 0 ]; do
 	--iface) IFACE="$2"; IFACE_SET=1; shift 2 ;;
 	--interval) INTERVAL="$2"; shift 2 ;;
 	--vpn-ip) VPN_IP="$2"; shift 2 ;;
+	--sub-port) SUB_PORT="$2"; SUB_PORT_SET=1; shift 2 ;;
 	--no-vpn) NO_VPN=1; shift ;;
 	--insecure) INSECURE=1; shift ;;
 	--uninstall) UNINSTALL=1; shift ;;
@@ -67,6 +76,13 @@ if [ -n "$UNINSTALL" ]; then
 	rc-update del monitor-agent default >/dev/null 2>&1 || true
 	systemctl disable --now monitor-agent 2>/dev/null || true
 	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE"
+	# The subscription server came in with the agent and leaves with it: it holds
+	# this node's token, and nothing would restart it afterwards.
+	rc-service sub-dynamic stop 2>/dev/null || true
+	rc-update del sub-dynamic default >/dev/null 2>&1 || true
+	systemctl disable --now sub-dynamic 2>/dev/null || true
+	rm -f "$SUB_UNIT" "$SUB_RC"
+	rm -rf "$SUB_HOME"
 	systemctl daemon-reload 2>/dev/null || true
 	userdel monitor-agent 2>/dev/null || deluser monitor-agent 2>/dev/null || true
 	rmdir "$ROOT" 2>/dev/null || true
@@ -99,6 +115,9 @@ fi
 	echo "--name NAME names the node --register creates; the hostname otherwise" >&2
 	echo "--vpn-ip ADDRESS is this machine's public address, for the VPN links;" >&2
 	echo "  without it the address is looked up, and --no-vpn skips the VPN entirely" >&2
+	echo "--sub-port PORT is where this node serves its own subscription, default 80;" >&2
+	echo "  the subscription URL carries it, and clients read the traffic header from" >&2
+	echo "  that response -- without the header their card loses the traffic row" >&2
 	exit 2
 }
 # Names the node a registration creates. A token belongs to a node that already
@@ -394,6 +413,8 @@ not_started() {
 # so a rerun is the fix rather than a reinstall.
 provision_vpn() {
 	[ -z "$NO_VPN" ] || { echo "skipping VPN setup (--no-vpn)"; return 0; }
+	# 订阅 URL 要指向订阅伺服真正在听的那个端口，所以端口先定下来。
+	pick_sub_port
 	if [ -z "$VPN_IP" ]; then
 		VPN_IP=$(curl -s --max-time 10 https://api.ipify.org 2>/dev/null || true)
 	fi
@@ -415,6 +436,12 @@ provision_vpn() {
 	# are not quote removal, so the address would reach provision wrapped in them.
 	set -- provision --server "$VPN_IP"
 	[ -z "$VPN_SNI" ] || set -- "$@" --sni "$VPN_SNI"
+	# 订阅地址要落在订阅伺服真正监听的那个端口上；80 不用写端口。
+	if [ "$SUB_PORT" = 80 ]; then
+		set -- "$@" --sub-base "http://$VPN_IP"
+	else
+		set -- "$@" --sub-base "http://$VPN_IP:$SUB_PORT"
+	fi
 	if ! VPN_JSON=$("$BIN" "$@"); then
 		echo "warning: VPN setup failed; this machine still reports as a node" >&2
 		echo "         re-run with: --upgrade --vpn-ip $VPN_IP" >&2
@@ -429,6 +456,214 @@ provision_vpn() {
 	[ "$CODE" = 200 ] ||
 		echo "warning: the hub did not record the deployment (HTTP $CODE); the node is running" >&2
 	return 0
+}
+
+# ---- 订阅伺服 ----
+# 节点自己伺服订阅三件套，并带上 `subscription-userinfo` 头 —— 客户端读它显示
+# 已用流量和到期日。**没有这个头，客户端那一行是直接不见的**：不报错，只是卡片上
+# 少了它。所以这个头不是锦上添花，是订阅「显示得对」的全部。
+#
+# 数字从 hub 读，用的是**节点自己的 token**（`/api/agent/traffic`）。不把面板管理员
+# 密码放到每台节点上 —— 那等于一台节点被攻破就是面板被攻破。
+SUB_STATE="/var/lib/sing-box/subscription.json"
+
+# 订阅伺服要用的解释器。没有就装一个：这个头是订阅的一部分，不是可选装饰。
+ensure_python() {
+	command -v python3 >/dev/null 2>&1 && return 0
+	if command -v apt-get >/dev/null 2>&1; then
+		DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >/dev/null 2>&1 || true
+	elif command -v dnf >/dev/null 2>&1; then
+		dnf install -y -q python3 >/dev/null 2>&1 || true
+	elif command -v apk >/dev/null 2>&1; then
+		apk add --no-cache python3 >/dev/null 2>&1 || true
+	fi
+	command -v python3 >/dev/null 2>&1
+}
+
+write_sub_server() {
+	install -d -m 0755 "$SUB_HOME"
+	cat >"$SUB_HOME/server.py" <<'PYSERVER'
+#!/usr/bin/env python3
+"""Serve this node's subscription, with the header clients read.
+
+The file names come from the state file `provision` maintains, and are re-read on
+every request. It mints a new random name on each run, so a hard-coded or cached
+one turns every fetch into a 404 -- which a client shows as nothing at all: just
+a card with the traffic row missing, and no error anywhere.
+"""
+import datetime, json, os, urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+STATE = os.environ.get("SUB_STATE", "/var/lib/sing-box/subscription.json")
+HUB = os.environ.get("HUB_URL", "").rstrip("/")
+TOKEN = os.environ.get("HUB_TOKEN", "")
+PORT = int(os.environ.get("SUB_PORT", "80"))
+CTYPE = {"clash": "text/yaml", "v2ray_txt": "text/plain", "v2ray_b64": "text/plain"}
+
+
+def routes():
+    with open(STATE) as f:
+        state = json.load(f)
+    return {"/" + os.path.basename(v): (v, CTYPE.get(k, "text/plain")) for k, v in state.items()}
+
+
+def traffic():
+    """upload, download, total, expire -- or None, which only omits the header."""
+    if not HUB or not TOKEN:
+        return None
+    try:
+        req = urllib.request.Request(
+            HUB + "/api/agent/traffic", headers={"Authorization": "Bearer " + TOKEN})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            d = json.load(r)
+        exp = d.get("expires_at") or ""
+        ts = int(datetime.datetime.fromisoformat(exp).replace(
+            tzinfo=datetime.timezone.utc).timestamp()) if exp else 0
+        return (int(d.get("month_tx") or 0), int(d.get("month_rx") or 0),
+                int(d.get("traffic_limit") or 0), ts)
+    except Exception as e:
+        print("[sub-dynamic] traffic read failed:", e, flush=True)
+        return None
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _serve(self, head_only=False):
+        try:
+            route = routes().get(self.path)
+        except Exception as e:
+            print("[sub-dynamic] state read failed:", e, flush=True)
+            route = None
+        if not route:
+            self.send_response(404)
+            self.end_headers()
+            return
+        path, ctype = route
+        try:
+            with open(path, "rb") as f:
+                body = f.read()
+        except FileNotFoundError:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        t = traffic()
+        if t:
+            self.send_header(
+                "subscription-userinfo",
+                "upload=%d; download=%d; total=%d; expire=%d" % t)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        self._serve(False)
+
+    def do_HEAD(self):
+        self._serve(True)
+
+    def log_message(self, *args):
+        pass
+
+
+HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+PYSERVER
+	chmod 0755 "$SUB_HOME/server.py"
+}
+
+# The token and the hub address are the node's own; the file is 0600 because the
+# token is a credential for this node and nothing else needs to read it.
+write_sub_env() {
+	umask 077
+	cat >"$SUB_HOME/env" <<ENV
+HUB_URL=$SERVER
+HUB_TOKEN=$TOKEN
+SUB_STATE=$SUB_STATE
+SUB_PORT=$SUB_PORT
+ENV
+	chmod 0600 "$SUB_HOME/env"
+}
+
+# 某个端口上有没有人在听。
+listening() {
+	ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
+}
+
+# 端口：默认 80，跟已经在跑的两台一致，客户端的订阅 URL 里也就不用带端口。被占了
+# 才退到 8080，并让 --sub-base 跟着带上端口，否则 URL 指向的地方没人听。
+pick_sub_port() {
+	[ -z "$SUB_PORT_SET" ] || return 0
+	listening 80 || return 0
+	SUB_PORT="8080"
+	echo "note: port 80 is taken, so the subscription will be served on 8080" >&2
+}
+
+setup_subscription() {
+	# --no-vpn 没有订阅可伺服；没写过订阅也一样。
+	[ -f "$SUB_STATE" ] || return 0
+	ensure_python || {
+		echo "warning: no python3, so this node will not serve its own subscription" >&2
+		echo "         the VPN itself is up; install python3 and re-run to add it" >&2
+		return 0
+	}
+	write_sub_server
+	write_sub_env
+	if [ "$INIT" = openrc ]; then
+		cat >"$SUB_RC" <<RC
+#!/sbin/openrc-run
+description="monitor subscription server"
+command="/usr/bin/python3"
+command_args="$SUB_HOME/server.py"
+supervisor="supervise-daemon"
+respawn_delay=5
+
+start_pre() {
+	set -a
+	. $SUB_HOME/env
+	set +a
+}
+RC
+		chmod 0755 "$SUB_RC"
+		rc-update add sub-dynamic default >/dev/null 2>&1 || true
+		rc-service sub-dynamic restart >/dev/null 2>&1 || true
+	else
+		cat >"$SUB_UNIT" <<UNIT
+[Unit]
+Description=monitor subscription server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=$SUB_HOME/env
+ExecStart=/usr/bin/python3 $SUB_HOME/server.py
+Restart=always
+RestartSec=5
+# 只读订阅文件和自己的配置，别的都不需要。
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+		systemctl daemon-reload
+		systemctl enable --now sub-dynamic >/dev/null 2>&1 || true
+		systemctl restart sub-dynamic 2>/dev/null || true
+	fi
+	# 端口真的在听才算成了。systemd 报 active 只说明进程起来了：bind 失败时
+	# `Restart=always` 会一直重试，日志里翻得到，而面板和客户端上什么也看不出来。
+	i=0
+	while [ "$i" -lt 12 ] && ! listening "$SUB_PORT"; do
+		i=$((i + 1))
+		sleep 0.5
+	done
+	if listening "$SUB_PORT"; then
+		echo "subscription served on port $SUB_PORT from $SUB_HOME/server.py"
+	else
+		echo "warning: nothing is listening on port $SUB_PORT, so the subscription is not being served" >&2
+		echo "         see: journalctl -u sub-dynamic -n 20" >&2
+	fi
 }
 
 if [ "$INIT" = openrc ]; then
@@ -469,6 +704,7 @@ RC
 	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
 	rm -f "$BIN.old"
 	provision_vpn
+	setup_subscription
 	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
 	exit 0
 fi
@@ -521,4 +757,5 @@ sleep 3
 	systemctl is-active --quiet monitor-agent || not_started "journalctl -u monitor-agent -n 20"
 	rm -f "$BIN.old"
 	provision_vpn
+	setup_subscription
 	echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"

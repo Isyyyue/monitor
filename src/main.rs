@@ -577,6 +577,10 @@ async fn main() -> Result<()> {
                 .route("/api/agent/ws", get(agent_ws::handler))
                 .route("/api/agent/register", post(api::agent_register))
                 .route("/api/agent/vpn", post(api::agent_vpn))
+                // Read-only, and the same node-token credential: the subscription
+                // server the installer leaves on the node reads its own numbers
+                // through this rather than holding the panel's password.
+                .route("/api/agent/traffic", get(api::agent_traffic))
                 .route("/install.sh", get(install_script))
                 .route("/agent/{arch}", get(agent_binary))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
