@@ -548,6 +548,49 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    /// A theme the hub can fetch is listed before it is installed -- that is how
+    /// the panel learns it exists and draws the 「下载」 button. Once its
+    /// directory is there the entry comes from the walk instead, carrying the
+    /// manifest's own name and version: two cards for one theme would be a
+    /// puzzle rather than a convenience.
+    #[test]
+    fn a_downloadable_theme_is_offered_until_it_is_installed() {
+        let base = std::env::temp_dir().join(format!(
+            "monitor-theme-downloadable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+
+        let app = crate::App {
+            themes: base.clone(),
+            ..crate::App::for_test(crate::db::Db::open(":memory:").unwrap())
+        };
+
+        let listed = themes(&app).unwrap();
+        let miku = listed.iter().find(|t| t.short == "miku").expect("可下载主题要在列表里");
+        assert!(miku.downloadable, "没装的要标成可下载，面板据此画「下载」");
+        assert!(!miku.selected, "没装的东西不能被选中");
+        assert_eq!(miku.url, DOWNLOADABLE[0].url, "url 要给的是包地址，hub 据此下载");
+
+        // Now put it on disk the way `install` would.
+        fs::create_dir_all(base.join("miku/dist")).unwrap();
+        fs::write(base.join("miku/dist/index.html"), "index").unwrap();
+        fs::write(
+            base.join("miku/theme.json"),
+            r#"{"name":"初音主题","short":"miku","description":"d","version":"1.0.0","author":"a","url":"u"}"#,
+        )
+        .unwrap();
+
+        let listed = themes(&app).unwrap();
+        let found: Vec<_> = listed.iter().filter(|t| t.short == "miku").collect();
+        assert_eq!(found.len(), 1, "装完不该出现两张同名的卡");
+        assert!(!found[0].downloadable, "装完就是普通主题，不该再画「下载」");
+        assert_eq!(found[0].version, "1.0.0", "版本要来自清单，不是空串");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
     /// Everything an uploaded archive must satisfy before replacing a theme
     /// currently being served.
     #[test]
