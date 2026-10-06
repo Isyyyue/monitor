@@ -54,9 +54,9 @@ jobs:
       - run: shellcheck -S warning install.sh install-hub.sh scripts/*.sh
 
       # What the two installers decide rather than what they say: the order
-      # their top-level code runs in, and the subscription port. Both are silent
-      # on a machine that already works and break one that does not, so neither
-      # shows up until a fresh install.
+      # their top-level code runs in, and the subscription port a re-run lands
+      # on. Both are silent on a machine that already works and break one that
+      # does not, so neither shows up until a fresh install or an upgrade.
       - run: scripts/install-test.sh
 
       # This commit's hub against the latest released agent: the field contract

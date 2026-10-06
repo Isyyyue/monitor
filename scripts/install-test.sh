@@ -79,6 +79,7 @@ grep -q '^write_sub_nginx() {' "$DIR/funcs.sh" || fail "write_sub_nginx was not 
 cat >"$DIR/harness.sh" <<HARNESS
 set -u
 SUB_HOME=$DIR/sub-home
+ENV_FILE=$DIR/agent.env
 SUB_NGINX_CONF=$DIR/conf.d/monitor-sub.conf
 SUB_BACKEND=18081
 SUB_VIA_NGINX=
@@ -92,6 +93,7 @@ nginx_usable() { [ "\${NGINX_USABLE:-1}" = 1 ]; }
 nginx_holds() { [ "\${NGINX_HOLDS:-1}" = 1 ]; }
 listening() { [ "\${LISTENING:-0}" = 1 ]; }
 sub_service_running() { [ "\${SUBRUN:-0}" = 1 ]; }
+sub_agent_serving() { grep -q '^MONITOR_SUB_PORT=' $DIR/agent.env 2>/dev/null; }
 
 . $DIR/funcs.sh
 
@@ -154,19 +156,60 @@ check "no nginx, port 80 taken" "8080 . . absent" "$got"
 # A re-run with a port chosen earlier. The agent does not listen on it when
 # nginx fronts the subscription, so nothing can be asked on the port itself --
 # the recorded value is what the address was built from and must be reused.
+#
+# Two places can hold it: the agent's own env (where v1.9.0 moved the
+# subscription to) and the env the Python service left behind. A machine
+# installed from the agent has no SUB_HOME at all, so reading only the old file
+# loses the port and moves the node to 80 -- breaking an address the client
+# already holds, with nothing reporting it.
 mkdir -p "$DIR/sub-home"
+
+# An install from before the subscription moved into the agent.
 printf 'SUB_PUBLIC_PORT=18082\n' >"$DIR/sub-home/env"
+rm -f "$DIR/agent.env"
 got=$(run 'NGINX_USABLE=0 NGINX_HOLDS=0 LISTENING=0 SUBRUN=1')
-check "re-run keeps the port it recorded" "18082 . . absent" "$got"
+check "re-run keeps the port the old service recorded" "18082 . . absent" "$got"
+rm -f "$DIR/sub-home/env"
+
+# An install from v1.9.0/1.9.1: the agent binds the public port itself, and its
+# env has no separate record of which port that is.
+cat >"$DIR/agent.env" <<ENV
+MONITOR_SUB_BIND=0.0.0.0
+MONITOR_SUB_PORT=18082
+MONITOR_SUB_STATE=/var/lib/sing-box/subscription.json
+ENV
+got=$(run 'NGINX_USABLE=0 NGINX_HOLDS=0 LISTENING=0')
+check "re-run keeps the port in the agent's env" "18082 . . absent" "$got"
+
+# ...but only when it binds the public port. Behind nginx the bound port is the
+# loopback one, and reusing it as the public port would move the address.
+cat >"$DIR/agent.env" <<ENV
+MONITOR_SUB_BIND=127.0.0.1
+MONITOR_SUB_PORT=18081
+MONITOR_SUB_STATE=/var/lib/sing-box/subscription.json
+ENV
+got=$(run 'NGINX_USABLE=0 NGINX_HOLDS=0 LISTENING=0')
+check "the loopback port is not mistaken for the public one" "80 . . absent" "$got"
+
+# From v1.9.2 on, the public port is recorded outright, so it survives a re-run
+# even behind nginx.
+cat >"$DIR/agent.env" <<ENV
+MONITOR_SUB_BIND=127.0.0.1
+MONITOR_SUB_PORT=18081
+MONITOR_SUB_PUBLIC_PORT=18082
+MONITOR_SUB_STATE=/var/lib/sing-box/subscription.json
+ENV
+got=$(run 'NGINX_USABLE=0 NGINX_HOLDS=0 LISTENING=0')
+check "the recorded public port wins over the loopback one" "18082 . . absent" "$got"
+rm -f "$DIR/agent.env"
 
 # A port given on the command line is never overridden by a fallback.
 got=$(run 'START_PORT=18090 PORT_SET=1 NGINX_USABLE=0 NGINX_HOLDS=0 LISTENING=1')
 check "--sub-port is kept" "18090 . . absent" "$got"
 
-# A port chosen earlier on a re-run, with nginx gone. The recorded value is
-# still the one clients hold, so it wins over the fallback.
-got=$(run 'NGINX_USABLE=0 NGINX_HOLDS=0 LISTENING=0 SUBRUN=1')
-check "re-run keeps 18082 with nginx gone" "18082 . . absent" "$got"
+# A fresh machine has nothing recorded, so the fallback applies.
+got=$(run 'NGINX_USABLE=0 NGINX_HOLDS=0 LISTENING=1')
+check "a fresh machine falls back when 80 is taken" "8080 . . absent" "$got"
 
 # --- 3. 面板端口 -------------------------------------------------------------
 #

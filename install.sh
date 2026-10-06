@@ -504,6 +504,13 @@ sub_service_running() {
 	fi
 }
 
+# agent 自己就是订阅服务（v1.9.0 起），所以「上一轮是我们装的」在那种机器上不能
+# 靠 sub-dynamic 这个服务名 —— 它已经被退役、根本不存在。看 agent 的 env 里有没有
+# 我们写过的订阅配置，那是同一个证据。
+sub_agent_serving() {
+	grep -q '^MONITOR_SUB_PORT=' "$ENV_FILE" 2>/dev/null
+}
+
 # nginx 装着、在跑 —— 才敢往里加一个 vhost。
 nginx_usable() {
 	command -v nginx >/dev/null 2>&1 || return 1
@@ -666,8 +673,12 @@ CONF
 	return 1
 }
 
-# 订阅的三条配置写进 agent 自己的环境文件 —— 它自己就是订阅服务，不再有第二个进程。
+# 订阅的几条配置写进 agent 自己的环境文件 —— 它自己就是订阅服务，不再有第二个进程。
 # $1 = 绑的地址，$2 = 绑的端口（走 nginx 时是回环那个）。
+#
+# PUBLIC_PORT 是**对外**那个（客户端 URL 上出现的），走 nginx 时与绑的端口不同：
+# nginx 在对外端口上听、把请求转到回环。重跑要靠它把上一轮的对外端口认回来，否则
+# 服务挪到别处、地址跟着变，客户端手里那个当场失效而没有任何地方会报错。
 write_sub_env() {
 	sed -i '/^MONITOR_SUB_/d' "$ENV_FILE"
 	{
@@ -675,6 +686,8 @@ write_sub_env() {
 ' "$1"
 		printf 'MONITOR_SUB_PORT=%s
 ' "$2"
+		printf 'MONITOR_SUB_PUBLIC_PORT=%s
+' "$SUB_PORT"
 		printf 'MONITOR_SUB_STATE=%s
 ' "$SUB_STATE"
 	} >>"$ENV_FILE"
@@ -739,15 +752,33 @@ pick_sub_port() {
 		return 0
 	fi
 	[ -z "$SUB_PORT_SET" ] || return 0
-	# 重跑：上一轮是我们装的，env 里记着当时的对外端口，直接用回去。
-	# 不去看「那个端口上是不是我在听」——走 nginx 时对外端口是 nginx 在听，
-	# 把 nginx 判成冲突就会让服务挪到 8080：服务跟着走、订阅地址跟着变，
-	# 客户端手里那个不带端口的地址当场失效，且没有任何地方会报错。
-	prev="$(sed -n 's/^SUB_PUBLIC_PORT=//p' "$SUB_HOME/env" 2>/dev/null | tail -n 1)"
+	# 重跑：读回上一轮的对外端口。不去看「那个端口上是不是我在听」——走 nginx 时
+	# 对外端口是 nginx 在听，把 nginx 判成冲突就会让服务挪到 8080：服务跟着走、
+	# 订阅地址跟着变，客户端手里那个不带端口的地址当场失效，且没有任何地方会报错。
+	#
+	# 两处都看：agent 自己的 env 是 v1.9.0 之后的落点，SUB_HOME/env 是它之前那个
+	# Python 服务留下的。只读后者的话，从 agent 模式装的机器再跑一次会**丢掉**
+	# 自定义端口 —— 那种机器上根本没有 SUB_HOME 这个目录。
+	prev="$(sed -n 's/^MONITOR_SUB_PUBLIC_PORT=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)"
+	case "$prev" in
+	"" | *[!0-9]*)
+		# v1.9.0/1.9.1 写的 env 里没有 PUBLIC_PORT 这一条。那时它自己绑着端口，
+		# 所以 MONITOR_SUB_PORT 就是对外那个；走 nginx 时它绑的是回环，那时才
+		# 不能拿它顶替 —— 判据是有没有绑在 0.0.0.0 上。
+		if [ "$(sed -n 's/^MONITOR_SUB_BIND=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)" = "0.0.0.0" ]; then
+			prev="$(sed -n 's/^MONITOR_SUB_PORT=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)"
+		fi
+		;;
+	esac
+	case "$prev" in
+	"" | *[!0-9]*)
+		prev="$(sed -n 's/^SUB_PUBLIC_PORT=//p' "$SUB_HOME/env" 2>/dev/null | tail -n 1)"
+		;;
+	esac
 	case "$prev" in
 	"" | *[!0-9]*) ;;
 	*)
-		if sub_service_running; then
+		if sub_service_running || sub_agent_serving; then
 			SUB_PORT="$prev"
 			echo "note: reusing port $SUB_PORT, where this node's subscription is already served" >&2
 			return 0
