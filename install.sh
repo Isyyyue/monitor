@@ -616,6 +616,14 @@ setup_subscription() {
 # 已经有别人占着 default_server 时 `nginx -t` 会不过，那时我们删掉刚写的、退回
 # 自己绑端口，绝不把一份 nginx 不接受的配置留在 conf.d 里。
 write_sub_nginx() {
+	# 写之前先把上一轮那份留下来。`cat >` 是截断写，而 nginx -t 失败可能不是
+	# 因为这份新配置 —— 比如别人同时改坏了别的站点。那种情况下若不还原，我们
+	# 就把这台机器上唯一能用的那份订阅 vhost 删掉了。
+	backup=""
+	if [ -f "$SUB_NGINX_CONF" ]; then
+		backup="$SUB_NGINX_CONF.monitor-prev"
+		cp "$SUB_NGINX_CONF" "$backup" 2>/dev/null || backup=""
+	fi
 	cat >"$SUB_NGINX_CONF" <<CONF
 # Written by monitor's install.sh; removed by install.sh --uninstall.
 server {
@@ -636,7 +644,21 @@ server {
 }
 CONF
 	if nginx -t >/dev/null 2>&1; then
+		[ -z "$backup" ] || rm -f "$backup"
 		return 0
+	fi
+	# 这份配置 nginx 不收。把上一轮那份放回去，别让这次失败连带删掉它 ——
+	# 放回去之后再验一次，通得过说明是这次的新配置有问题，而旧的那份照旧能用，
+	# 那就让它继续用（返回 2：仍然走 nginx，只是没用上新配置）。
+	if [ -n "$backup" ] && cp "$backup" "$SUB_NGINX_CONF" 2>/dev/null; then
+		rm -f "$backup"
+		if nginx -t >/dev/null 2>&1; then
+			return 2
+		fi
+		# 连旧的那份都不通，说明问题不在我们这儿；撤掉，避免把一份 nginx
+		# 起不来的配置留在 conf.d 里 —— 那会让 reload 把整个 nginx 打死。
+		rm -f "$SUB_NGINX_CONF"
+		return 1
 	fi
 	rm -f "$SUB_NGINX_CONF"
 	return 1
@@ -694,10 +716,21 @@ pick_sub_port() {
 	# nginx 占着这个端口 → 让它伺服，我们退到回环。重跑时也走这条：
 	# 上一轮是我们写的 vhost，nginx 还在听，结论一样。
 	if nginx_usable && nginx_holds "$SUB_PORT"; then
-		if write_sub_nginx; then
-			SUB_VIA_NGINX=1
+		# `set -e` 下不能裸调用再取 $? —— 非 0 会当场把脚本终止掉。
+		rc=0
+		write_sub_nginx || rc=$?
+		case $rc in
+		0)	SUB_VIA_NGINX=1
 			return 0
-		fi
+			;;
+		# 新配置不行，但上一轮那份还原回来了、nginx 收得下 —— 订阅照旧在
+		# $SUB_PORT 上由 nginx 伺服，什么都不用变。退回 8080 反而会把一个
+		# 本来好好的、不带端口的订阅地址弄失效。
+		2)	SUB_VIA_NGINX=1
+			echo "warning: nginx refused the new subscription config; the previous one is still in place" >&2
+			return 0
+			;;
+		esac
 		echo "warning: nginx refused the subscription config, so it was removed" >&2
 		SUB_PORT="8080"
 		echo "note: serving the subscription directly on 8080 instead" >&2
@@ -724,49 +757,6 @@ pick_sub_port() {
 	SUB_PORT="8080"
 	echo "note: port 80 is taken, so the subscription will be served on 8080" >&2
 }
-
-if [ "$INIT" = openrc ]; then
-	cat >"$RC_FILE" <<RC
-#!/sbin/openrc-run
-description="monitor agent"
-command="$BIN"
-command_args="--interval $INTERVAL"
-supervisor="supervise-daemon"
-command_user="monitor-agent"
-respawn_delay=5
-output_log="$LOG_FILE"
-error_log="$LOG_FILE"
-
-depend() {
-	need net
-}
-
-# The token stays in the root-only env file rather than the service script;
-# this runs as root, and the agent inherits what it exports. supervise-daemon
-# opens the log only after dropping to command_user, so the file must be the
-# agent's, including one an earlier install left to root.
-start_pre() {
-	checkpath --file --owner monitor-agent --mode 0600 $LOG_FILE
-	set -a
-	. $ENV_FILE
-	set +a
-}
-RC
-	chmod 0755 "$RC_FILE"
-	rc-update add monitor-agent default >/dev/null
-	rc-service monitor-agent restart
-	# supervise-daemon reports the service started while it respawns an agent
-	# that exits at once, so the process itself is what is looked for, inside
-	# the respawn delay. pidof rather than pgrep -x, which BusyBox matches
-	# against the full path.
-	sleep 3
-	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
-	rm -f "$BIN.old"
-	provision_vpn
-	setup_subscription
-	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
-	exit 0
-fi
 
 # 订阅要绑 80（低端口）时给 agent 那**一个**能力，别的不给：`CapabilityBoundingSet`
 # 把它限定成只有这一个，`AmbientCapabilities` 让它对非 root 的 agent 生效。
@@ -819,6 +809,50 @@ $SUB_CAPS
 WantedBy=multi-user.target
 UNIT
 }
+
+if [ "$INIT" = openrc ]; then
+	cat >"$RC_FILE" <<RC
+#!/sbin/openrc-run
+description="monitor agent"
+command="$BIN"
+command_args="--interval $INTERVAL"
+supervisor="supervise-daemon"
+command_user="monitor-agent"
+respawn_delay=5
+output_log="$LOG_FILE"
+error_log="$LOG_FILE"
+
+depend() {
+	need net
+}
+
+# The token stays in the root-only env file rather than the service script;
+# this runs as root, and the agent inherits what it exports. supervise-daemon
+# opens the log only after dropping to command_user, so the file must be the
+# agent's, including one an earlier install left to root.
+start_pre() {
+	checkpath --file --owner monitor-agent --mode 0600 $LOG_FILE
+	set -a
+	. $ENV_FILE
+	set +a
+}
+RC
+	chmod 0755 "$RC_FILE"
+	rc-update add monitor-agent default >/dev/null
+	rc-service monitor-agent restart
+	# supervise-daemon reports the service started while it respawns an agent
+	# that exits at once, so the process itself is what is looked for, inside
+	# the respawn delay. pidof rather than pgrep -x, which BusyBox matches
+	# against the full path.
+	sleep 3
+	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
+	rm -f "$BIN.old"
+	provision_vpn
+	setup_subscription
+	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
+	exit 0
+fi
+
 
 sub_caps
 write_agent_unit
