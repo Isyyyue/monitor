@@ -36,8 +36,17 @@ NO_VPN=""
 SUB_HOME="/opt/sub-dynamic"
 SUB_UNIT="/etc/systemd/system/sub-dynamic.service"
 SUB_RC="/etc/init.d/sub-dynamic"
+# 对外端口：客户端订阅 URL 里的那个。默认 80，与已经在跑的两台一致。
 SUB_PORT="80"
 SUB_PORT_SET=""
+# 走 nginx 时订阅服务自己绑的回环端口。nginx 在前面把订阅路径转过来，
+# 对外仍然是 SUB_PORT —— 两种情况下客户端拿到的 URL 都不带端口。
+SUB_BACKEND="18081"
+SUB_NGINX_CONF="/etc/nginx/conf.d/monitor-sub.conf"
+# 对外端口是 nginx 在听时置上：服务退到回环，由 nginx 转过来。
+SUB_VIA_NGINX=""
+# 端口上已经有人在伺服同一批文件（手工装的那份）时置上：什么都不动，我们也不装。
+SUB_FOREIGN=""
 
 while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
@@ -83,6 +92,12 @@ if [ -n "$UNINSTALL" ]; then
 	systemctl disable --now sub-dynamic 2>/dev/null || true
 	rm -f "$SUB_UNIT" "$SUB_RC"
 	rm -rf "$SUB_HOME"
+	# nginx 前面那一段也撤掉，并重载 —— 留着一条指向已删服务的 location，
+	# 要等下一次 reload 才会发现。
+	rm -f "$SUB_NGINX_CONF"
+	if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
+		systemctl reload nginx 2>/dev/null || rc-service nginx reload >/dev/null 2>&1 || true
+	fi
 	systemctl daemon-reload 2>/dev/null || true
 	userdel monitor-agent 2>/dev/null || deluser monitor-agent 2>/dev/null || true
 	rmdir "$ROOT" 2>/dev/null || true
@@ -497,6 +512,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 STATE = os.environ.get("SUB_STATE", "/var/lib/sing-box/subscription.json")
 HUB = os.environ.get("HUB_URL", "").rstrip("/")
 TOKEN = os.environ.get("HUB_TOKEN", "")
+BIND = os.environ.get("SUB_BIND", "0.0.0.0")
 PORT = int(os.environ.get("SUB_PORT", "80"))
 CTYPE = {"clash": "text/yaml", "v2ray_txt": "text/plain", "v2ray_b64": "text/plain"}
 
@@ -568,7 +584,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+HTTPServer((BIND, PORT), Handler).serve_forever()
 PYSERVER
 	chmod 0755 "$SUB_HOME/server.py"
 }
@@ -581,7 +597,9 @@ write_sub_env() {
 HUB_URL=$SERVER
 HUB_TOKEN=$TOKEN
 SUB_STATE=$SUB_STATE
-SUB_PORT=$SUB_PORT
+SUB_BIND=$1
+SUB_PORT=$2
+SUB_PUBLIC_PORT=$3
 ENV
 	chmod 0600 "$SUB_HOME/env"
 }
@@ -591,49 +609,129 @@ listening() {
 	ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
 }
 
-# 监听 $1 的是不是**我们装的**那个订阅服务（进程命令行指向它的 server.py）。
-sub_owns_port() {
+# 监听 $1 的是不是 nginx。
+nginx_holds() {
 	pid="$(ss -ltnpH "sport = :$1" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1)"
 	[ -n "$pid" ] || return 1
-	tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'sub-dynamic/server\.py'
+	tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'nginx'
 }
 
-# 端口：默认 80，跟已经在跑的两台一致，客户端的订阅 URL 里也就不用带端口。被占了
-# 才退到 8080，并让 --sub-base 跟着带上端口，否则 URL 指向的地方没人听。
+# 订阅服务在跑吗。重跑时要靠它认出「上一轮那个是我自己」。
+sub_service_running() {
+	if [ "$INIT" = openrc ]; then
+		rc-service sub-dynamic status >/dev/null 2>&1
+	else
+		systemctl is-active --quiet sub-dynamic 2>/dev/null
+	fi
+}
+
+# nginx 装着、在跑 —— 才敢往里加一个 vhost。
+nginx_usable() {
+	command -v nginx >/dev/null 2>&1 || return 1
+	if [ "$INIT" = openrc ]; then
+		rc-service nginx status >/dev/null 2>&1
+	else
+		systemctl is-active --quiet nginx 2>/dev/null
+	fi
+}
+
+# 这个端口上已经有人在伺服我们的订阅了，而且**不是我们自己** —— 比如手工装的那份。
+# README 里那句「已有的独立订阅服务不由此模块自动接管」就是这条：接管它会连它的
+# 绑定地址一起改掉，而它可能只绑回环。
+#
+# 认 env 而不是认服务名：手工那份也叫 sub-dynamic.service（从别处搬来时就是这个
+# 名字），只看服务在不在跑会把它当成自己。
+foreign_sub_server() {
+	[ -f "$SUB_HOME/env" ] && return 1
+	[ -f "$SUB_STATE" ] || return 1
+	clash="$(sed -n 's/.*"clash"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SUB_STATE" | head -n 1)"
+	[ -n "$clash" ] || return 1
+	curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$SUB_PORT/$(basename "$clash")" 2>/dev/null
+}
+
+# 让 nginx 把订阅路径转到我们的回环端口。写成一个独立文件，不动别人的站点。
+#
+# 必须是 default_server：同端口上已经有别的 server 时，`server_name _` 那份会被
+# 盖住 —— 请求落到别人的 default 上，订阅就 404，而配置文件本身看着没问题。
+# 已经有别人占着 default_server 时 `nginx -t` 会不过，那时我们删掉刚写的、退回
+# 自己绑端口，绝不把一份 nginx 不接受的配置留在 conf.d 里。
+write_sub_nginx() {
+	cat >"$SUB_NGINX_CONF" <<CONF
+# Written by monitor's install.sh; removed by install.sh --uninstall.
+server {
+    listen $SUB_PORT default_server;
+    listen [::]:$SUB_PORT default_server;
+    server_name _;
+
+    # 订阅三件套交给订阅服务：它按当前状态文件找文件，并带上
+    # subscription-userinfo 头 —— 客户端靠它显示已用流量与到期日。
+    location ~ ^/(sub-[0-9a-f]+\.yaml|v2-[0-9a-f]+\.(txt|b64))\$ {
+        proxy_pass http://127.0.0.1:$SUB_BACKEND;
+        proxy_set_header Host \$host;
+    }
+
+    location / {
+        return 404;
+    }
+}
+CONF
+	if nginx -t >/dev/null 2>&1; then
+		return 0
+	fi
+	rm -f "$SUB_NGINX_CONF"
+	return 1
+}
+
+# 对外端口，以及**谁在前面**。两条路给客户端的 URL 都是不带端口的
+# `http://IP/xxx.yaml`：80 空着就自己绑 80；80 上是 nginx 就把服务退到回环，
+# 由 nginx 把订阅路径转过来 —— 与已经在跑的两台一致。
+#
+# 在这里就把 nginx 配置写好并验证，而不是等 setup_subscription：对外端口要拿去
+# 拼 `--sub-base`（写进面板里的订阅地址），而 nginx 有可能不收这份配置。
 pick_sub_port() {
+	# 先看端口上有没有**别人**在伺服同一批文件（手工装的那份）。这一步必须在
+	# 改端口之前：一旦退到 8080，探的就成了 8080，而那个人在 80 上 —— 探不到，
+	# 于是我们照样装一份，两份抢同一批文件。
+	if foreign_sub_server; then
+		SUB_FOREIGN=1
+		return 0
+	fi
+	# nginx 占着这个端口 → 让它伺服，我们退到回环。重跑时也走这条：
+	# 上一轮是我们写的 vhost，nginx 还在听，结论一样。
+	if nginx_usable && nginx_holds "$SUB_PORT"; then
+		if write_sub_nginx; then
+			SUB_VIA_NGINX=1
+			return 0
+		fi
+		echo "warning: nginx refused the subscription config, so it was removed" >&2
+		SUB_PORT="8080"
+		echo "note: serving the subscription directly on 8080 instead" >&2
+		return 0
+	fi
 	[ -z "$SUB_PORT_SET" ] || return 0
-	# 重跑：上一轮是我们装的，env 里记着端口，而那个端口上跑的还是我们的服务。
-	# 那不是冲突，是它自己 —— 当成冲突就会挪到 8080，服务跟着走、订阅地址跟着变，
-	# 而客户端手里那个不带端口的地址当场失效，且没有任何地方会报错。
-	#
-	# 只在 env 是我们写的、端口也确实是它在听时才复用。手工装的那份（从别处搬来、
-	# 没有 env）不认 —— 接管它会连它的绑定地址一起改掉，而它可能只绑回环。
-	prev="$(sed -n 's/^SUB_PORT=//p' "$SUB_HOME/env" 2>/dev/null | tail -n 1)"
+	# 重跑：上一轮是我们装的，env 里记着当时的对外端口，直接用回去。
+	# 不去看「那个端口上是不是我在听」——走 nginx 时对外端口是 nginx 在听，
+	# 把 nginx 判成冲突就会让服务挪到 8080：服务跟着走、订阅地址跟着变，
+	# 客户端手里那个不带端口的地址当场失效，且没有任何地方会报错。
+	prev="$(sed -n 's/^SUB_PUBLIC_PORT=//p' "$SUB_HOME/env" 2>/dev/null | tail -n 1)"
 	case "$prev" in
 	"" | *[!0-9]*) ;;
 	*)
-		if sub_owns_port "$prev"; then
+		if sub_service_running; then
 			SUB_PORT="$prev"
-			echo "note: reusing port $SUB_PORT, where this node's subscription server already runs" >&2
+			echo "note: reusing port $SUB_PORT, where this node's subscription is already served" >&2
 			return 0
 		fi
 		;;
 	esac
+	# 80 被别的东西占着才退。
 	listening 80 || return 0
 	SUB_PORT="8080"
 	echo "note: port 80 is taken, so the subscription will be served on 8080" >&2
 }
 
-setup_subscription() {
-	# --no-vpn 没有订阅可伺服；没写过订阅也一样。
-	[ -f "$SUB_STATE" ] || return 0
-	ensure_python || {
-		echo "warning: no python3, so this node will not serve its own subscription" >&2
-		echo "         the VPN itself is up; install python3 and re-run to add it" >&2
-		return 0
-	}
-	write_sub_server
-	write_sub_env
+# 服务本身：单元（或 openrc 脚本）与启动。与端口无关，两种暴露方式共用。
+start_sub_service() {
 	if [ "$INIT" = openrc ]; then
 		cat >"$SUB_RC" <<RC
 #!/sbin/openrc-run
@@ -675,18 +773,59 @@ UNIT
 		systemctl enable --now sub-dynamic >/dev/null 2>&1 || true
 		systemctl restart sub-dynamic 2>/dev/null || true
 	fi
+}
+
+setup_subscription() {
+	# --no-vpn 没有订阅可伺服；没写过订阅也一样。
+	[ -f "$SUB_STATE" ] || return 0
+	ensure_python || {
+		echo "warning: no python3, so this node will not serve its own subscription" >&2
+		echo "         the VPN itself is up; install python3 and re-run to add it" >&2
+		return 0
+	}
+	# 别人已经在这个端口上伺服同一批文件（手工装的那份）—— 不接管。
+	# 判断在 pick_sub_port 里就做过了，那里才拿得到「改端口之前」的端口号。
+	if [ -n "$SUB_FOREIGN" ]; then
+		echo "note: the subscription on port $SUB_PORT is already served by something else" >&2
+		echo "      leaving it alone; no server of ours was installed" >&2
+		return 0
+	fi
+
+	# 对外端口归谁：走 nginx 时我们绑回环，vhost 在 pick_sub_port 里已经写好并验过。
+	bind="0.0.0.0"
+	served="$SUB_PORT"
+	if [ -n "$SUB_VIA_NGINX" ]; then
+		bind="127.0.0.1"
+		served="$SUB_BACKEND"
+	fi
+
+	write_sub_server
+	write_sub_env "$bind" "$served" "$SUB_PORT"
+	start_sub_service
+	if [ -n "$SUB_VIA_NGINX" ]; then
+		if [ "$INIT" = openrc ]; then
+			rc-service nginx reload >/dev/null 2>&1 || true
+		else
+			systemctl reload nginx 2>/dev/null || true
+		fi
+	fi
+
 	# 端口真的在听才算成了。systemd 报 active 只说明进程起来了：bind 失败时
 	# `Restart=always` 会一直重试，日志里翻得到，而面板和客户端上什么也看不出来。
 	i=0
-	while [ "$i" -lt 12 ] && ! listening "$SUB_PORT"; do
+	while [ "$i" -lt 12 ] && ! listening "$served"; do
 		i=$((i + 1))
 		sleep 0.5
 	done
-	if listening "$SUB_PORT"; then
-		echo "subscription served on port $SUB_PORT from $SUB_HOME/server.py"
-	else
-		echo "warning: nothing is listening on port $SUB_PORT, so the subscription is not being served" >&2
+	if ! listening "$served"; then
+		echo "warning: nothing is listening on port $served, so the subscription is not being served" >&2
 		echo "         see: journalctl -u sub-dynamic -n 20" >&2
+		return 0
+	fi
+	if [ -n "$SUB_VIA_NGINX" ]; then
+		echo "subscription served on port $SUB_PORT through nginx (backend 127.0.0.1:$served)"
+	else
+		echo "subscription served on port $SUB_PORT from $SUB_HOME/server.py"
 	fi
 }
 
