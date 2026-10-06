@@ -591,10 +591,34 @@ listening() {
 	ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
 }
 
+# 监听 $1 的是不是**我们装的**那个订阅服务（进程命令行指向它的 server.py）。
+sub_owns_port() {
+	pid="$(ss -ltnpH "sport = :$1" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+	[ -n "$pid" ] || return 1
+	tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'sub-dynamic/server\.py'
+}
+
 # 端口：默认 80，跟已经在跑的两台一致，客户端的订阅 URL 里也就不用带端口。被占了
 # 才退到 8080，并让 --sub-base 跟着带上端口，否则 URL 指向的地方没人听。
 pick_sub_port() {
 	[ -z "$SUB_PORT_SET" ] || return 0
+	# 重跑：上一轮是我们装的，env 里记着端口，而那个端口上跑的还是我们的服务。
+	# 那不是冲突，是它自己 —— 当成冲突就会挪到 8080，服务跟着走、订阅地址跟着变，
+	# 而客户端手里那个不带端口的地址当场失效，且没有任何地方会报错。
+	#
+	# 只在 env 是我们写的、端口也确实是它在听时才复用。手工装的那份（从别处搬来、
+	# 没有 env）不认 —— 接管它会连它的绑定地址一起改掉，而它可能只绑回环。
+	prev="$(sed -n 's/^SUB_PORT=//p' "$SUB_HOME/env" 2>/dev/null | tail -n 1)"
+	case "$prev" in
+	"" | *[!0-9]*) ;;
+	*)
+		if sub_owns_port "$prev"; then
+			SUB_PORT="$prev"
+			echo "note: reusing port $SUB_PORT, where this node's subscription server already runs" >&2
+			return 0
+		fi
+		;;
+	esac
 	listening 80 || return 0
 	SUB_PORT="8080"
 	echo "note: port 80 is taken, so the subscription will be served on 8080" >&2
