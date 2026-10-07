@@ -3883,6 +3883,7 @@ mod tests {
 
     #[tokio::test]
     async fn changing_the_password_kills_other_sessions_but_not_the_caller() {
+        let _test = crate::auth::PASSWORD_TEST_LOCK.lock().await;
         let app = std::sync::Arc::new(app());
         let stale = random_token();
         app.db.create_session(&sha256(&stale), Utc::now().timestamp() + 3_600).unwrap();

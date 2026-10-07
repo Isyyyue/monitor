@@ -44,6 +44,9 @@ const LOCKOUT: Duration = Duration::from_secs(900);
 const PASSWORD_CHECKS: usize = 1;
 static PASSWORD_GATE: Semaphore = Semaphore::const_new(PASSWORD_CHECKS);
 
+#[cfg(test)]
+pub(crate) static PASSWORD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub(crate) fn password_slot() -> Option<tokio::sync::SemaphorePermit<'static>> {
     PASSWORD_GATE.try_acquire().ok()
 }
@@ -365,8 +368,10 @@ mod tests {
     /// The gate must refuse rather than queue: a queue admits the same flood,
     /// and each attempt that lands costs 19 MiB which remains in a thread's
     /// arena for the life of the process.
-    #[test]
-    fn the_password_gate_refuses_a_flood_rather_than_queueing_it() {
+    #[tokio::test]
+    async fn the_password_gate_refuses_a_flood_rather_than_queueing_it() {
+        // Password endpoint tests share the real process-wide gate.
+        let _test = PASSWORD_TEST_LOCK.lock().await;
         let held: Vec<_> =
             (0..PASSWORD_CHECKS).map(|_| PASSWORD_GATE.try_acquire().expect("up to the limit")).collect();
         assert!(PASSWORD_GATE.try_acquire().is_err(), "the attempt past the limit must be refused");
