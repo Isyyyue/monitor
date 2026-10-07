@@ -94,7 +94,7 @@ load_file() {
 	. "$1"
 }
 
-FUNCS="pick_sub_port pick_public_port read_prev_sub write_sub_nginx sub_file_names check_subscription"
+FUNCS="pick_sub_port pick_public_port read_prev_sub write_sub_nginx sub_file_names check_subscription wait_subscription"
 {
 	for fn in $FUNCS; do extract "$fn"; done
 } >"$DIR/funcs.sh"
@@ -127,10 +127,12 @@ nginx_holds() { [ "\${NGINX_HOLDS:-1}" = 1 ]; }
 # can hold 80 free while something else is busy -- or the reverse.
 listening() { [ "\${LISTENING:-0}" = 1 ] && [ "\$1" = 80 ] || [ "\$1" = "\${TAKEN:-}" ]; }
 sub_service_running() { [ "\${SUBRUN:-0}" = 1 ]; }
+agent_holds() { [ "\${AGENT_HOLDS:-0}" = 1 ]; }
 # write_sub_nginx calls this before writing its config. Its own behaviour is
 # covered in section 9; here it only has to exist, or the port scenarios die on
 # "command not found" instead of reaching their assertion.
 sub_default_server_patch() { return 0; }
+sub_default_server_unpatch() { return 0; }
 
 . $DIR/funcs.sh
 
@@ -328,6 +330,11 @@ rm -f "$DIR/agent.env"
 got=$(run 'ORDER=read NGINX_USABLE=0 NGINX_HOLDS=0 LISTENING=1')
 check "a fresh machine falls back when 80 is taken" "8080 . . absent" "$got"
 
+got=$(run 'START_PORT=18082 PORT_SET=1 NGINX_USABLE=0 NGINX_HOLDS=0 TAKEN=18082 AGENT_HOLDS=1')
+check "our restarted listener keeps its custom port" "18082 . . absent" "$got"
+got=$(run 'START_PORT=18082 PORT_SET=1 NGINX_USABLE=0 NGINX_HOLDS=0 TAKEN=18082 AGENT_HOLDS=0')
+check "another process on the custom port still triggers fallback" "8080 . . absent" "$got"
+
 # --- 3. 订阅取到的是哪几个文件 ------------------------------------------------
 #
 # The installer now fetches the subscription to prove it works, which means it
@@ -349,12 +356,12 @@ JSON
 check "every route in the state file is found" \
 	"sub-abc123.yaml v2-def456.txt v2-def456.b64" "$(names | tr '\n' ' ' | sed 's/ $//')"
 
-# A path outside the directory the agent serves from is not a name it would
-# answer for, so it is dropped rather than fetched.
+# Directory prefixes do not change the filename-based HTTP route.
 cat >"$DIR/subscription.json" <<JSON
 {"clash":"/etc/passwd","v2ray_txt":"/var/lib/sing-box/v2-ok.txt"}
 JSON
-check "a path outside the subscription directory is ignored" "v2-ok.txt" "$(names)"
+check "route names match the agent regardless of directory" "passwd
+v2-ok.txt" "$(names)"
 
 # An unknown key is not one of the three routes.
 cat >"$DIR/subscription.json" <<JSON
@@ -400,19 +407,19 @@ got=$(fetch 'curl() {
 			esac
 		done
 		printf "200 512"
-	}' '{"clash":"/var/lib/sing-box/sub-abc123.yaml"}')
+	}' '{"clash":"/var/lib/sing-box/sub-abc123.yaml","v2ray_txt":"/var/www/sub/v2-test.txt","v2ray_b64":"/custom/sub/v2-test.b64"}')
 check "a served subscription passes" "YES" "$got"
 
 # 200 but nothing in it: the client gets an empty card.
-got=$(fetch 'curl() { printf "200 0"; }' '{"clash":"/var/lib/sing-box/sub-abc123.yaml"}')
+got=$(fetch 'curl() { printf "200 0"; }' '{"clash":"/var/lib/sing-box/sub-abc123.yaml","v2ray_txt":"/var/www/sub/v2-test.txt","v2ray_b64":"/custom/sub/v2-test.b64"}')
 check "a 200 with an empty body fails" "NO" "$got"
 
 # A 404, which is what all three silent failures look like.
-got=$(fetch 'curl() { printf "404 0"; }' '{"clash":"/var/lib/sing-box/sub-abc123.yaml"}')
+got=$(fetch 'curl() { printf "404 0"; }' '{"clash":"/var/lib/sing-box/sub-abc123.yaml","v2ray_txt":"/var/www/sub/v2-test.txt","v2ray_b64":"/custom/sub/v2-test.b64"}')
 check "a 404 fails" "NO" "$got"
 
 # No answer at all: curl exits nonzero and prints nothing.
-got=$(fetch 'curl() { return 7; }' '{"clash":"/var/lib/sing-box/sub-abc123.yaml"}')
+got=$(fetch 'curl() { return 7; }' '{"clash":"/var/lib/sing-box/sub-abc123.yaml","v2ray_txt":"/var/www/sub/v2-test.txt","v2ray_b64":"/custom/sub/v2-test.b64"}')
 check "no answer at all fails" "NO" "$got"
 
 # The state file names no route -- --no-vpn, or provision never ran.
@@ -421,7 +428,7 @@ check "a state file without routes fails" "NO" "$got"
 
 # The traffic header missing is not a failure: its value comes from the hub,
 # and an unreachable hub leaves it off rather than breaking the subscription.
-got=$(fetch 'curl() { printf "200 512"; }' '{"clash":"/var/lib/sing-box/sub-abc123.yaml"}')
+got=$(fetch 'curl() { printf "200 512"; }' '{"clash":"/var/lib/sing-box/sub-abc123.yaml","v2ray_txt":"/var/www/sub/v2-test.txt","v2ray_b64":"/custom/sub/v2-test.b64"}')
 check "a missing traffic header still passes" "YES" "$got"
 
 # --- 5. 面板端口 -------------------------------------------------------------
@@ -605,6 +612,7 @@ check "nothing to drop reports non-zero" "rc=1 left=0" "$got"
     printf 'broken replacement\n' >"$ENV_FILE"
     printf 'broken nginx\n' >"$SUB_NGINX_CONF"
     eval "$(extract restore_sub_file)"
+    load wait_subscription
     eval "$(extract restore_prev_sub)"
     sub_caps() { grep -q '^MONITOR_SUB_PORT=18081$' "$ENV_FILE" || fail 'capability chose new port'; }
     systemctl() { return 0; }
@@ -698,6 +706,8 @@ patch_probe() {
 			-t)
 				# The rejected case: this tree never validates.
 				[ "$case_name" = reject ] && return 1
+				# A comment must not swallow the listen directive's semicolon.
+				grep -qE 'listen 80[^#]*;' "$root/sites-enabled/default" || return 1
 				return 0
 				;;
 			esac
@@ -763,12 +773,17 @@ check "a refused patch is rolled back, marker and site intact" \
 # deployed; setup_subscription is only about putting the links on a URL.
 
 grep -q '^report_vpn() {' "$INSTALL" || fail "install.sh has no report_vpn"
+load wait_subscription
 
 # Measured live: a node with a running sing-box, a subscription it could not
 # serve, and an empty vpn table on the hub.
 (
 	prov=0 sub=0
+	# shellcheck disable=SC2034 # Read by the sourced installer function.
+	SUB_STATE=unused SUB_FOREIGN='' SUB_PORT=18082 VPN_JSON=credentials
+	check_subscription() { return 1; }
 	NO_VPN=
+	load wait_subscription
 	eval "$(extract configure_optional_vpn)"
 	# report_vpn and setup_subscription are both stubbed: this checks only the
 	# order and the independence of the two, not what either does. The probe is
@@ -789,6 +804,9 @@ grep -q '^report_vpn() {' "$INSTALL" || fail "install.sh has no report_vpn"
 # turn one report into two.
 (
 	prov=0
+	# shellcheck disable=SC2034 # Read by the sourced installer function.
+	SUB_STATE=unused SUB_FOREIGN='' SUB_PORT=18082 VPN_JSON=credentials
+	check_subscription() { return 0; }
 	NO_VPN=
 	eval "$(extract configure_optional_vpn)"
 	provision_vpn() { return 0; }

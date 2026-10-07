@@ -120,7 +120,7 @@ if [ -n "$UNINSTALL" ]; then
 	rc-service monitor-agent stop 2>/dev/null || true
 	rc-update del monitor-agent default >/dev/null 2>&1 || true
 	systemctl disable --now monitor-agent 2>/dev/null || true
-	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE" "$ROOT/subscription.json"
+	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE" "$ROOT/subscription.json" "$ROOT/vpn-report.pending.json" "$ROOT/vpn-report.pending.json.new"
 	# 延迟探针也一起走：它跑着一个自己的 sing-box 客户端，留着会一直占着
 	# 127.0.0.1:18083/18084，而它所测的东西（节点 token、本地库）已经没了。
 	#
@@ -585,15 +585,35 @@ provision_vpn() {
 
 report_vpn() {
     [ -n "$VPN_JSON" ] || return 0
-	# The links live in the panel, which is where they are shown and kept. A refusal
-	# here would leave the node serving traffic it cannot display, so it is said out
-	# loud rather than swallowed.
-	CODE=$(printf '%s' "$VPN_JSON" | curl -sS $CURL_INSECURE --max-time 30 -w '%{http_code}' -o /dev/null \
-		-X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-		--data-binary @- "${SERVER%/}/api/agent/vpn" 2>/dev/null) || CODE=000
-	[ "$CODE" = 200 ] ||
-		echo "warning: the hub did not record the deployment (HTTP $CODE); the node is running" >&2
-	return 0
+    # Credentials stay immutable; only validated subscription URLs are published.
+    clash_url=""
+    v2ray_url=""
+    if [ -n "$SUB_READY" ]; then
+        state="$SUB_STATE"
+        [ -n "$SUB_FOREIGN" ] || state="$ROOT/subscription.json"
+        base="http://$VPN_IP"
+        [ "$SUB_PORT" = 80 ] || base="$base:$SUB_PORT"
+        routes=$(cat "$state")
+        clash=$(json_str "$routes" clash)
+        v2ray=$(json_str "$routes" v2ray_txt)
+        clash_url="$base/${clash##*/}"
+        v2ray_url="$base/${v2ray##*/}"
+    fi
+    payload=$(printf '%s' "$VPN_JSON" | sed \
+        -e "s|\"clash_sub_url\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"clash_sub_url\":\"$clash_url\"|" \
+        -e "s|\"v2ray_sub_url\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"v2ray_sub_url\":\"$v2ray_url\"|")
+    pending="$ROOT/vpn-report.pending.json"
+    (umask 077; printf '%s\n' "$payload" >"$pending.new")
+    mv -f "$pending.new" "$pending"
+    CODE=$(curl -sS $CURL_INSECURE --max-time 30 -w '%{http_code}' -o /dev/null \
+        -X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+        --data-binary "@$pending" "${SERVER%/}/api/agent/vpn" 2>/dev/null) || CODE=000
+    if [ "$CODE" != 200 ]; then
+        echo "warning: the hub did not record the deployment (HTTP $CODE); retry payload: $pending" >&2
+        return 1
+    fi
+    rm -f "$pending"
+    return 0
 }
 
 # ---- 订阅伺服 ----
@@ -604,6 +624,7 @@ report_vpn() {
 # 数字从 hub 读，用的是**节点自己的 token**（`/api/agent/traffic`）。不把面板管理员
 # 密码放到每台节点上 —— 那等于一台节点被攻破就是面板被攻破。
 SUB_STATE="/var/lib/sing-box/subscription.json"
+SUB_READY=""
 
 # 某个端口上有没有人在听。
 listening() {
@@ -615,6 +636,16 @@ nginx_holds() {
 	pid="$(ss -ltnpH "sport = :$1" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1)"
 	[ -n "$pid" ] || return 1
 	tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'nginx'
+}
+
+# Match the running executable, not just a saved port, before reusing a listener.
+agent_holds() {
+    pids=$(ss -ltnpH "sport = :$1" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u)
+    [ -n "$pids" ] || return 1
+    for pid in $pids; do
+        exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || return 1
+        case "$exe" in "$BIN" | "$BIN (deleted)") ;; *) return 1 ;; esac
+    done
 }
 
 # 订阅服务在跑吗。重跑时要靠它认出「上一轮那个是我自己」。
@@ -647,6 +678,7 @@ nginx_usable() {
 # 认 env 而不是认服务名：手工那份也叫 sub-dynamic.service（从别处搬来时就是这个
 # 名字），只看服务在不在跑会把它当成自己。
 foreign_sub_server() {
+	agent_holds "$SUB_PORT" && return 1
 	[ -f "$SUB_HOME/env" ] && return 1
 	[ -f "$SUB_STATE" ] || return 1
 	clash="$(sed -n 's/.*"clash"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SUB_STATE" | head -n 1)"
@@ -677,7 +709,7 @@ grant_bind_capability() {
 }
 
 # 订阅的文件名每次 provision 都会换一个随机串，只有状态文件里记着 —— 所以要验订阅
-# 得先问状态文件它叫什么。echo 出那三个名字，目录外的路径（状态文件被改过）一律忽略。
+# 得先问状态文件它叫什么。只输出三种已知订阅的安全文件名。
 sub_file_names() {
 	[ -f "$SUB_STATE" ] || return 0
 	# 状态文件是一行 JSON，三个键并列在同一行上，所以一个个抓而不是一次替换：
@@ -685,7 +717,7 @@ sub_file_names() {
 	# 按逗号拆行再一个个看：`grep -o` 在这类单行 JSON 上一次只给一个匹配
 	# （GNU 与 BusyBox 都如此），三个键里会静默漏掉两个。
 	tr ',' '
-' <"$SUB_STATE" | while IFS= read -r pair; do
+' <"$SUB_STATE" | while IFS= read -r pair || [ -n "$pair" ]; do
 		kind=${pair%%:*}
 		path=${pair#*:}
 		kind=${kind#*\"}
@@ -699,7 +731,8 @@ sub_file_names() {
 		# 认文件名，不认路径：agent 也只认状态文件里那个文件的名字，比它更宽的
 		# 请求它自己就会拒掉。路径的目录部分（状态文件被改过时）直接忽略。
 		name=${path##*/}
-		[ -n "$name" ] && [ "$path" = "/var/lib/sing-box/$name" ] && echo "$name"
+		case "$name" in "" | . | .. | *[!a-zA-Z0-9._-]*) continue ;; esac
+        printf '%s\n' "$name"
 	done
 }
 
@@ -715,6 +748,10 @@ check_subscription() {
 	names=$(sub_file_names)
 	[ -n "$names" ] || {
 		echo "warning: the subscription state file lists no routes: $SUB_STATE" >&2
+		return 1
+	}
+	[ "$(printf '%s\n' "$names" | wc -l)" -eq 3 ] || {
+		echo "warning: the subscription state must list all three routes: $SUB_STATE" >&2
 		return 1
 	}
 	hdr="$TMP.hdr"
@@ -761,6 +798,18 @@ NAMES
 #   80 空着          → agent 自己绑 80
 #   80 上是 nginx    → agent 绑回环 $SUB_BACKEND，nginx 转过来；agent 不开公网端口
 #   80 被别人占着    → 退到 8080
+wait_subscription() {
+    # systemd startup and nginx reload can return before requests reach the new
+    # listener/configuration. Retry briefly; the final attempt prints diagnostics.
+    attempt=0
+    while [ "$attempt" -lt 3 ]; do
+        check_subscription "$1" 2>/dev/null && return 0
+        attempt=$((attempt + 1))
+        sleep 0.5
+    done
+    check_subscription "$1"
+}
+
 setup_subscription() {
 	[ -z "$NO_VPN" ] || return 0
 	# --no-vpn 没有订阅可伺服；没写过订阅也一样。
@@ -818,7 +867,6 @@ setup_subscription() {
 	if ! listening "$served"; then
 		echo "warning: nothing is listening on port $served, so the subscription is not being served" >&2
 		echo "         see: journalctl -u monitor-agent -n 20" >&2
-		VPN_JSON=""
 		restore_prev_sub || true
 		return 1
 	fi
@@ -829,7 +877,7 @@ setup_subscription() {
 	# 的订阅留在原地址后面 —— 那比安装失败更难发现。
 	#
 	# 验的是**对外**那个地址，不是 agent 绑的那个：走 nginx 时后者只覆盖一半链路。
-	if check_subscription "http://127.0.0.1:$SUB_PORT"; then
+	if wait_subscription "http://127.0.0.1:$SUB_PORT"; then
 		retire_legacy_sub_service
 		if [ -n "$SUB_VIA_NGINX" ]; then
 			echo "subscription served by monitor-agent on port $SUB_PORT through nginx"
@@ -840,7 +888,6 @@ setup_subscription() {
 	fi
 
 	echo "warning: the subscription could not be fetched on port $SUB_PORT" >&2
-	VPN_JSON=""
 	restore_prev_sub || {
 		echo "         there is no previous configuration to go back to" >&2
 		echo "         see: journalctl -u monitor-agent -n 20" >&2
@@ -876,7 +923,7 @@ restore_prev_sub() {
     fi
     restart_agent
     case "$SUB_PORT" in "" | *[!0-9]*) return 1 ;; esac
-    check_subscription "http://127.0.0.1:$SUB_PORT"
+    wait_subscription "http://127.0.0.1:$SUB_PORT"
 }
 
 # 同一个端口上只能有一个 `default_server`，而 nginx 撞上第二个时不是「后写的赢」，
@@ -914,7 +961,7 @@ sub_default_server_patch() {
 		cp "$f" "$f.monitor-orig" 2>/dev/null || continue
 		# 只把 `default_server` 这四个字注释掉：站点本身（root、location、
 		# try_files）一个字不动，它照旧服务自己的 server_name，只是不再兜底。
-		sed -i -E "s@^([[:space:]]*listen[[:space:]]+(\[::\]:)?$1[[:space:]].*)default_server@\1# default_server (monitor: moved to monitor-sub.conf)@" "$f"
+		sed -i -E "s@^([[:space:]]*listen[[:space:]]+(\[::\]:)?$1[[:space:]].*)default_server(.*)\$@\1\3 # default_server (monitor: moved to monitor-sub.conf)@" "$f"
 		if nginx -t >/dev/null 2>&1; then
 			SUB_DEFAULT_RESTORE="$SUB_DEFAULT_RESTORE$f
 "
@@ -1109,6 +1156,7 @@ pick_public_port() {
 # 在这里就把 nginx 配置写好并验证，而不是等 setup_subscription：对外端口要拿去
 # 拼 `--sub-base`（写进面板里的订阅地址），而 nginx 有可能不收这份配置。
 pick_sub_port() {
+	pick_public_port
 	# 先看端口上有没有**别人**在伺服同一批文件（手工装的那份）。这一步必须在
 	# 改端口之前：一旦退到 8080，探的就成了 8080，而那个人在 80 上 —— 探不到，
 	# 于是我们照样装一份，两份抢同一批文件。
@@ -1116,7 +1164,6 @@ pick_sub_port() {
 		SUB_FOREIGN=1
 		return 0
 	fi
-	pick_public_port
 	# nginx 占着这个端口 → 让它伺服，我们退到回环。重跑时也走这条：
 	# 上一轮是我们写的 vhost，nginx 还在听，结论一样。
 	if nginx_usable && nginx_holds "$SUB_PORT"; then
@@ -1140,10 +1187,12 @@ pick_sub_port() {
 		echo "note: serving the subscription directly on 8080 instead" >&2
 		return 0
 	fi
-	# 80 被别的东西占着才退。
+	agent_holds "$SUB_PORT" && return 0
+	# Only a listener owned by another process requires a fallback.
 	listening "$SUB_PORT" || return 0
+	taken_port="$SUB_PORT"
 	SUB_PORT="8080"
-	echo "note: port 80 is taken, so the subscription will be served on 8080" >&2
+	echo "note: port $taken_port is taken, so the subscription will be served on 8080" >&2
 }
 
 # 订阅要绑 80（低端口）时给 agent 那**一个**能力，别的不给：`CapabilityBoundingSet`
@@ -1193,18 +1242,19 @@ json_str() {
 
 setup_latency_probe() {
 	[ -z "$NO_VPN" ] || return 0
-	[ -n "$VPN_JSON" ] || return 0
+	probe_json=$1
+	[ -n "$probe_json" ] || return 0
 
-	server=$(json_str "$VPN_JSON" server)
-	uuid=$(json_str "$VPN_JSON" uuid)
-	pbk=$(json_str "$VPN_JSON" reality_public_key)
-	sid=$(json_str "$VPN_JSON" short_id)
-	hy2pw=$(json_str "$VPN_JSON" hy2_password)
-	obfspw=$(json_str "$VPN_JSON" obfs_password)
+	server=$(json_str "$probe_json" server)
+	uuid=$(json_str "$probe_json" uuid)
+	pbk=$(json_str "$probe_json" reality_public_key)
+	sid=$(json_str "$probe_json" short_id)
+	hy2pw=$(json_str "$probe_json" hy2_password)
+	obfspw=$(json_str "$probe_json" obfs_password)
 	# HY2 的 sni 是自签证书的 CN：有域名时是那个域名，没有时是地址本身。
 	# 客户端拿它去 SNI。`insecure` 已开，所以对不上也能连 —— 但仍然要用对，
 	# 否则用户拿着一个「能连但证书永远对不上」的配置去排查别的地方。
-	sni=$(json_str "$VPN_JSON" sni)
+	sni=$(json_str "$probe_json" sni)
 	[ -n "$sni" ] || sni="$server"
 	for v in "$server" "$uuid" "$pbk" "$sid" "$hy2pw" "$obfspw"; do
 		[ -n "$v" ] || {
@@ -1355,25 +1405,20 @@ configure_optional_vpn() {
         echo "warning: monitoring is installed; VPN setup did not complete" >&2
         return 0
     fi
-    # 先上报，再伺服订阅。
-    #
-    # 这两件事的成败是独立的：`provision_vpn` 成功就意味着 sing-box 已经在跑、
-    # 凭据已经生成、客户端拿到的链接已经能用 —— 面板该显示「已部署」。而订阅伺服
-    # 只是把那份链接放到一个 URL 上；它失败只影响「能不能一键导入」，不影响
-    # 「VPN 有没有部署」。
-    #
-    # 原来把上报放进 `setup_subscription` 的成功分支，于是订阅服务器的任何毛病
-    # （端口占不到、nginx 拒了配置）都会让面板永久显示「未部署 VPN」，而节点实际
-    # 正在转发流量 —— 用户看着面板去找一个已经在跑的 VPN，且输出里没有一个字
-    # 解释这个矛盾。
-    report_vpn
-    if ! setup_subscription; then
-        echo "warning: the VPN is deployed and working, but its subscription link could not be served" >&2
-        echo "         clients can still import the node from the panel's node list" >&2
+    SUB_READY=""
+    # setup_subscription may restore the old endpoint. Validate the route map
+    # actually served after that decision, rather than provision's candidate map.
+    setup_subscription || echo "warning: subscription setup failed; VPN credentials are retained" >&2
+    candidate_state="$SUB_STATE"
+    [ -n "$SUB_FOREIGN" ] || SUB_STATE="$ROOT/subscription.json"
+    if wait_subscription "http://127.0.0.1:$SUB_PORT"; then
+        SUB_READY=1
+    else
+        echo "warning: no validated subscription is available; VPN and monitoring remain installed" >&2
     fi
-    # 最后才是探针：它要的是刚 provision 出来的凭据，而此刻那些已经在
-    # $VPN_JSON 里了。放在订阅之后，是因为订阅失败与否都不影响能不能测延迟。
-    setup_latency_probe
+    SUB_STATE="$candidate_state"
+    report_vpn || true
+    setup_latency_probe "$VPN_JSON"
 }
 
 # agent 的单元。抽成函数是因为订阅那边可能还要再写一次：绑 80 需要能力，而那是
