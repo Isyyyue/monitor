@@ -102,6 +102,15 @@ ask() {
 	printf '%s' "${reply:-$2}"
 }
 
+confirm_answer() {
+	if [ ! -t 0 ]; then printf '%s' "$2"; return; fi
+	case "$2" in y | Y) hint="[Y/n]" ;; *) hint="[y/N]" ;; esac
+	printf '  %s?%s  %s  %s%s%s ' "$Y" "$N" "$1" "$D" "$hint" "$N" >&2
+	read -r reply || reply=""
+	reply="${reply:-$2}"
+	case "$reply" in y | Y | yes | YES) printf 'y' ;; *) printf 'n' ;; esac
+}
+
 confirm() {
 	if [ -n "$YES" ]; then return 0; fi
 	if [ ! -t 0 ]; then die "$1（非交互运行时加 --yes 确认）"; fi
@@ -895,9 +904,7 @@ ask_install() {
 		press
 		return
 	fi
-	reply="$(ask "你有域名吗？（有就用它签真证书；没有就自签，浏览器会警告一次）" "n")"
-	case "$reply" in
-	y | Y | yes | YES)
+	if [ "$(confirm_answer "你有域名吗？（有就用它签真证书；没有就自签，浏览器会警告一次）" n)" = y ]; then
 		SITE="$(ask "域名（只写域名就行，例如 example.com）" "")"
 		[ -n "$SITE" ] || die "没有填域名。要么填一个，要么重跑并回答 n，用自签证书"
 		# 只写域名时补上协议：让人少打七个字符，也少一处打错的地方。
@@ -906,11 +913,9 @@ ask_install() {
 		*) SITE="https://$SITE" ;;
 		esac
 		check_site
-		;;
-	*)
+	else
 		HTTPS=1
-		;;
-	esac
+	fi
 	printf '\n'
 	install_hub
 	press

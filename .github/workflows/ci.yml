@@ -71,6 +71,8 @@ jobs:
       # does not, so neither shows up until a fresh install or an upgrade.
       - run: scripts/install-test.sh
       - run: python3 scripts/subscription-state-test.py
+      - run: python3 scripts/vpn-opt-in-test.py
+      - run: python3 scripts/prompt-pty-test.py
 
       # This commit's hub against the latest agent we have released: the field
       # contract between a hub and an agent already running in the field, and

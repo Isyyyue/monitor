@@ -2787,7 +2787,7 @@ function Deploy({ site, selfSigned }: { site: string; selfSigned: boolean }) {
   // once. The hub has no way to ask a node to do anything, so this is the command
   // that does it rather than a button that sends one.
   const command = (n: any) =>
-    installScriptCommand(site, ["--upgrade", `--vpn-ip ${n.ip || "<节点公网IP>"}`], acceptUnverified)
+    installScriptCommand(site, ["--upgrade", "--vpn", `--vpn-ip ${n.ip || "<节点公网IP>"}`], acceptUnverified)
 
   return (
     <div className="space-y-4">
@@ -2796,8 +2796,8 @@ function Deploy({ site, selfSigned }: { site: string; selfSigned: boolean }) {
           <h3 className="text-sm font-medium">VPN 部署</h3>
           <CertificateOption site={site} enabled={acceptUnverified} onChange={setAcceptUnverified} />
           <p className="mt-1 text-xs text-muted-foreground">
-            sing-box 与订阅由安装器在节点上以 root 写一次，面板不再向节点下发指令。
-            复制下面的命令到节点上执行即可部署或重新部署；节点必须已装 agent。
+            安装 Agent 默认只启用监控。复制下面的命令到节点上以 root 执行，才会部署 VPN 与订阅。
+            已部署节点可使用同一命令重新部署，并复用已有凭据；面板不向节点下发安装指令。
           </p>
         </div>
         <div className="space-y-2">

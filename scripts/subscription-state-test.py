@@ -65,6 +65,7 @@ SUB_PORT={port}
 SUB_FOREIGN=
 SUB_READY=
 NO_VPN=
+VPN_ENABLED=1
 VPN_IP=127.0.0.1
 TMP='{root}/curl'
 SERVER=http://127.0.0.1:{port}

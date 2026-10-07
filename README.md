@@ -36,7 +36,7 @@ sudo sh install-hub.sh
 
 ### 2. 安装节点 Agent
 
-在后台添加节点或开启注册窗口，复制节点页生成的安装命令，在目标节点执行。安装器默认配置 VPN；仅需监控时添加 `--no-vpn`。
+在后台添加节点或开启注册窗口，复制节点页生成的安装命令，在目标节点执行。新装 Agent 默认只启用监控；需要 VPN 时，在后台 VPN 页复制部署命令并在节点执行。已有 VPN 节点升级时保留配置与凭据。
 
 | 参数 | 用途 |
 |---|---|
@@ -44,8 +44,9 @@ sudo sh install-hub.sh
 | `--token` / `--register` | 已有节点 token / 注册窗口密钥 |
 | `--interval` / `--iface` | 上报间隔 / 统计网卡 |
 | `--vpn-ip` | VPN 链接中的节点公网地址 |
+| `--vpn` | 明确启用 VPN 部署；`--vpn-ip` 也会启用部署 |
 | `--sub-port` | 对外订阅端口 |
-| `--no-vpn` | 跳过自动 VPN 配置 |
+| `--no-vpn` | 跳过 VPN 配置变更，保留已有 VPN |
 | `--upgrade` | 升级已有 Agent |
 
 安装器需要 root 完成安装与配置，常驻 Agent 使用独立普通用户运行。VPN 操作由本机的 `monitor-agent provision` 执行，结果通过节点 token 上报 Hub；Hub 不向节点下发 VPN 安装指令。

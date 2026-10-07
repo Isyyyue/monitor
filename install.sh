@@ -31,6 +31,7 @@ UNINSTALL=""
 UPGRADE=""
 VPN_IP=""
 NO_VPN=""
+VPN_ENABLED=""
 # The subscription server, installed alongside the agent. Its paths are here
 # rather than beside its functions because --uninstall runs long before those are
 # defined.
@@ -97,9 +98,10 @@ while [ $# -gt 0 ]; do
 	--name) NAME="$2"; shift 2 ;;
 	--iface) IFACE="$2"; IFACE_SET=1; shift 2 ;;
 	--interval) INTERVAL="$2"; shift 2 ;;
-	--vpn-ip) VPN_IP="$2"; shift 2 ;;
+	--vpn-ip) VPN_IP="$2"; VPN_ENABLED=1; shift 2 ;;
 	--sub-port) SUB_PORT="$2"; SUB_PORT_SET=1; shift 2 ;;
 	--no-vpn) NO_VPN=1; shift ;;
+	--vpn) VPN_ENABLED=1; shift ;;
 	--insecure) INSECURE=1; INSECURE_SET=1; shift ;;
 	--verify-tls) INSECURE=""; INSECURE_SET=1; shift ;;
 	--uninstall) UNINSTALL=1; shift ;;
@@ -186,7 +188,8 @@ if [ -z "$SERVER" ] || { [ -z "$TOKEN" ] && [ -z "$REGISTER" ]; }; then
 	echo "       install.sh --uninstall" >&2
 	echo "--name NAME names the node --register creates; the hostname otherwise" >&2
 	echo "--vpn-ip ADDRESS is this machine's public address, for the VPN links;" >&2
-	echo "  without it the address is looked up, and --no-vpn skips the VPN entirely" >&2
+	echo "  --vpn enables VPN deployment (address auto-detected); --vpn-ip also enables it" >&2
+	echo "  fresh installs default to monitoring only; --no-vpn skips VPN changes" >&2
 	echo "--sub-port PORT is where this node serves its own subscription, default 80;" >&2
 	echo "  the subscription URL carries it, and clients read the traffic header from" >&2
 	echo "  that response -- without the header their card loses the traffic row" >&2
@@ -1401,6 +1404,12 @@ drop_latency_probe() {
 
 configure_optional_vpn() {
     [ -z "$NO_VPN" ] || { echo "keeping existing subscription settings (--no-vpn)"; return 0; }
+    # Only our saved route map identifies a previously deployed VPN. An unrelated
+    # sing-box installation must not opt a monitoring-only node into provisioning.
+    if [ -z "$VPN_ENABLED" ] && [ ! -s "$ROOT/subscription.json" ]; then
+        echo "monitoring only; deploy VPN from the panel when needed"
+        return 0
+    fi
     if ! provision_vpn; then
         echo "warning: monitoring is installed; VPN setup did not complete" >&2
         return 0

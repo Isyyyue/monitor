@@ -84,24 +84,11 @@ const TOOLTIP = {
 // and a rate axis of 1 KB/s to 100 MB/s its 10 MB/s label and two gridlines.
 const VALUE_AXIS = { ...AXIS, width: 68, interval: 0 }
 
-// Five series share one chart, so they are separated by hue and by dash: the
-// palette alone leaves two paths crossing at the same lightness hard to tell
-// apart, and two probes that both happen to plot flat would be told apart by
-// the dash instead.
-//
-// The palette used to be greyscale, on the argument that lightness alone is a
-// clearer separation than hue for anyone who cannot see the difference. That
-// was built, measured, and shipped -- then reversed: the download line is
-// drawn in `--ok` and read as "good" rather than as "one of five greys", and a
-// status page whose healthy line is grey reads as broken next to the same page
-// in the panel, where it has always been green. Hue carries meaning here, so
-// the dashes stay as the second cue rather than the only one.
-// ponytail: the dash period is shorter than the jitter once every ping in the
-// window is on the chart, so at the day range a dotted line and a dashed one
-// both read as texture and only hue separates them.
+// The first two latency series stay blue/red in both appearance modes. Dashes
+// also distinguish overlapping lines; extra probes keep the wider palette.
 const PALETTE = [
-  { stroke: "var(--color-chart-1)", dash: undefined },
-  { stroke: "var(--color-chart-3)", dash: "6 3" },
+  { stroke: "#3b82f6", dash: undefined },
+  { stroke: "#ef4444", dash: "6 3" },
   { stroke: "var(--color-chart-2)", dash: "2 3" },
   { stroke: "var(--color-chart-4)", dash: "10 4 2 4" },
   { stroke: "var(--color-chart-5)", dash: "1 4" },
@@ -658,7 +645,7 @@ export function NodeDetail({ node, historyDays, onBack }: {
                 <XAxis {...timeAxis(chartRows)} />
                 <YAxis {...axes.cpu} unit="%" {...VALUE_AXIS} />
                 <Tooltip {...TOOLTIP} formatter={(v) => [`${Number(v).toFixed(1)}%`, "CPU"]} />
-                <Area dataKey="cpu" stroke="var(--color-chart-1)" fill="var(--color-chart-1)" fillOpacity={0.15} {...RESOURCE_SERIES} />
+                <Area dataKey="cpu" stroke="var(--color-ok)" fill="var(--color-ok)" fillOpacity={0.15} {...RESOURCE_SERIES} />
               </AreaChart>
             </ResponsiveContainer>
           </Panel>
@@ -675,7 +662,7 @@ export function NodeDetail({ node, historyDays, onBack }: {
                 <XAxis {...timeAxis(chartRows)} />
                 <YAxis domain={[0, node.mem_total]} ticks={quarters(node.mem_total)} tickFormatter={axisBytes} {...VALUE_AXIS} />
                 <Tooltip {...TOOLTIP} formatter={(v) => bytes(Number(v))} />
-                <Area dataKey="mem_used" name="内存" stroke="var(--color-chart-2)" fill="var(--color-chart-2)" fillOpacity={0.15} {...RESOURCE_SERIES} />
+                <Area dataKey="mem_used" name="内存" stroke="var(--color-ok)" fill="var(--color-ok)" fillOpacity={0.15} {...RESOURCE_SERIES} />
               </AreaChart>
             </ResponsiveContainer>
           </Panel>
@@ -714,7 +701,7 @@ export function NodeDetail({ node, historyDays, onBack }: {
                 />
                 {[
                   { key: "rx", stroke: "var(--color-ok)" },
-                  { key: "tx", stroke: "var(--color-chart-1)" },
+                  { key: "tx", stroke: "var(--color-ok)" },
                 ].map((s) => (
                   <Area
                     key={s.key}
@@ -730,7 +717,7 @@ export function NodeDetail({ node, historyDays, onBack }: {
                   />
                 ))}
                 <Line dataKey="rx" name="下行" stroke="var(--color-ok)" {...RESOURCE_SERIES} />
-                <Line dataKey="tx" name="上行" stroke="var(--color-chart-1)" {...RESOURCE_SERIES} />
+                <Line dataKey="tx" name="上行" stroke="var(--color-ok)" {...RESOURCE_SERIES} />
               </ComposedChart>
             </ResponsiveContainer>
           </Panel>
@@ -745,7 +732,7 @@ export function NodeDetail({ node, historyDays, onBack }: {
                 <XAxis {...timeAxis(chartRows)} />
                 <YAxis domain={[0, node.disk_total]} ticks={quarters(node.disk_total)} tickFormatter={axisBytes} {...VALUE_AXIS} />
                 <Tooltip {...TOOLTIP} formatter={(v) => bytes(Number(v))} />
-                <Area dataKey="disk_used" name="硬盘" stroke="var(--color-chart-2)" fill="var(--color-chart-2)" fillOpacity={0.15} {...RESOURCE_SERIES} />
+                <Area dataKey="disk_used" name="硬盘" stroke="var(--color-ok)" fill="var(--color-ok)" fillOpacity={0.15} {...RESOURCE_SERIES} />
               </AreaChart>
             </ResponsiveContainer>
           </Panel>

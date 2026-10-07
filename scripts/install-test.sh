@@ -782,7 +782,7 @@ load wait_subscription
 	# shellcheck disable=SC2034 # Read by the sourced installer function.
 	SUB_STATE=unused SUB_FOREIGN='' SUB_PORT=18082 VPN_JSON=credentials
 	check_subscription() { return 1; }
-	NO_VPN=
+	NO_VPN='' VPN_ENABLED=1
 	load wait_subscription
 	eval "$(extract configure_optional_vpn)"
 	# report_vpn and setup_subscription are both stubbed: this checks only the
@@ -807,7 +807,7 @@ load wait_subscription
 	# shellcheck disable=SC2034 # Read by the sourced installer function.
 	SUB_STATE=unused SUB_FOREIGN='' SUB_PORT=18082 VPN_JSON=credentials
 	check_subscription() { return 0; }
-	NO_VPN=
+	NO_VPN='' VPN_ENABLED=1
 	eval "$(extract configure_optional_vpn)"
 	provision_vpn() { return 0; }
 	report_vpn() { prov=$((prov + 1)); }
@@ -824,7 +824,7 @@ load wait_subscription
 	prov=0
 	# Read by the function pulled in with extract; shellcheck cannot see that.
 	# shellcheck disable=SC2034
-	NO_VPN=
+	NO_VPN='' VPN_ENABLED=1
 	eval "$(extract configure_optional_vpn)"
 	provision_vpn() { return 1; }
 	report_vpn() { prov=$((prov + 1)); }
