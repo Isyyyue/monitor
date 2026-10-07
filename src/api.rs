@@ -2387,18 +2387,11 @@ mod tests {
     #[tokio::test]
     async fn settings_refuses_the_self_signed_flag() {
         let app = std::sync::Arc::new(app());
-        let response = save_settings(
-            Admin,
-            State(app.clone()),
-            HeaderMap::new(),
-            Json(json!({"self_signed": "on"})),
-        )
-        .await;
+        let response =
+            save_settings(Admin, State(app.clone()), HeaderMap::new(), Json(json!({"self_signed": "on"})))
+                .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            app.db.get("self_signed").is_none(),
-            "a rejected value must not have been written anyway"
-        );
+        assert!(app.db.get("self_signed").is_none(), "a rejected value must not have been written anyway");
     }
 
     /// Taken by every test that calls `metrics`. `HISTORY_GATE` is process-wide,
