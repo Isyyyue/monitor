@@ -2107,10 +2107,17 @@ function Themes() {
   // Only a theme whose manifest names a GitHub repository has a source to update
   // from; the hub refuses anything else, and this merely hides the button.
   //
+  // The built-in theme is excluded: it lives in the hub binary, and updating it
+  // would only write a directory that shadows the embedded copy, after which
+  // upgrading the hub stops updating the theme. Reinstalling the hub is how it
+  // is updated. The hub refuses this too -- hiding a button is a courtesy, not
+  // a boundary.
+  //
   // A downloadable one is not installed yet, so there is nothing to update --
   // its `url` is the package itself, not a repository the hub could look a
   // release up in.
-  const updatable = (theme: Theme) => !theme.downloadable && theme.url.startsWith("https://github.com/")
+  const updatable = (theme: Theme) =>
+    !theme.builtin && !theme.downloadable && theme.url.startsWith("https://github.com/")
 
   // Downloads a theme the hub knows how to fetch. Only the short name goes up:
   // the URL lives in the hub's own list, because unpacking an archive into the

@@ -1776,6 +1776,16 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
     let Some(installed) = crate::frontend::themes(app)?.into_iter().find(|theme| theme.short == short) else {
         refuse!("没有这个主题");
     };
+    // The built-in theme is the copy in the hub binary, and its version is
+    // stamped from the hub's own at packaging time -- so updating it downloads
+    // the same bytes it already is, and what it actually does is write a
+    // directory that then shadows the embedded copy. From then on upgrading the
+    // hub stops updating the theme: `serve` reads the stale directory first, and
+    // the version it reports is the binary's, so the two quietly drift.
+    // Reinstalling the hub is how the built-in theme is updated.
+    if installed.builtin {
+        refuse!("内置主题跟着 hub 走：升级 hub 就是升级它，不能单独更新");
+    }
     let Some((owner, repo)) = theme_repo(short, &installed.url) else {
         refuse!("这个主题的 url 不是 https://github.com/<owner>/<repo>，只能手动上传新包");
     };
@@ -2654,6 +2664,37 @@ mod tests {
             server.abort();
             std::fs::remove_dir_all(&state.themes).unwrap();
         }
+    }
+
+    /// The built-in theme is the copy in the binary, and its version tracks the
+    /// hub's. Updating it would only write a directory that shadows the embedded
+    /// copy -- after which upgrading the hub stops updating the theme, because
+    /// `serve` reads the stale directory first. So the endpoint refuses it, not
+    /// merely the panel hiding the button.
+    #[tokio::test]
+    async fn the_builtin_theme_cannot_be_updated_on_its_own() {
+        let themes = std::env::temp_dir().join(format!("monitor-builtin-{}", crate::auth::random_token()));
+        std::fs::create_dir_all(&themes).unwrap();
+        let mut state = app();
+        state.themes = themes.clone();
+        let state = std::sync::Arc::new(state);
+
+        // The list's first entry is the embedded copy, which is the one an update
+        // must refuse -- whatever its manifest's url happens to say.
+        let listed = crate::frontend::themes(&state).unwrap();
+        assert!(listed[0].builtin && listed[0].short == "default", "内置主题要排在列表首位");
+
+        let response =
+            update_theme(Admin, State(state.clone()), axum::extract::Path("default".to_string())).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("跟着 hub 走"),
+            "拒绝的理由要说清是跟 hub 走，而不是包坏或没有 url"
+        );
+        assert!(!themes.join("default").exists(), "被拒的更新不该在磁盘上留下目录");
+
+        std::fs::remove_dir_all(&themes).unwrap();
     }
 
     #[test]

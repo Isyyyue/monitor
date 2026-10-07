@@ -4,7 +4,7 @@
 
 Hub 使用 Rust、axum 和 SQLite，管理后台与公开状态页使用 React、TypeScript。前端和默认主题嵌入 Hub 二进制，运行时无需 Node.js 或独立数据库服务。Agent 使用单线程异步运行，指标采集、TCP 探测和订阅服务共用一个进程。
 
-项目源自 [monitor-probe/monitor](https://github.com/monitor-probe/monitor)，Hub、自研 Agent、后台、默认主题及部署脚本的源码均在本仓库。
+Hub、自研 Agent、管理后台、默认主题及部署脚本的源码均在本仓库，本仓库可独立构建与运行，不依赖任何外部仓库。
 
 ## 功能
 
