@@ -21,8 +21,8 @@ down -- see `task_id()`. The older four-field form
 `tag:port:node_id:task_id` is still accepted, for a deployment that has a
 number pinned somewhere.
 
-On measurement failure the round is skipped (no -1 written); the panel's
-clean_neg1.py cron handles -1 rows written by the official agent.
+On measurement failure the round is skipped (no -1 written). The current
+Rust Agent skips proxy:* targets; no periodic -1 cleanup is required.
 """
 import os
 import sqlite3

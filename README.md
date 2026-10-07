@@ -82,6 +82,8 @@ Hub 与 VPN 节点部署在同一台机器时，分别安排 HTTPS 面板与 sin
 
 默认公开页源码位于 [web-theme/](web-theme/README.md)，与后台一起构建并嵌入 Hub。初音视频主题为可选主题，可从 Release 下载 `theme-miku.tar.gz` 后在后台上传安装，默认不启用。
 
+默认与初音主题由本仓库发布，包名分别为 `theme-default.tar.gz`、`theme-miku.tar.gz`，主题版本与 Release 版本一致。后台更新按主题选择对应包；旧版默认主题的上游地址会自动迁回本仓库。第三方主题仍按其声明的仓库更新，使用 `theme.tar.gz`。
+
 主题代码和资源会在浏览器中执行或加载，仅安装可信来源。背景视频可能增加网络传输和客户端渲染开销。
 
 ## 源码构建

@@ -1,103 +1,70 @@
 # Proxy Latency Probe
 
-Measures real end-to-end proxy latency and feeds it into the monitor panel's
-latency graph. The official monitor-agent's built-in ping is unreliable for
-proxy targets, so this prober tests through the actual proxy connections.
+Optional end-to-end proxy latency measurements for the Monitor panel. The Rust
+Agent measures TCP connectivity and latency to dialable `host:port` targets;
+this separate probe measures HTTP requests through real VLESS/Hysteria2 routes.
+It requires Python 3, curl and a sing-box client on the Hub machine.
 
 ## How it works
 
-```
-probe.py --curl--> sing-box HTTP inbounds (127.0.0.1:18083-18086)
-                        |
-                        v (routes to real proxy outbounds)
-                 VLESS / Hysteria2 servers
-                        |
-                        v
-              https://www.google.com/generate_204
-                        |
-                        v
-              ping_record(node_id, task_id, ts, latency)
-```
-
-Every 60 seconds, `probe.py` curls a test URL through each local HTTP
-inbound. sing-box routes each inbound to its real proxy outbound. The total
-time is written to the hub's `ping_record` table, where the panel draws one
-line per (node, task).
-
-## Files
-
-| File | Purpose |
-|---|---|
-| `probe.py` | The prober. Configurable via env vars, no hardcoded secrets. |
-| `clean_neg1.py` | Deletes `latency = -1` rows. Run from cron every minute. |
-| `sing-box.example.json` | Template sing-box client config. Copy to `sing-box.json` and fill in your proxy credentials. |
-| `probe-latency.service` | systemd unit for probe.py |
-| `probe-singbox.service` | systemd unit for the sing-box client |
+Every 60 seconds, `probe.py` fetches `PROBE_TEST_URL` through local sing-box HTTP
+inbounds. sing-box routes each inbound to its configured proxy outbound. The
+elapsed time in milliseconds is written to the Hub's SQLite `ping_record` table.
+Failed measurements are skipped; this probe does not calculate proxy packet loss.
 
 ## Setup
 
-1. Copy the example config and fill in your proxy details:
-
-```bash
-cp sing-box.example.json /opt/probe/sing-box.json
-# edit /opt/probe/sing-box.json: server IPs, UUIDs, passwords, REALITY keys
-```
-
-2. Copy the scripts:
+Run from this directory on the Hub machine:
 
 ```bash
 mkdir -p /opt/probe
-cp probe.py clean_neg1.py /opt/probe/
-chmod +x /opt/probe/*.py
-```
-
-3. Install and start the services:
-
-```bash
+cp sing-box.example.json /opt/probe/sing-box.json
+# Fill in server addresses, UUIDs, passwords and REALITY keys.
+cp probe.py /opt/probe/
 cp probe-singbox.service probe-latency.service /etc/systemd/system/
+# Adjust service paths and PROBE_DB if your installation uses other directories.
 systemctl daemon-reload
 systemctl enable --now probe-singbox.service probe-latency.service
 ```
 
-4. Add the -1 cleaner to cron (the official agent writes -1 rows that
-   corrupt the graph average; this keeps the table clean):
-
-```bash
-echo '* * * * * /usr/bin/python3 /opt/probe/clean_neg1.py' | crontab -
-```
+Create panel tasks with targets `proxy:vless` and `proxy:hy2`, and use the actual
+panel node IDs in `PROBE_TARGETS`. The Agent skips these non-dialable task targets.
+Keep the sing-box HTTP inbounds bound to `127.0.0.1`.
 
 ## Configuration
 
-`probe.py` reads from environment variables:
+Set environment variables in `probe-latency.service` or a systemd override:
 
 | Variable | Default | Description |
 |---|---|---|
-| `PROBE_DB` | `/opt/monitor/data/monitor.db` | Path to the hub's SQLite database |
-| `PROBE_INTERVAL` | `60` | Seconds between measurement rounds |
+| `PROBE_DB` | `/opt/monitor/data/monitor.db` | Hub SQLite database path |
+| `PROBE_INTERVAL` | `60` | Seconds between rounds |
 | `PROBE_TEST_URL` | `https://www.google.com/generate_204` | URL fetched through each proxy |
-| `PROBE_TARGETS` | (see below) | Comma-separated `tag:port:node_id:task_id` |
+| `PROBE_TARGETS` | See below | Comma-separated `tag:port:node_id` entries |
 
-Default targets (match the example sing-box config):
+Default targets match `sing-box.example.json`:
 
+```text
+vless:18083:1,hy2:18084:1,vless:18085:2,hy2:18086:2
 ```
-vless-old:18083:1:1,hy2-old:18084:1:2,vless-new:18085:2:1,hy2-new:18086:2:2
-```
 
-`task_id` must match a ping task in the panel (1=VLESS red, 2=HY2 blue
-by default). `node_id` must match the node in the panel.
-
-To customize, set env vars in the systemd unit:
+`tag` identifies the panel task by its target (`vless` → `proxy:vless`,
+`hy2` → `proxy:hy2`). Task IDs are looked up from the database, not assumed to be
+1 or 2. The older `tag:port:node_id:task_id` format remains supported when an
+explicit task ID is required.
 
 ```ini
 [Service]
-Environment="PROBE_TARGETS=vless:18083:1:1,hy2:18084:1:2"
+Environment="PROBE_TARGETS=vless:18083:1,hy2:18084:1"
 Environment="PROBE_INTERVAL=30"
 ```
 
-## Why not use the agent's ping
+After editing a unit, run `systemctl daemon-reload` and restart
+`probe-latency.service`.
 
-The official agent measures `proxy:vless` / `proxy:hy2` targets with its own
-method, which intermittently fails and writes `-1`. The panel averages `-1`
-as 0, producing phantom packet-loss and latency spikes. This prober measures
-through the real proxy path with curl and skips failed measurements
-entirely, so the graph only shows real data.
+## Historical cleanup
+
+`clean_neg1.py` is a legacy cleanup tool that deletes **all** `latency = -1` rows
+from the configured database, including legitimate failed TCP probes. It is not
+required by the current Agent and should not be scheduled as routine cleanup.
+Back up the database and inspect affected records before any manual use.

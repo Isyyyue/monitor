@@ -29,6 +29,9 @@ trap 'rm -rf "$STAGE"' EXIT
 
 cp -r "$SRC/dist" "$STAGE/dist"
 cp "$MIKU/theme.json" "$STAGE/theme.json"
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+[ -n "$VERSION" ] || { echo 'Cargo.toml version missing' >&2; exit 1; }
+sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" "$STAGE/theme.json"
 cp "$MIKU/miku-bg.css" "$STAGE/dist/assets/miku-bg.css"
 cp "$MIKU/miku-bg.mp4" "$STAGE/dist/assets/miku-bg.mp4"
 [ -f "$SRC/preview.png" ] && cp "$SRC/preview.png" "$STAGE/preview.png"

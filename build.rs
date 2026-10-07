@@ -13,6 +13,7 @@ fn main() {
     println!("cargo:rerun-if-changed=web-theme/dist");
     println!("cargo:rerun-if-changed=web-theme/theme.json");
     println!("cargo:rerun-if-changed=scripts/theme.sh");
+    println!("cargo:rerun-if-changed=Cargo.toml");
     // The panel is embedded by `frontend.rs`, and a build script that emits any
     // `rerun-if-changed` at all replaces cargo's own "something in the package
     // changed" heuristic. Without this line a rebuilt `web-admin/dist` triggers

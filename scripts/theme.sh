@@ -26,5 +26,10 @@ rm -rf "$DEST"
 mkdir -p "$DEST"
 cp -r "$SRC/dist" "$DEST/dist"
 cp "$SRC/theme.json" "$DEST/theme.json"
+# Our theme assets share the monitor release version; package.json belongs to
+# the frontend tooling and is not the theme update version.
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+[ -n "$VERSION" ] || { echo 'Cargo.toml version missing' >&2; exit 1; }
+sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" "$DEST/theme.json"
 [ -f "$SRC/preview.png" ] && cp "$SRC/preview.png" "$DEST/preview.png"
 echo "theme staged from $SRC/dist"

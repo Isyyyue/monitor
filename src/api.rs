@@ -1633,6 +1633,31 @@ pub async fn upload_theme(
 /// same `theme.tar.gz` the upload button accepts.
 const ARCHIVE: &str = "theme.tar.gz";
 
+fn theme_repo<'a>(short: &str, url: &'a str) -> Option<(&'a str, &'a str)> {
+    let repo = github_repo(url)?;
+    // Migrate manifests embedded or installed by our earlier releases. A
+    // custom theme's repository remains its author's choice.
+    if short == "default"
+        && repo.0.eq_ignore_ascii_case("monitor-probe")
+        && repo.1.eq_ignore_ascii_case("monitor-theme-default")
+    {
+        Some(("Isyyyue", "monitor"))
+    } else {
+        Some(repo)
+    }
+}
+
+fn theme_archive(owner: &str, repo: &str, short: Option<&str>) -> &'static str {
+    if owner.eq_ignore_ascii_case("Isyyyue") && repo.eq_ignore_ascii_case("monitor") {
+        match short {
+            Some("miku") => "theme-miku.tar.gz",
+            _ => "theme-default.tar.gz",
+        }
+    } else {
+        ARCHIVE
+    }
+}
+
 /// The `<owner>/<repo>` a theme's `url` or an address pasted to install one
 /// names, where it names a GitHub repository at all.
 ///
@@ -1751,22 +1776,32 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
     let Some(installed) = crate::frontend::themes(app)?.into_iter().find(|theme| theme.short == short) else {
         refuse!("没有这个主题");
     };
-    let Some((owner, repo)) = github_repo(&installed.url) else {
+    let Some((owner, repo)) = theme_repo(short, &installed.url) else {
         refuse!("这个主题的 url 不是 https://github.com/<owner>/<repo>，只能手动上传新包");
     };
     let release = latest_theme(app, owner, repo).await?;
+    update_from_release(app, &installed, &release).await
+}
+
+async fn update_from_release(
+    app: &App,
+    installed: &crate::frontend::Theme,
+    release: &Release,
+) -> Result<(bool, String), anyhow::Error> {
+    let (owner, repo) = theme_repo(&installed.short, &installed.url)
+        .ok_or_else(|| anyhow::anyhow!("主题没有可用的 GitHub 更新仓库"))?;
 
     // Tags read `v1.2.3` while manifests carry `1.2.3`. Equal means up to date;
     // anything else is installed, including a deliberate downgrade, since the
     // release is what the author published.
     let tag = &release.tag_name;
     if tag.strip_prefix('v').unwrap_or(tag) == installed.version {
-        return Ok((false, installed.version));
+        return Ok((false, installed.version.clone()));
     }
     // Constrained to the theme it may replace. The built-in theme has no
     // directory until this runs: updating it writes one, which then serves in
     // place of the embedded copy until it is deleted.
-    let theme = fetch_theme(app, owner, repo, &release, Some(short)).await?;
+    let theme = fetch_theme(app, owner, repo, release, Some(&installed.short)).await?;
     Ok((true, theme.version))
 }
 
@@ -1857,27 +1892,28 @@ async fn fetch_theme(
     use anyhow::Context;
 
     let tag = &release.tag_name;
+    let archive_name = theme_archive(owner, repo, expect);
     if !path_segment(tag) {
         refuse!("release 的 tag {tag:?} 不能出现在下载地址里");
     }
     // Checked here rather than by downloading and reading a 404: the asset name is
     // the contract, and stating so is the entire error message.
-    if !release.assets.iter().any(|asset| asset.name == ARCHIVE) {
-        refuse!("release {tag} 里没有 {ARCHIVE}");
+    if !release.assets.iter().any(|asset| asset.name == archive_name) {
+        refuse!("release {tag} 里没有 {archive_name}");
     }
 
     // Through the panel's GitHub proxy when one is configured, the archive being
     // the part a blocked network cannot reach. The API call in `latest_theme` is
     // not proxied: most proxies front only releases, and a hub that cannot read
     // the tag still has the upload path.
-    let direct = format!("https://github.com/{owner}/{repo}/releases/download/{tag}/{ARCHIVE}");
+    let direct = format!("https://github.com/{owner}/{repo}/releases/download/{tag}/{archive_name}");
     let url = crate::proxied(app, direct.clone());
     let proxy = url != direct;
     let unreachable = || {
         crate::Shown(if proxy {
-            format!("经 GitHub 代理下载 {ARCHIVE} 失败，换一个代理，或清空代理让 hub 直连")
+            format!("经 GitHub 代理下载 {archive_name} 失败，换一个代理，或清空代理让 hub 直连")
         } else {
-            format!("下载 {ARCHIVE} 失败：hub 连不上 github.com 时，在设置里填 GitHub 代理")
+            format!("下载 {archive_name} 失败：hub 连不上 github.com 时，在设置里填 GitHub 代理")
         })
     };
     let response = app
@@ -1910,7 +1946,7 @@ async fn fetch_theme(
         if proxy {
             refuse!("GitHub 代理返回的不是主题包，换一个代理，或清空代理让 hub 直连");
         }
-        refuse!("release {tag} 里的 {ARCHIVE} 不是 gzip 格式，包本身有问题，请联系主题作者");
+        refuse!("release {tag} 里的 {archive_name} 不是 gzip 格式，包本身有问题，请联系主题作者");
     }
 
     // The same unpacking, validation and atomic replace an upload undergoes.
@@ -2532,11 +2568,99 @@ mod tests {
         assert_eq!(stored, vec![5, 60, 3_600]);
     }
 
+    #[test]
+    fn theme_updates_use_our_assets_and_preserve_external_repositories() {
+        assert_eq!(
+            theme_repo("default", "https://github.com/monitor-probe/monitor-theme-default"),
+            Some(("Isyyyue", "monitor"))
+        );
+        assert_eq!(theme_repo("custom", "https://github.com/a/b"), Some(("a", "b")));
+        assert_eq!(theme_archive("Isyyyue", "monitor", Some("default")), "theme-default.tar.gz");
+        assert_eq!(theme_archive("Isyyyue", "monitor", Some("miku")), "theme-miku.tar.gz");
+        assert_eq!(theme_archive("a", "b", Some("custom")), "theme.tar.gz");
+    }
+
+    #[tokio::test]
+    async fn theme_update_migrates_once_and_then_skips_the_download() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        for short in ["default", "miku"] {
+            let mut state = app();
+            state.themes =
+                std::env::temp_dir().join(format!("monitor-update-{}", crate::auth::random_token()));
+            std::fs::create_dir_all(&state.themes).unwrap();
+            let manifest = json!({"name":short,"short":short,"description":"test","version":"1.9.6","author":"test","url":"https://github.com/Isyyyue/monitor"});
+            let mut archive =
+                tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default()));
+            for (path, bytes) in [
+                ("theme.json", serde_json::to_vec(&manifest).unwrap()),
+                ("dist/index.html", b"custom return-to-list".to_vec()),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                archive.append_data(&mut header, path, bytes.as_slice()).unwrap();
+            }
+            let bytes = archive.into_inner().unwrap().finish().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = calls.clone();
+            let expected_path = format!(
+                "/https://github.com/Isyyyue/monitor/releases/download/v1.9.6/{}",
+                theme_archive("Isyyyue", "monitor", Some(short))
+            );
+            let router = axum::Router::new().fallback(axum::routing::get(move |uri: axum::http::Uri| {
+                let bytes = bytes.clone();
+                let count = count.clone();
+                let expected_path = expected_path.clone();
+                async move {
+                    assert_eq!(uri.path(), expected_path);
+                    count.fetch_add(1, Ordering::SeqCst);
+                    ([(header::CONTENT_LENGTH, bytes.len().to_string())], bytes)
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            state.db.set("github_proxy", &format!("http://{}", listener.local_addr().unwrap())).unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            let mut installed: crate::frontend::Theme = serde_json::from_value(manifest).unwrap();
+            installed.version = "1.0.0".into();
+            if short == "default" {
+                installed.url = "https://github.com/monitor-probe/monitor-theme-default".into();
+                installed.version = "1.4.0".into();
+            }
+            let release = Release {
+                tag_name: "v1.9.6".into(),
+                assets: vec![Asset { name: theme_archive("Isyyyue", "monitor", Some(short)).into() }],
+            };
+            assert_eq!(
+                update_from_release(&state, &installed, &release).await.unwrap(),
+                (true, "1.9.6".into())
+            );
+            let installed =
+                crate::frontend::themes(&state).unwrap().into_iter().find(|t| t.short == short).unwrap();
+            assert_eq!(
+                update_from_release(&state, &installed, &release).await.unwrap(),
+                (false, "1.9.6".into())
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                std::fs::read(state.themes.join(short).join("dist/index.html")).unwrap(),
+                b"custom return-to-list"
+            );
+            server.abort();
+            std::fs::remove_dir_all(&state.themes).unwrap();
+        }
+    }
+
+    #[test]
     /// The update and install paths follow a manifest's `url` or a pasted address
     /// to build a download address, so what counts as a GitHub repository
     /// constitutes the entire trust boundary: whatever this accepts, the hub will
     /// fetch.
-    #[test]
     fn only_a_github_repository_url_can_name_a_release_to_download() {
         assert_eq!(github_repo("https://github.com/Isyyyue/monitor"), Some(("Isyyyue", "monitor")));
         // A link to the repository, in whatever form the author wrote it or the
