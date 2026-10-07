@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react"
+import { connectLive } from "../../../shared/live-stream.ts"
 
 export type Metrics = {
   /** The agent's `--iface`, empty for the default rules; absent from an agent predating it. */
@@ -255,41 +256,12 @@ export function shortAddress(address: string): string {
 /** Where a shown address comes from, which the panel gives as its tooltip. */
 export type Source = "manual" | "interface" | "exit" | "connection"
 
-/** An https entry naming a domain, never an address: a certificate is issued to
- * a name, and the panel builds the command from this address. */
-function httpsDomain(site: string): string {
+/** A node-reachable HTTPS entry. Certificate trust is a separate choice. */
+function httpsEntry(site: string): string {
   try {
     const u = new URL(site)
-    return u.protocol === "https:" && !u.hostname.startsWith("[") && !/^\d+\.\d+\.\d+\.\d+$/.test(u.hostname)
-      && u.hostname !== "localhost" && !u.hostname.endsWith(".localhost") && !u.username && !u.password
+    return u.protocol === "https:" && !loopbackOrigin(site) && !u.username && !u.password
       && u.pathname === "/" && !u.search && !u.hash ? u.origin : ""
-  } catch {
-    return ""
-  }
-}
-
-/**
- * An https entry reached at an address rather than a name: a hub with no domain
- * serves a certificate it signed itself. `--insecure` is how a node is told to
- * accept it -- install.sh fetches the binary over that same unverified channel
- * and hands the flag on to the agent, which trusts public roots otherwise.
- *
- * The address test is what separates this from an ordinary https entry. A name
- * can hold a certificate a public CA vouches for; an address cannot, so a name
- * here means the operator has something to lose by skipping the check and this
- * is not the case for it.
- *
- * Not loopback, for the same reason as `plainEntry`: an address on the hub's
- * own machine names nothing a node could reach.
- */
-export function selfSignedEntry(site: string): string {
-  try {
-    const u = new URL(site)
-    const host = u.hostname
-    const address = host.startsWith("[") || /^\d+(\.\d+){3}$/.test(host)
-    return u.protocol === "https:" && !u.username && !u.password
-      && u.pathname === "/" && !u.search && !u.hash
-      && address && !loopbackOrigin(site) ? u.origin : ""
   } catch {
     return ""
   }
@@ -321,7 +293,7 @@ export function plainEntry(site: string): string {
  * Anything else and there is no command to offer.
  */
 export function provisioningSite(site: string): string {
-  return httpsDomain(site) || plainEntry(site)
+  return httpsEntry(site) || plainEntry(site)
 }
 
 /**
@@ -349,7 +321,7 @@ export function loopbackOrigin(origin: string): boolean {
  */
 export function provisionRefusal(origin: string, site: string): string {
   if (site && !provisioningSite(site)) {
-    return "hub 的 --site 既不是 https 域名也不是明文地址，改正后才能添加或安装节点。"
+    return "hub 的 --site 不是可用的 HTTPS 入口或明文地址，改正后才能添加或安装节点。"
   }
   // A plaintext --site names one address and nothing else, so the page has to be
   // on it -- or be a tunnel into the hub, which the command still fills from
@@ -361,7 +333,7 @@ export function provisionRefusal(origin: string, site: string): string {
       ? ""
       : "面板是明文部署，只能从 --site 写的那一个地址进面板添加节点。"
   }
-  if (httpsDomain(origin) || (loopbackOrigin(origin) && site)) return ""
+  if (httpsEntry(origin) || (loopbackOrigin(origin) && site)) return ""
   return loopbackOrigin(origin)
     ? "从隧道或回环地址进面板时，要给 hub 加 --site 指定节点可达的 https 域名。"
     : "请通过 HTTPS 域名访问面板后添加或安装节点。"
@@ -543,71 +515,20 @@ export function useNodes() {
   const [error, setError] = useState<string | null>(null)
   const [reload, setReload] = useState(0)
 
-  useEffect(() => {
-    let socket: WebSocket | null = null
-    let poll: ReturnType<typeof setInterval> | null = null
-    let retry: ReturnType<typeof setTimeout> | null = null
-    let closed = false
-
-    // A refresh replaces this effect, and an answer to the one it replaced may
-    // still arrive after the newer one; it is dropped rather than shown.
-    const fetchOnce = () =>
-      api<{ nodes: Node[]; admin: boolean }>("/nodes")
-        .then((d) => {
-          if (closed) return
-          setNodes(d.nodes)
-          setAdmin(d.admin)
-          setError(null)
-        })
-        .catch((e: Error) => {
-          if (closed) return
-          setError(e.message)
-          // With the public page switched off, a revoked session receives a 401
-          // here and on the stream, so the frame that would report admin=false
-          // never arrives and the panel would retain the list it already had.
-          if (e instanceof ApiError && e.status === 401) setAdmin(false)
-        })
-
-    fetchOnce()
-
-    const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/ws`
-    // A hub restart closes every stream. Without reconnecting, a page that
-    // outlives a deploy would remain on the fallback poll for the rest of its
-    // life, refreshing at a fifth of the live rate with no indication.
-    const connect = () => {
-      try {
-        socket = new WebSocket(url)
-      } catch {
-        poll ??= setInterval(fetchOnce, 5000)
-        return
-      }
-      socket.onmessage = (event) => {
-        const frame = JSON.parse(event.data)
-        setNodes(frame.nodes)
-        setAdmin(frame.admin)
-        setError(null)
-        // The stream has returned; the poll was only covering for it.
-        if (poll) {
-          clearInterval(poll)
-          poll = null
-        }
-      }
-      socket.onerror = () => socket?.close()
-      socket.onclose = () => {
-        if (closed) return
-        poll ??= setInterval(fetchOnce, 5000)
-        retry = setTimeout(connect, 5000)
-      }
-    }
-    connect()
-
-    return () => {
-      closed = true
-      socket?.close()
-      if (poll) clearInterval(poll)
-      if (retry) clearTimeout(retry)
-    }
-  }, [reload])
+  useEffect(() => connectLive<{ nodes: Node[]; admin: boolean }>({
+    url: `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/ws`,
+    fetch: (signal) => api("/nodes", { signal }),
+    decode: (data) => {
+      const frame = JSON.parse(String(data))
+      if (!Array.isArray(frame.nodes) || typeof frame.admin !== "boolean") throw new Error("实时数据格式不正确")
+      return frame
+    },
+    receive: (frame) => { setNodes(frame.nodes); setAdmin(frame.admin); setError(null) },
+    error: (error) => {
+      setError((error as Error).message)
+      if (error instanceof ApiError && error.status === 401) setAdmin(false)
+    },
+  }), [reload])
 
   return { nodes, admin, error, refresh: () => setReload((n) => n + 1) }
 }

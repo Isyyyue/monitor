@@ -14,7 +14,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { api, badIfaceName, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, plainEntry, provisioningSite, selfSignedEntry, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { api, badIfaceName, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, plainEntry, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { installScriptCommand } from "@/lib/install-command"
 import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -1070,27 +1071,23 @@ function BillingForm({ node, onClose, onSaved }: {
 // Each command runs the hub's own install.sh and is offered on the entry --site
 // names: an https domain, or a plaintext address for a hub that has none. `args`
 // receives that entry, which the agent is also given as --server.
-function scriptCommand(site: string, args: (site: string) => string[]) {
+function CertificateOption({ site, enabled, onChange }: { site: string; enabled: boolean; onChange: (value: boolean) => void }) {
+  if (!site.startsWith("https:")) return null
+  return <OptionRow title="接受未验证的 HTTPS 证书" hint="仅在确认使用自签证书时开启。下载与连接会跳过服务器身份验证。">
+    <Switch checked={enabled} onCheckedChange={onChange} aria-label="接受未验证的 HTTPS 证书" />
+  </OptionRow>
+}
+
+function scriptCommand(site: string, args: (site: string) => string[], acceptUnverified = false) {
   site = provisioningSite(site)
-  if (!site) return ""
-  // install.sh refuses plain HTTP to a hub that is not on this machine, and that
-  // refusal is right: the token and the binary about to run as root both cross an
-  // unverified channel. --insecure is the operator's standing decision to accept
-  // it, which naming a plaintext --site already was.
-  //
-  // A self-signed address is the same decision taken for an encrypted channel
-  // whose certificate nobody vouches for. Without the flag the node fetches the
-  // binary from a TLS handshake it cannot verify and, worse, the agent dials a
-  // hub it refuses -- so the panel would hand out a command that cannot work.
-  const insecure = plainEntry(site) || selfSignedEntry(site) ? ["--insecure"] : []
-  return `curl -fsSL ${site}/install.sh | sh -s -- ${args(site).concat(insecure).join(" ")}`
+  return installScriptCommand(site, args(site), acceptUnverified)
 }
 
 // Built here rather than fetched: the node list already carries the token, so
 // viewing an install command is a read rather than an action. Reissuing one to
 // display it would take the running agent offline.
-function installCommand(site: string, token: string, seconds: number | undefined, iface: string | undefined) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, ...intervalArg(seconds), ...ifaceArg(iface)])
+function installCommand(site: string, token: string, seconds: number | undefined, iface: string | undefined, acceptUnverified = false) {
+  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, ...intervalArg(seconds), ...ifaceArg(iface)], acceptUnverified)
 }
 
 // Left out untouched, as an untouched --iface is: a rerun then keeps what the
@@ -1109,14 +1106,14 @@ function ifaceArg(iface: string | undefined) {
 // within the window it opened, and each machine exchanges it for a token of its
 // own, so unlike an install command this text is no one's credential and can be
 // sent to every machine as it is.
-function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...intervalArg(seconds), ...ifaceArg(iface)])
+function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined, acceptUnverified = false) {
+  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...intervalArg(seconds), ...ifaceArg(iface)], acceptUnverified)
 }
 
 // Carries no token, so it is the same for every node and remains valid after the
 // node is deleted.
-function uninstallCommand(site: string) {
-  return scriptCommand(site, () => ["--uninstall"])
+function uninstallCommand(site: string, acceptUnverified = false) {
+  return scriptCommand(site, () => ["--uninstall"], acceptUnverified)
 }
 
 // The window lives on the hub; this reads it back and counts down, which is also
@@ -1164,9 +1161,10 @@ function RegisterDialog({ site, reg, onClose }: {
   reg: ReturnType<typeof useRegisterWindow>
   onClose: () => void
 }) {
+  const [acceptUnverified, setAcceptUnverified] = useState(false)
   const iface = useIfaceOption(undefined)
   const interval = useIntervalOption()
-  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag) : ""
+  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag, acceptUnverified) : ""
   const clock = `${Math.floor(reg.left / 60)}:${String(reg.left % 60).padStart(2, "0")}`
 
   return (
@@ -1183,6 +1181,7 @@ function RegisterDialog({ site, reg, onClose }: {
           </p>
           <section className="space-y-3">
             <h3 className="text-sm font-medium">安装选项</h3>
+            <CertificateOption site={site} enabled={acceptUnverified} onChange={setAcceptUnverified} />
             <IntervalOption option={interval} batch />
             <IfaceOption option={iface} batch />
           </section>
@@ -1332,8 +1331,9 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   const [confirmRotate, setConfirmRotate] = useState(false)
   const iface = useIfaceOption(currentIface(node))
   const interval = useIntervalOption(node.interval)
+  const [acceptUnverified, setAcceptUnverified] = useState(false)
 
-  const command = iface.valid ? installCommand(site, token, interval.flag, iface.flag) : ""
+  const command = iface.valid ? installCommand(site, token, interval.flag, iface.flag, acceptUnverified) : ""
 
   async function rotate() {
     setRotating(true)
@@ -1362,6 +1362,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
         <div className="space-y-5">
           <section className="space-y-3">
             <h3 className="text-sm font-medium">安装选项</h3>
+            <CertificateOption site={site} enabled={acceptUnverified} onChange={setAcceptUnverified} />
             <IntervalOption option={interval} />
             <IfaceOption option={iface} />
           </section>
@@ -1433,6 +1434,7 @@ function trafficTone(n: Node, warnAt: number) {
 
 function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () => void; site: string; refusal: string }) {
   const warnAt = Number(useSettings().s?.notify_traffic) || 80
+  const [acceptUnverified, setAcceptUnverified] = useState(false)
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
@@ -1456,7 +1458,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
     added.current = null
   })
   const searching = query.trim() !== "" || group !== "all"
-  const uninstall = refusal ? "" : uninstallCommand(site)
+  const uninstall = refusal ? "" : uninstallCommand(site, acceptUnverified)
 
   async function remove() {
     if (!deleting) return
@@ -1476,6 +1478,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   return (
     <div className="space-y-4">
       {refusal && <p className="text-sm text-muted-foreground">{refusal}</p>}
+      <CertificateOption site={site} enabled={acceptUnverified} onChange={setAcceptUnverified} />
       <div className="flex flex-wrap items-center justify-end gap-2">
         <div className="mr-auto flex w-full gap-2 sm:w-auto">
           <NodeSearch className="min-w-0 flex-1 sm:w-64 sm:flex-none" value={query} onChange={setQuery} />
@@ -2718,7 +2721,8 @@ sudo nginx -t && sudo systemctl reload nginx`
   )
 }
 
-function Deploy() {
+function Deploy({ site }: { site: string }) {
+  const [acceptUnverified, setAcceptUnverified] = useState(false)
   const [nodes, setNodes] = useState<any[]>([])
   const [vpnInfo, setVpnInfo] = useState<Record<number, any>>({})
   // A set, not one id: the point of this page is comparing nodes, and a single
@@ -2752,13 +2756,14 @@ function Deploy() {
   // once. The hub has no way to ask a node to do anything, so this is the command
   // that does it rather than a button that sends one.
   const command = (n: any) =>
-    `curl -fsSL ${location.origin}/install.sh | sudo sh -s -- --upgrade --vpn-ip ${n.ip || "<节点公网IP>"}`
+    installScriptCommand(site, ["--upgrade", `--vpn-ip ${n.ip || "<节点公网IP>"}`], acceptUnverified)
 
   return (
     <div className="space-y-4">
       <Card className="gap-4 p-5">
         <div>
           <h3 className="text-sm font-medium">VPN 部署</h3>
+          <CertificateOption site={site} enabled={acceptUnverified} onChange={setAcceptUnverified} />
           <p className="mt-1 text-xs text-muted-foreground">
             sing-box 与订阅由安装器在节点上以 root 写一次，面板不再向节点下发指令。
             复制下面的命令到节点上执行即可部署或重新部署；节点必须已装 agent。
@@ -3124,7 +3129,7 @@ export function Admin({
         ) : path === "/admin/website" ? (
           <Website />
         ) : path === "/admin/deploy" ? (
-          <Deploy />
+          <Deploy site={site} />
         ) : (
           <Nodes nodes={nodes} refresh={refresh} site={site} refusal={refusal} />
         )}

@@ -1,6 +1,3 @@
-//! Sessions, the local emergency password, and GitHub single sign-on.
-//!
-//! GitHub is the primary sign-in path. The local password exists so that a
 //! Sessions and the local password.
 
 use std::collections::HashMap;
@@ -8,7 +5,7 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use axum::extract::{ConnectInfo, State};
@@ -46,6 +43,22 @@ const LOCKOUT: Duration = Duration::from_secs(900);
 /// cost is that two simultaneous sign-ins require one to retry.
 const PASSWORD_CHECKS: usize = 1;
 static PASSWORD_GATE: Semaphore = Semaphore::const_new(PASSWORD_CHECKS);
+
+pub(crate) fn password_slot() -> Option<tokio::sync::SemaphorePermit<'static>> {
+    PASSWORD_GATE.try_acquire().ok()
+}
+
+pub(crate) async fn password_task<T: Send + 'static>(
+    permit: tokio::sync::SemaphorePermit<'static>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .context("password worker failed")
+}
 
 pub fn sha256(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
@@ -187,21 +200,30 @@ pub async fn login(
         return answer(StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，稍后再试");
     }
     // Held across the check below, which is its purpose.
-    let Ok(_permit) = PASSWORD_GATE.try_acquire() else {
+    let Some(permit) = password_slot() else {
         return answer(StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，稍后再试");
     };
     let Some(stored) = app.db.get("admin_password_hash") else {
         return answer(StatusCode::FORBIDDEN, "没有设置应急密码，无法用密码登录");
     };
-    if !verify_password(&body.password, &stored) {
-        app.throttle.record_failure(ip);
-        return answer(StatusCode::UNAUTHORIZED, "密码错误");
-    }
-    app.throttle.clear(ip);
-    match issue_session(&app, &headers) {
-        Ok(cookie) => {
+    let worker_app = app.clone();
+    let outcome = password_task(permit, move || {
+        if !verify_password(&body.password, &stored) {
+            return Ok(None);
+        }
+        issue_session(&worker_app, &headers).map(Some)
+    })
+    .await
+    .and_then(|result| result);
+    match outcome {
+        Ok(Some(cookie)) => {
+            app.throttle.clear(ip);
             crate::notify::signed_in(&app, "应急密码", ip);
             with_cookies(Json(serde_json::json!({"ok": true})), [cookie])
+        }
+        Ok(None) => {
+            app.throttle.record_failure(ip);
+            answer(StatusCode::UNAUTHORIZED, "密码错误")
         }
         Err(e) => fail(e),
     }

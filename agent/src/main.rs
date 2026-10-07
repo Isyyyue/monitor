@@ -81,6 +81,7 @@ fn parse_values(
             // only writes MONITOR_INSECURE when the operator asked for it, and
             // the note printed at the end says what it gives up.
             "--insecure" => out.insecure = true,
+            "--verify-tls" => out.insecure = false,
             _ => anyhow::bail!("unknown argument: {flag}"),
         }
     }
@@ -88,6 +89,17 @@ fn parse_values(
         anyhow::bail!("set MONITOR_SERVER/MONITOR_TOKEN or --server/--token");
     }
     out.server = websocket_url(&out.server)?;
+    out.ifaces =
+        out.ifaces.iter().map(|name| name.trim().to_owned()).filter(|name| !name.is_empty()).collect();
+    for name in &out.ifaces {
+        let name = name.strip_prefix('-').unwrap_or(name);
+        anyhow::ensure!(
+            !name.is_empty()
+                && !name.starts_with('-')
+                && name.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)),
+            "invalid interface name"
+        );
+    }
     Ok(out)
 }
 
@@ -216,6 +228,7 @@ fn parse_args() -> Result<Args> {
 /// which the hub keeps as the minute's peak.
 #[derive(Debug, Serialize)]
 struct Metrics {
+    iface: String,
     boot_id: String,
     hostname: String,
     uptime: u64,
@@ -314,7 +327,36 @@ impl Rate {
     }
 }
 
-fn collect_metrics(sys: &mut sysinfo::System, ifaces: &[String], rate: &mut Rate) -> Metrics {
+#[derive(Default)]
+struct Sampling {
+    rate: Rate,
+    disks: Option<sysinfo::Disks>,
+    listed_at: Option<std::time::Instant>,
+    boot: Option<String>,
+    host: Option<String>,
+}
+
+fn includes_interface(name: &str, rules: &[String]) -> bool {
+    let included = !rules.iter().any(|rule| !rule.starts_with('-')) || rules.iter().any(|rule| rule == name);
+    included && !rules.iter().any(|rule| rule.strip_prefix('-') == Some(name))
+}
+
+fn network_totals(body: &str, rules: &[String]) -> (u64, u64) {
+    body.lines()
+        .filter_map(|line| {
+            let (name, counters) = line.split_once(':')?;
+            if !includes_interface(name.trim(), rules) {
+                return None;
+            }
+            let mut counters = counters.split_whitespace();
+            let rx = counters.next()?.parse::<u64>().ok()?;
+            let tx = counters.nth(7)?.parse::<u64>().ok()?;
+            Some((rx, tx))
+        })
+        .fold((0u64, 0u64), |(rx, tx), (r, t)| (rx.saturating_add(r), tx.saturating_add(t)))
+}
+
+fn collect_metrics(sys: &mut sysinfo::System, ifaces: &[String], sample: &mut Sampling) -> Metrics {
     // 只刷 CPU 与内存。`refresh_all()` 还会走一遍**每个进程**去建一张没人读的列表
     // —— 在忙一点的机器上那是这个 agent 最大的一笔开销，而它采完就扔。
     // 进程数是从 /proc 数的，磁盘和网卡在下面各自刷新自己的列表。
@@ -330,22 +372,27 @@ fn collect_metrics(sys: &mut sysinfo::System, ifaces: &[String], rate: &mut Rate
     let swap_used = sys.used_swap();
 
     // Disks
-    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let relist = sample.listed_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
+    let disks = sample.disks.get_or_insert_with(sysinfo::Disks::new);
+    if relist {
+        disks.refresh_list();
+        sample.listed_at = Some(std::time::Instant::now());
+        sample.host = Some(hostname());
+    } else {
+        disks.refresh();
+    }
     let (disk_total, disk_used) = disks
         .iter()
         .fold((0, 0), |(t, u), d| (t + d.total_space(), u + d.total_space() - d.available_space()));
 
     // Networks
-    let networks = sysinfo::Networks::new_with_refreshed_list();
-    let (rx, tx) = networks
-        .iter()
-        .filter(|(name, _)| ifaces.is_empty() || ifaces.iter().any(|wanted| wanted == *name))
-        .fold((0, 0), |(r, t), (_, n)| (r + n.total_received(), t + n.total_transmitted()));
-    let (net_rx, net_tx) = rate.measure(rx, tx);
+    let (rx, tx) = network_totals(&std::fs::read_to_string("/proc/net/dev").unwrap_or_default(), ifaces);
+    let (net_rx, net_tx) = sample.rate.measure(rx, tx);
 
     Metrics {
-        boot_id: boot_id(),
-        hostname: hostname(),
+        iface: ifaces.join(","),
+        boot_id: sample.boot.get_or_insert_with(boot_id).clone(),
+        hostname: sample.host.clone().unwrap_or_default(),
         uptime: uptime(),
         cpu,
         load: [load.one as f32, load.five as f32, load.fifteen as f32],
@@ -694,7 +741,7 @@ async fn run() -> Result<()> {
 
     // 订阅和监控是两件事：一个坏了不该把另一个带走。这里起不来只记一条警告，
     // 安装器会独立确认监听到底有没有起来。
-    if let Err(e) = subscription::start(&args.server, &args.token).await {
+    if let Err(e) = subscription::start(&args.server, &args.token, args.insecure).await {
         warn!("subscription listener unavailable: {e:#}");
     }
 
@@ -746,7 +793,7 @@ async fn session(args: &Args) -> Result<()> {
     write.send(Message::Text(hello.to_string())).await?;
     info!("Sent hello");
 
-    let mut rate = Rate::default();
+    let mut sampling = Sampling::default();
     let mut interval = tokio::time::interval(args.interval);
     // 探针各自跑在 spawn 出来的任务里，读数从这里回到唯一的写端：一个 WebSocket
     // 只能有一个写者，几条探针各写各的会交错成坏帧。
@@ -760,7 +807,7 @@ async fn session(args: &Args) -> Result<()> {
         tokio::select! {
             _ = interval.tick() => {
                 // Send metrics report
-                let metrics = collect_metrics(&mut sys, &args.ifaces, &mut rate);
+                let metrics = collect_metrics(&mut sys, &args.ifaces, &mut sampling);
                 let report = json!({
                     "jsonrpc": "2.0",
                     "method": "report",
@@ -822,6 +869,32 @@ async fn session(args: &Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_the_interface_configuration_to_the_panel() {
+        let mut sys = sysinfo::System::new();
+        let value =
+            serde_json::to_value(collect_metrics(&mut sys, &["-lo".into()], &mut Sampling::default()))
+                .unwrap();
+        assert_eq!(value["iface"], "-lo");
+    }
+
+    #[test]
+    fn interface_rules_select_real_counter_columns() {
+        let body = "lo: 10 0 0 0 0 0 0 0 100\neth0: 20 0 0 0 0 0 0 0 200\neth1: 30 0 0 0 0 0 0 0 300\n";
+        assert_eq!(network_totals(body, &[]), (60, 600));
+        assert_eq!(network_totals(body, &["-lo".into()]), (50, 500));
+        assert_eq!(network_totals(body, &["eth0".into(), "eth1".into(), "-eth1".into()]), (20, 200));
+    }
+
+    #[test]
+    fn excluding_an_absent_interface_preserves_other_counters() {
+        let mut sys = sysinfo::System::new();
+        let all = collect_metrics(&mut sys, &[], &mut Sampling::default());
+        let excluded = collect_metrics(&mut sys, &["-monitor-not-present".into()], &mut Sampling::default());
+        assert!(all.net_rx_total + all.net_tx_total > 0);
+        assert!(excluded.net_rx_total + excluded.net_tx_total >= all.net_rx_total + all.net_tx_total);
+    }
     #[test]
     fn request_contains_complete_handshake_and_bearer_auth() {
         let r = websocket_request("ws://localhost:28080/api/agent/ws", "audit-token").unwrap();
@@ -909,7 +982,7 @@ mod tests {
     #[test]
     fn the_report_carries_every_field_the_hub_reads() {
         let mut sys = sysinfo::System::new_all();
-        let mut rate = Rate::default();
+        let mut rate = Sampling::default();
         let m = serde_json::to_value(collect_metrics(&mut sys, &[], &mut rate)).unwrap();
         let obj = m.as_object().unwrap();
         for key in [

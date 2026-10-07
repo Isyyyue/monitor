@@ -7,15 +7,11 @@
 # what makes the theme changeable at all: it is the page visitors look at, and
 # what they ask of it (a way back to the list, a background) are edits to it.
 #
-# Copies built output rather than building it. web-theme/dist/ is committed,
-# because a build needs node and an `npm install`, and this script runs from
-# build.rs -- so `cargo build` would otherwise need a JavaScript toolchain to
-# produce a Rust binary. Rebuilding the theme is a step of its own:
+# Copies built output rather than building it. Before cargo build, build the
+# untracked web-theme/dist/ once (CI performs this step automatically):
 #
 #     cd web-theme && npm install && npm run build
 #
-# then commit dist/. CI rebuilds it before building the hub and fails if the
-# result differs, so a stale dist/ cannot reach a release.
 set -eu
 
 cd "$(dirname "$0")/.."

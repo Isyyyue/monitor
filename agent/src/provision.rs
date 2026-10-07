@@ -13,6 +13,69 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use serde_json::{json, Value};
 
+/// Replace a complete file on its own filesystem, retaining its permissions.
+fn atomic_write(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    atomic_write_mode(path, contents, 0o600)
+}
+
+fn atomic_write_mode(path: &Path, contents: impl AsRef<[u8]>, mode: u32) -> Result<()> {
+    use std::io::Write;
+    let parent = path.parent().context("file has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".monitor-{}-{}", std::process::id(), random_hex(8)?));
+    let result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        let mut file = options.open(&temporary)?;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            file.set_permissions(metadata.permissions())?;
+        }
+        file.write_all(contents.as_ref())?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Recover the previously serving files if activation or publication fails.
+struct FileSnapshot(Vec<(PathBuf, Option<Vec<u8>>)>);
+impl FileSnapshot {
+    fn capture(paths: &[&Path]) -> Result<Self> {
+        let mut files = Vec::new();
+        for path in paths {
+            let contents = match std::fs::read(path) {
+                Ok(contents) => Some(contents),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.into()),
+            };
+            files.push((path.to_path_buf(), contents));
+        }
+        Ok(Self(files))
+    }
+    fn restore(&self) -> Result<()> {
+        for (path, contents) in &self.0 {
+            match contents {
+                Some(contents) => atomic_write(path, contents)?,
+                None => match std::fs::remove_file(path) {
+                    Ok(()) => (),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(e) => return Err(e.into()),
+                },
+            }
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------- 标准形态的固定部分
 
 /// REALITY 的伪装目标站。全节点统一。
@@ -458,7 +521,7 @@ impl SubscriptionPaths {
             "v2ray_txt": self.v2ray_txt.to_string_lossy(),
             "v2ray_b64": self.v2ray_b64.to_string_lossy(),
         });
-        std::fs::write(state, serde_json::to_string_pretty(&body)?).context("write subscription state")
+        atomic_write(state, serde_json::to_string_pretty(&body)?).context("write subscription state")
     }
 }
 
@@ -466,9 +529,9 @@ pub fn write_subscriptions(n: &Node, paths: &SubscriptionPaths, state: &Path) ->
     if let Some(parent) = paths.clash.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
-    std::fs::write(&paths.clash, render_clash_yaml(n)).context("write clash yaml")?;
-    std::fs::write(&paths.v2ray_txt, render_v2ray_txt(n)).context("write v2ray txt")?;
-    std::fs::write(&paths.v2ray_b64, render_v2ray_b64(n)).context("write v2ray b64")?;
+    atomic_write_mode(&paths.clash, render_clash_yaml(n), 0o644).context("write clash yaml")?;
+    atomic_write_mode(&paths.v2ray_txt, render_v2ray_txt(n), 0o644).context("write v2ray txt")?;
+    atomic_write_mode(&paths.v2ray_b64, render_v2ray_b64(n), 0o644).context("write v2ray b64")?;
     paths.save_state(state)
 }
 
@@ -600,28 +663,46 @@ pub fn run(args: ProvisionArgs) -> Result<()> {
     let rendered = render_config(&n)?;
     let scratch = args.config_dir.join("config.json.new");
     let scratch_str = scratch.to_string_lossy().to_string();
-    std::fs::write(&scratch, &rendered).context("write scratch config")?;
+    atomic_write(&scratch, &rendered).context("write scratch config")?;
     if let Err(e) = run_cmd(SINGBOX_BIN, &["check", "-c", &scratch_str]) {
         let _ = std::fs::remove_file(&scratch);
         return Err(e.context("sing-box refused the rendered config; nothing was changed"));
     }
-    std::fs::rename(&scratch, &config_path).context("replace sing-box config")?;
-
     let state = PathBuf::from(SUB_STATE);
     if let Some(parent) = state.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
     let paths = SubscriptionPaths::resolve(&args.sub_dir, &state)?;
-    write_subscriptions(&n, &paths, &state)?;
-
     // 用包自带的单元；不写自己的 unit。
     if !Path::new(PACKAGE_UNIT).exists() {
         anyhow::bail!("{PACKAGE_UNIT} not found; is sing-box installed from the package?");
     }
     run_cmd("systemctl", &["daemon-reload"])?;
-    run_cmd("systemctl", &["enable", "sing-box"])?;
-    run_cmd("systemctl", &["restart", "sing-box"])?;
-    run_cmd("systemctl", &["is-active", "--quiet", "sing-box"])?;
+    let was_active = run_cmd("systemctl", &["is-active", "--quiet", "sing-box"]).is_ok();
+    let was_enabled = run_cmd("systemctl", &["is-enabled", "--quiet", "sing-box"]).is_ok();
+    let snapshot =
+        FileSnapshot::capture(&[&config_path, &paths.clash, &paths.v2ray_txt, &paths.v2ray_b64, &state])?;
+    std::fs::rename(&scratch, &config_path).context("replace sing-box config")?;
+    let activate = (|| -> Result<()> {
+        run_cmd("systemctl", &["enable", "sing-box"])?;
+        run_cmd("systemctl", &["restart", "sing-box"])?;
+        run_cmd("systemctl", &["is-active", "--quiet", "sing-box"])?;
+        write_subscriptions(&n, &paths, &state)
+    })();
+    if let Err(error) = activate {
+        snapshot.restore().context("deployment failed and restoring previous files also failed")?;
+        if was_active {
+            run_cmd("systemctl", &["restart", "sing-box"])
+                .context("previous files restored but previous service could not restart")?;
+            run_cmd("systemctl", &["is-active", "--quiet", "sing-box"])?;
+        } else {
+            run_cmd("systemctl", &["stop", "sing-box"])?;
+        }
+        if !was_enabled {
+            run_cmd("systemctl", &["disable", "sing-box"])?;
+        }
+        return Err(error.context("deployment failed; previous files and service restored"));
+    }
 
     // 交给安装器回填面板。安装器已是 root 且在本地。
     println!("{}", render_report(&n, &paths, &args.sub_base, reused));
@@ -657,6 +738,22 @@ pub fn render_report(n: &Node, paths: &SubscriptionPaths, sub_base: &str, reused
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_publication_restores_previous_and_removes_new_files() {
+        let dir = std::env::temp_dir().join(format!("monitor-rollback-{}", super::random_hex(8).unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("existing");
+        let new = dir.join("new");
+        std::fs::write(&old, "old contents").unwrap();
+        let snapshot = super::FileSnapshot::capture(&[&old, &new]).unwrap();
+        super::atomic_write(&old, "new contents").unwrap();
+        super::atomic_write(&new, "new file").unwrap();
+        snapshot.restore().unwrap();
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "old contents");
+        assert!(!new.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     use super::*;
 
     fn sample() -> Node {

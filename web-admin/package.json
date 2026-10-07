@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "test": "node src/lib/api.test.ts",
+    "test": "node src/lib/api.test.ts && node src/lib/install-command.test.ts && node ../shared/live-stream.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {

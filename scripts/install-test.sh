@@ -560,4 +560,42 @@ check "uninstall drops it under conf.d too" "rc=0 left=0" "$got"
 got=$(drop_probe '')
 check "nothing to drop reports non-zero" "rc=1 left=0" "$got"
 
+# Transaction rollback operates only on this test's temporary files.
+(
+    ROOT="$DIR/rollback"
+    mkdir -p "$ROOT/backup"
+    SUB_BACKUP_DIR="$ROOT/backup"
+    # These settings are consumed by the installer functions extracted with eval.
+    # shellcheck disable=SC2034
+    export ENV_FILE="$ROOT/env" UNIT_FILE="$ROOT/unit" RC_FILE="$ROOT/rc"
+    # shellcheck disable=SC2034
+    export SUB_NGINX_CONF="$ROOT/nginx" SUB_UNIT="$ROOT/legacy-unit" SUB_RC="$ROOT/legacy-rc"
+    # shellcheck disable=SC2034
+    export SUB_PREV_PUBLIC=18082 SUB_PREV_PORT=18081 SUB_LEGACY_RUNNING=1 INIT=systemd
+    printf 'MONITOR_SUB_PORT=18081\nMONITOR_SUB_BIND=127.0.0.1\n' >"$SUB_BACKUP_DIR/env"
+    printf 'previous unit\n' >"$SUB_BACKUP_DIR/unit"
+    printf 'previous nginx\n' >"$SUB_BACKUP_DIR/nginx"
+    printf 'previous state\n' >"$SUB_BACKUP_DIR/agent-state"
+    printf 'broken replacement\n' >"$ENV_FILE"
+    printf 'broken nginx\n' >"$SUB_NGINX_CONF"
+    eval "$(extract restore_sub_file)"
+    eval "$(extract restore_prev_sub)"
+    sub_caps() { grep -q '^MONITOR_SUB_PORT=18081$' "$ENV_FILE" || fail 'capability chose new port'; }
+    systemctl() { return 0; }
+    restart_agent() { return 0; }
+    check_subscription() { [ "$1" = http://127.0.0.1:18082 ]; }
+    restore_prev_sub || fail 'rollback rejected restored public endpoint'
+    grep -q 'previous nginx' "$SUB_NGINX_CONF" || fail 'old nginx was lost'
+    grep -q 'previous unit' "$UNIT_FILE" || fail 'old unit was lost'
+    grep -q 'previous state' "$ROOT/subscription.json" || fail 'route map was lost'
+    check_subscription() { return 1; }
+    if restore_prev_sub; then fail 'rollback claimed success despite failed HTTP validation'; fi
+    # shellcheck disable=SC2034
+    NO_VPN=1
+    eval "$(extract configure_optional_vpn)"
+    provision_vpn() { fail '--no-vpn entered provision'; }
+    configure_optional_vpn
+    echo '  ok  rollback restores files, public port and checks real success; --no-vpn skips changes'
+)
+
 echo "install-test: ok"

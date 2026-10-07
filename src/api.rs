@@ -15,9 +15,7 @@ use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
 use crate::agent_ws::Agent;
-use crate::auth::{
-    authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
-};
+use crate::auth::{authed, client_ip, current_session, issue_session, issued_at, random_token, with_cookies};
 use crate::db::{self, Db, Node, NodePatch, PingTask, Traffic, TrafficPatch};
 use crate::{agent_ws, App, Shared};
 
@@ -1926,7 +1924,12 @@ async fn fetch_theme(
 /// The thumbnail the theme list displays, where the theme provides one; the list
 /// reports which do.
 pub async fn theme_preview(_: Admin, State(app): State<Shared>, Path(short): Path<String>) -> Response {
-    match crate::frontend::preview(&app.themes, &short) {
+    let themes = app.themes.clone();
+    let png = match tokio::task::spawn_blocking(move || crate::frontend::preview(&themes, &short)).await {
+        Ok(png) => png,
+        Err(error) => return fail(error),
+    };
+    match png {
         // Not cached: reinstalling a theme under the same name also replaces the
         // image, and this is a panel-only request for a local file.
         Some(png) => {
@@ -2012,7 +2015,7 @@ pub async fn themes(_: Admin, State(app): State<Shared>) -> Response {
             // Reads each image to answer, as serving it would: a handful of
             // themes, each image capped at 8 MiB.
             for theme in &mut themes {
-                theme.preview = crate::frontend::preview(&app.themes, &theme.short).is_some();
+                theme.preview = crate::frontend::has_preview(&app.themes, &theme.short);
             }
             Json(json!({"themes": themes})).into_response()
         }
@@ -2080,11 +2083,7 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
 
 /// Why one setting cannot be stored, or `None` when it can.
 ///
-/// Separate from the write below because every key is validated before any is
-/// written: changing the password drops every session, and a 400 raised
-/// afterwards -- on a later key, in whatever order the map iterates -- carries no
-/// Set-Cookie, signing the admin out of every device through a password change
-/// the UI reported as rejected.
+/// Validate every key before writing so an invalid request changes no settings.
 fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
     // Settings are stored as text. A caller sending the natural JSON type --
     // `{"public_page": false}`, `{"retention_days": 7}` -- is refused rather than
@@ -2111,8 +2110,7 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         "github_proxy" if !(value.is_empty() || value.starts_with("https://")) => {
             Some("GitHub 代理必须以 https:// 开头：agent 程序经它下载，再安装到每个节点".into())
         }
-        "admin_password" if value.len() < 12 => Some("密码至少 12 位".into()),
-        "admin_password" => None,
+        "admin_password" => Some("请通过修改密码接口验证旧密码后更新".into()),
         k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
         k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
         _ => Some(format!("没有这个设置项：{key}")),
@@ -2122,7 +2120,7 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
 pub async fn save_settings(
     _: Admin,
     State(app): State<Shared>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let Some(map) = body.as_object() else { return bad("设置格式不对") };
@@ -2131,26 +2129,13 @@ pub async fn save_settings(
             return bad(&message);
         }
     }
-    // Set when the password changed: the change signs every session out, and the
-    // caller receives a replacement rather than being logged out by it.
-    let mut reissued = String::new();
     for (key, value) in map {
         let value = value.as_str().unwrap_or_default();
-        if key == "admin_password" {
-            match hash_password(value).and_then(|h| {
-                app.db.replace_password(&h)?;
-                issue_session(&app, &headers)
-            }) {
-                Ok(cookie) => reissued = cookie,
-                Err(e) => return fail(e),
-            }
-            continue;
-        }
         if let Err(e) = app.db.set(key, value) {
             return fail(e);
         }
     }
-    with_cookies(Json(json!({"ok": true})), [reissued])
+    Json(json!({"ok": true})).into_response()
 }
 
 /// 修改密码：验证旧密码，设置新密码
@@ -2160,8 +2145,8 @@ pub async fn change_password(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let old_password = body.get("old_password").and_then(|v| v.as_str()).unwrap_or_default();
-    let new_password = body.get("new_password").and_then(|v| v.as_str()).unwrap_or_default();
+    let old_password = body.get("old_password").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
+    let new_password = body.get("new_password").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
 
     if new_password.len() < 12 {
         return answer(StatusCode::BAD_REQUEST, "新密码至少 12 位");
@@ -2171,16 +2156,24 @@ pub async fn change_password(
     let Some(stored) = app.db.get("admin_password_hash") else {
         return answer(StatusCode::FORBIDDEN, "没有设置密码");
     };
-    if !crate::auth::verify_password(old_password, &stored) {
-        return answer(StatusCode::UNAUTHORIZED, "旧密码错误");
-    }
+    let Some(permit) = crate::auth::password_slot() else {
+        return answer(StatusCode::TOO_MANY_REQUESTS, "密码操作正在处理，请稍后再试");
+    };
 
     // 设置新密码，其他设备登出，当前设备保持登录
-    match crate::auth::hash_password(new_password).and_then(|h| {
+    let result = crate::auth::password_task(permit, move || {
+        if !crate::auth::verify_password(&old_password, &stored) {
+            return Ok(None);
+        }
+        let h = crate::auth::hash_password(&new_password)?;
         app.db.replace_password(&h)?;
-        crate::auth::issue_session(&app, &headers)
-    }) {
-        Ok(cookie) => with_cookies(Json(json!({"ok": true})), [cookie]),
+        crate::auth::issue_session(&app, &headers).map(Some)
+    })
+    .await
+    .and_then(|result| result);
+    match result {
+        Ok(Some(cookie)) => with_cookies(Json(json!({"ok": true})), [cookie]),
+        Ok(None) => answer(StatusCode::UNAUTHORIZED, "旧密码错误"),
         Err(e) => fail(e),
     }
 }
@@ -2272,6 +2265,19 @@ pub async fn agent_traffic(State(app): State<Shared>, headers: HeaderMap) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn settings_cannot_bypass_old_password_verification() {
+        let app = std::sync::Arc::new(app());
+        let response = save_settings(
+            Admin,
+            State(app),
+            HeaderMap::new(),
+            Json(json!({"admin_password":"a-new-password-123"})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
     // Sessions remain hashed; only node tokens are stored in the clear.
     use crate::auth::sha256;
     use crate::db::{Db, Span};
@@ -3881,8 +3887,13 @@ mod tests {
         let stale = random_token();
         app.db.create_session(&sha256(&stale), Utc::now().timestamp() + 3_600).unwrap();
 
-        let body = Json(json!({"admin_password": "a-long-enough-password"}));
-        let response = save_settings(Admin, axum::extract::State(app.clone()), HeaderMap::new(), body).await;
+        app.db
+            .set("admin_password_hash", &crate::auth::hash_password("the-old-password-123").unwrap())
+            .unwrap();
+        let body =
+            Json(json!({"old_password":"the-old-password-123", "new_password": "a-long-enough-password"}));
+        let response =
+            change_password(Admin, axum::extract::State(app.clone()), HeaderMap::new(), body).await;
 
         assert!(!app.db.session_valid(&sha256(&stale)), "sessions must not outlive the old password");
 

@@ -26,6 +26,7 @@ IFACE=""
 IFACE_SET=""
 INTERVAL=""
 INSECURE=""
+INSECURE_SET=""
 UNINSTALL=""
 UPGRADE=""
 VPN_IP=""
@@ -52,13 +53,33 @@ SUB_FOREIGN=""
 SUB_PREV_PUBLIC=""
 SUB_PREV_PORT=""
 SUB_PREV_BIND=""
+SUB_PREV_STATE=""
+SUB_BACKUP_DIR=""
+SUB_LEGACY_RUNNING=""
 read_prev_sub() {
 	[ -f "$ENV_FILE" ] || return 0
 	SUB_PREV_PUBLIC=$(sed -n 's/^MONITOR_SUB_PUBLIC_PORT=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
 	SUB_PREV_PORT=$(sed -n 's/^MONITOR_SUB_PORT=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
 	SUB_PREV_BIND=$(sed -n 's/^MONITOR_SUB_BIND=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+	SUB_PREV_STATE=$(sed -n 's/^MONITOR_SUB_STATE=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+	if [ -z "$SUB_PREV_PUBLIC" ] && [ "$SUB_PREV_BIND" = 127.0.0.1 ] && [ -f "$SUB_NGINX_CONF" ]; then
+		SUB_PREV_PUBLIC=$(sed -n 's/^[[:space:]]*listen \([0-9][0-9]*\).*/\1/p' "$SUB_NGINX_CONF" | head -n 1)
+	fi
 }
 read_prev_sub
+
+save_sub_file() {
+    [ ! -f "$1" ] || cp -p "$1" "$SUB_BACKUP_DIR/$2"
+}
+
+restore_sub_file() {
+    if [ -f "$SUB_BACKUP_DIR/$2" ]; then cp -p "$SUB_BACKUP_DIR/$2" "$1"; else rm -f "$1"; fi
+}
+
+cleanup_install() {
+    [ -z "${TMP:-}" ] || rm -f "$TMP"
+    case "$SUB_BACKUP_DIR" in "$ROOT"/.subscription-backup.*) rm -rf "$SUB_BACKUP_DIR" ;; esac
+}
 
 while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
@@ -77,7 +98,8 @@ while [ $# -gt 0 ]; do
 	--vpn-ip) VPN_IP="$2"; shift 2 ;;
 	--sub-port) SUB_PORT="$2"; SUB_PORT_SET=1; shift 2 ;;
 	--no-vpn) NO_VPN=1; shift ;;
-	--insecure) INSECURE=1; shift ;;
+	--insecure) INSECURE=1; INSECURE_SET=1; shift ;;
+	--verify-tls) INSECURE=""; INSECURE_SET=1; shift ;;
 	--uninstall) UNINSTALL=1; shift ;;
 	--upgrade) UPGRADE=1; shift ;;
 	*) echo "unknown option: $1" >&2; exit 2 ;;
@@ -96,7 +118,7 @@ if [ -n "$UNINSTALL" ]; then
 	rc-service monitor-agent stop 2>/dev/null || true
 	rc-update del monitor-agent default >/dev/null 2>&1 || true
 	systemctl disable --now monitor-agent 2>/dev/null || true
-	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE"
+	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE" "$ROOT/subscription.json"
 	# 订阅现在由 agent 自己伺服，随它一起走 —— 上面那行已经删了它的环境文件，
 	# 订阅的三条配置就在里面。这里再收掉上一代那份独立服务，以及 nginx 前面
 	# 那一段：留着一条指向已删服务的 location，要等下一次 reload 才会发现。
@@ -136,7 +158,7 @@ if [ -n "$UPGRADE" ]; then
 	}
 fi
 
-[ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
+if [ -z "$SERVER" ] || { [ -z "$TOKEN" ] && [ -z "$REGISTER" ]; }; then
 	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure]" >&2
 	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS] [--vpn-ip ADDRESS]" >&2
 	echo "       install.sh --uninstall" >&2
@@ -150,7 +172,7 @@ fi
 	echo "  self-signed address or a plain HTTP one. It skips the check for this" >&2
 	echo "  download and for the agent's connection, and is remembered across upgrades" >&2
 	exit 2
-}
+fi
 # Names the node a registration creates. A token belongs to a node that already
 # has a name, which the panel changes; silently dropping the flag there would
 # read as a rename that never happened.
@@ -201,8 +223,9 @@ fi
 # without the flags the first install used, and a node that suddenly refuses its
 # hub's certificate is one that stops reporting -- which is the failure this
 # whole flag exists to avoid.
-if [ -z "$INSECURE" ]; then
+if [ -z "$INSECURE_SET" ]; then
 	INSECURE=$(sed -n 's/^MONITOR_INSECURE=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+	case "$INSECURE" in 1 | true | yes) INSECURE=1 ;; *) INSECURE="" ;; esac
 	[ -z "$INSECURE" ] || echo "keeping --insecure from the previous install"
 fi
 if [ -n "$INSECURE" ]; then SCHEME=http; else SCHEME=https; fi
@@ -327,7 +350,7 @@ esac
 # which is why none is requested here.
 URL="${SERVER%/}/agent/$ARCH"
 TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
+trap cleanup_install EXIT
 
 echo "downloading monitor-agent ($ARCH)"
 # The hub relays four downloads at once and queues the rest for 30 seconds. A
@@ -384,7 +407,7 @@ if [ -z "$TOKEN" ]; then
 	# error share one exit status under --fail. A request that got no response
 	# stops here, with curl's own message. The name travels on stdin: as an
 	# argument, one beginning with @ would be read as a file to send.
-	REPLY=$(printf '%s' "$NAME" | curl -sS --max-time 30 -w '\n%{http_code}' -H "Authorization: Bearer $REGISTER" \
+	REPLY=$(printf '%s' "$NAME" | curl -sS $CURL_INSECURE --max-time 30 -w '\n%{http_code}' -H "Authorization: Bearer $REGISTER" \
 		-H "X-Node-Token: $HELD" --data-binary @- "${SERVER%/}/api/agent/register") || exit 1
 	CODE=$(printf '%s\n' "$REPLY" | tail -n 1)
 	TOKEN=$(printf '%s\n' "$REPLY" | sed '$d')
@@ -426,6 +449,21 @@ else
 	}
 fi
 install -d -m 0755 "$ROOT"
+SUB_BACKUP_DIR=$(mktemp -d "$ROOT/.subscription-backup.XXXXXX")
+save_sub_file "$ENV_FILE" env
+save_sub_file "$ROOT/subscription.json" agent-state
+save_sub_file "$UNIT_FILE" unit
+save_sub_file "$RC_FILE" rc
+save_sub_file "$SUB_NGINX_CONF" nginx
+save_sub_file "$SUB_UNIT" legacy-unit
+save_sub_file "$SUB_RC" legacy-rc
+if [ -f "$SUB_HOME/env" ]; then
+    if [ "$INIT" = openrc ]; then
+        rc-service sub-dynamic status >/dev/null 2>&1 && SUB_LEGACY_RUNNING=1 || true
+    else
+        systemctl is-active --quiet sub-dynamic 2>/dev/null && SUB_LEGACY_RUNNING=1 || true
+    fi
+fi
 # Kept until the new binary has proved it starts; see not_started. Never over
 # an existing copy: a run that died before that check left an unproven binary
 # in $BIN, and the copy is the one that ran before it.
@@ -448,6 +486,11 @@ ENV
 	# to reach it at all. Written here rather than in the unit so it stays out of
 	# `systemctl cat`.
 	[ -z "$INSECURE" ] || printf 'MONITOR_INSECURE=1\n' >>"$ENV_FILE"
+	# Keep the old listener until a new subscription plan has passed validation.
+	[ -z "$SUB_PREV_BIND" ] || printf 'MONITOR_SUB_BIND=%s\n' "$SUB_PREV_BIND" >>"$ENV_FILE"
+	[ -z "$SUB_PREV_PORT" ] || printf 'MONITOR_SUB_PORT=%s\n' "$SUB_PREV_PORT" >>"$ENV_FILE"
+	[ -z "$SUB_PREV_PUBLIC" ] || printf 'MONITOR_SUB_PUBLIC_PORT=%s\n' "$SUB_PREV_PUBLIC" >>"$ENV_FILE"
+	[ -z "$SUB_PREV_STATE" ] || printf 'MONITOR_SUB_STATE=%s\n' "$SUB_PREV_STATE" >>"$ENV_FILE"
 )
 
 # The new agent is not running. The binary it replaced is put back and started
@@ -458,9 +501,13 @@ not_started() {
 	echo "monitor-agent did not start; see: $1" >&2
 	[ -f "$BIN.old" ] || exit 1
 	mv -f "$BIN.old" "$BIN"
+	restore_sub_file "$ENV_FILE" env
+	restore_sub_file "$UNIT_FILE" unit
+	restore_sub_file "$RC_FILE" rc
 	if [ "$INIT" = openrc ]; then
 		rc-service monitor-agent restart >/dev/null 2>&1 || true
 	else
+		systemctl daemon-reload
 		systemctl restart monitor-agent || true
 	fi
 	echo "the previous monitor-agent binary is back in place and was restarted" >&2
@@ -474,6 +521,7 @@ not_started() {
 # Failure is not fatal. The machine is already reporting by this point, and
 # `provision` is idempotent -- it reuses the credentials in an existing config --
 # so a rerun is the fix rather than a reinstall.
+VPN_JSON=""
 provision_vpn() {
 	[ -z "$NO_VPN" ] || { echo "skipping VPN setup (--no-vpn)"; return 0; }
 	# 订阅 URL 要指向订阅伺服真正在听的那个端口，所以端口先定下来。
@@ -485,7 +533,7 @@ provision_vpn() {
 	"" | *[!0-9.]*)
 		echo "warning: could not determine this machine's public address" >&2
 		echo "         VPN setup skipped; re-run with --upgrade --vpn-ip ADDRESS" >&2
-		return 0
+		return 1
 		;;
 	esac
 	# The certificate's CN follows the name clients actually send, so a hub reached
@@ -508,12 +556,17 @@ provision_vpn() {
 	if ! VPN_JSON=$("$BIN" "$@"); then
 		echo "warning: VPN setup failed; this machine still reports as a node" >&2
 		echo "         re-run with: --upgrade --vpn-ip $VPN_IP" >&2
-		return 0
+		return 1
 	fi
+    return 0
+}
+
+report_vpn() {
+    [ -n "$VPN_JSON" ] || return 0
 	# The links live in the panel, which is where they are shown and kept. A refusal
 	# here would leave the node serving traffic it cannot display, so it is said out
 	# loud rather than swallowed.
-	CODE=$(printf '%s' "$VPN_JSON" | curl -sS --max-time 30 -w '%{http_code}' -o /dev/null \
+	CODE=$(printf '%s' "$VPN_JSON" | curl -sS $CURL_INSECURE --max-time 30 -w '%{http_code}' -o /dev/null \
 		-X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
 		--data-binary @- "${SERVER%/}/api/agent/vpn" 2>/dev/null) || CODE=000
 	[ "$CODE" = 200 ] ||
@@ -583,7 +636,11 @@ foreign_sub_server() {
 # 跑这个二进制都能绑低端口，所以顺带把可执行权限收到 root 与 agent 所在的组 ——
 # 这样那个能力就只有它们够得着。
 grant_bind_capability() {
-	[ -n "$SUB_CAPS" ] || return 0
+	if [ -z "$SUB_CAPS" ]; then
+		command -v setcap >/dev/null 2>&1 && setcap -r "$BIN" 2>/dev/null || true
+		chmod 0755 "$BIN"
+		return 0
+	fi
 	command -v setcap >/dev/null 2>&1 || {
 		echo "warning: no setcap, so a non-root agent cannot bind port $SUB_PORT" >&2
 		echo "         install libcap (or re-run with --sub-port 8080) and try again" >&2
@@ -683,6 +740,7 @@ NAMES
 #   80 上是 nginx    → agent 绑回环 $SUB_BACKEND，nginx 转过来；agent 不开公网端口
 #   80 被别人占着    → 退到 8080
 setup_subscription() {
+	[ -z "$NO_VPN" ] || return 0
 	# --no-vpn 没有订阅可伺服；没写过订阅也一样。
 	[ -f "$SUB_STATE" ] || return 0
 	# 别人已经在这个端口上伺服同一批文件（手工装的那份）—— 不接管。
@@ -692,6 +750,11 @@ setup_subscription() {
 		echo "      leaving it alone; the agent will not serve it" >&2
 		return 0
 	fi
+	# Keep sing-box's directory private. The agent reads its own route map.
+	cp "$SUB_STATE" "$ROOT/subscription.json.new"
+	chown root:monitor-agent "$ROOT/subscription.json.new"
+	chmod 0640 "$ROOT/subscription.json.new"
+	mv -f "$ROOT/subscription.json.new" "$ROOT/subscription.json"
 
 	bind="0.0.0.0"
 	served="$SUB_PORT"
@@ -701,6 +764,7 @@ setup_subscription() {
 	fi
 
 	# 单元里的能力是按端口算的，而端口比写单元晚定 —— 所以按最终结论再写一次。
+	write_sub_env "$bind" "$served"
 	sub_caps
 	if [ "$INIT" = openrc ]; then
 		grant_bind_capability
@@ -709,8 +773,10 @@ setup_subscription() {
 		systemctl daemon-reload
 	fi
 
-	write_sub_env "$bind" "$served"
-	retire_legacy_sub_service
+	if [ -n "$SUB_LEGACY_RUNNING" ]; then
+		if [ "$INIT" = openrc ]; then rc-service sub-dynamic stop >/dev/null 2>&1 || true;
+		else systemctl stop sub-dynamic >/dev/null 2>&1 || true; fi
+	fi
 	restart_agent
 	if [ -n "$SUB_VIA_NGINX" ]; then
 		if [ "$INIT" = openrc ]; then
@@ -730,6 +796,8 @@ setup_subscription() {
 	if ! listening "$served"; then
 		echo "warning: nothing is listening on port $served, so the subscription is not being served" >&2
 		echo "         see: journalctl -u monitor-agent -n 20" >&2
+		VPN_JSON=""
+		restore_prev_sub || true
 		return 1
 	fi
 
@@ -740,6 +808,7 @@ setup_subscription() {
 	#
 	# 验的是**对外**那个地址，不是 agent 绑的那个：走 nginx 时后者只覆盖一半链路。
 	if check_subscription "http://127.0.0.1:$SUB_PORT"; then
+		retire_legacy_sub_service
 		if [ -n "$SUB_VIA_NGINX" ]; then
 			echo "subscription served by monitor-agent on port $SUB_PORT through nginx"
 		else
@@ -749,6 +818,7 @@ setup_subscription() {
 	fi
 
 	echo "warning: the subscription could not be fetched on port $SUB_PORT" >&2
+	VPN_JSON=""
 	restore_prev_sub || {
 		echo "         there is no previous configuration to go back to" >&2
 		echo "         see: journalctl -u monitor-agent -n 20" >&2
@@ -763,36 +833,28 @@ setup_subscription() {
 #
 # 没有上一轮（首次安装）就什么都不做并报失败，让调用方把话说清楚。
 restore_prev_sub() {
-	[ -n "$SUB_PREV_PUBLIC$SUB_PREV_PORT" ] || return 1
-	# nginx 那份 vhost 要是还在（这一轮 nginx 收了新配置，备份已删），得按旧端口
-	# 重写 —— 否则旧的回环端口配着新的对外端口，等于两边都不对。
-	if [ -f "$SUB_NGINX_CONF" ]; then
-		rm -f "$SUB_NGINX_CONF"
-		SUB_PORT="${SUB_PREV_PUBLIC:-$SUB_PREV_PORT}"
-		SUB_VIA_NGINX=""
-		if nginx_usable && nginx_holds "$SUB_PORT"; then
-			SUB_VIA_NGINX=1
-			rc=0
-			write_sub_nginx || rc=$?
-			[ "$rc" != 1 ] || {
-				SUB_VIA_NGINX=""
-				SUB_PORT="8080"
-			}
-		fi
-		if [ "$INIT" = openrc ]; then
-			rc-service nginx reload >/dev/null 2>&1 || true
-		else
-			systemctl reload nginx 2>/dev/null || true
-		fi
-	fi
-	bind="0.0.0.0"
-	served="$SUB_PORT"
-	[ -z "$SUB_VIA_NGINX" ] || {
-		bind="127.0.0.1"
-		served="$SUB_BACKEND"
-	}
-	write_sub_env "$bind" "$served"
-	restart_agent
+    [ -n "$SUB_BACKUP_DIR" ] && [ -f "$SUB_BACKUP_DIR/env" ] || return 1
+    restore_sub_file "$ENV_FILE" env
+    restore_sub_file "$ROOT/subscription.json" agent-state
+    restore_sub_file "$UNIT_FILE" unit
+    restore_sub_file "$RC_FILE" rc
+    restore_sub_file "$SUB_NGINX_CONF" nginx
+    restore_sub_file "$SUB_UNIT" legacy-unit
+    restore_sub_file "$SUB_RC" legacy-rc
+    SUB_PORT="${SUB_PREV_PUBLIC:-$SUB_PREV_PORT}"
+    sub_caps
+    if [ "$INIT" = openrc ]; then
+        grant_bind_capability
+        rc-service nginx reload >/dev/null 2>&1 || true
+        [ -z "$SUB_LEGACY_RUNNING" ] || rc-service sub-dynamic start >/dev/null 2>&1 || return 1
+    else
+        systemctl daemon-reload
+        systemctl reload nginx 2>/dev/null || true
+        [ -z "$SUB_LEGACY_RUNNING" ] || systemctl start sub-dynamic >/dev/null 2>&1 || return 1
+    fi
+    restart_agent
+    case "$SUB_PORT" in "" | *[!0-9]*) return 1 ;; esac
+    check_subscription "http://127.0.0.1:$SUB_PORT"
 }
 
 # 让 nginx 把订阅路径转到我们的回环端口。写成一个独立文件，不动别人的站点。
@@ -871,7 +933,7 @@ write_sub_env() {
 		printf 'MONITOR_SUB_PUBLIC_PORT=%s
 ' "$SUB_PORT"
 		printf 'MONITOR_SUB_STATE=%s
-' "$SUB_STATE"
+' "$ROOT/subscription.json"
 	} >>"$ENV_FILE"
 }
 
@@ -988,13 +1050,23 @@ pick_sub_port() {
 # 走 nginx 时不绑低端口，这里就是空的 —— 能力不白给。
 sub_caps() {
 	SUB_CAPS=""
-	case "$SUB_PORT" in
+	bound=$(sed -n 's/^MONITOR_SUB_PORT=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+	case "$bound" in
 	"" | *[!0-9]*) return 0 ;;
 	esac
-	[ -z "$SUB_VIA_NGINX" ] || return 0
-	[ "$SUB_PORT" -lt 1024 ] || return 0
+	[ "$bound" -lt 1024 ] || return 0
 	SUB_CAPS="AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
+}
+
+configure_optional_vpn() {
+    [ -z "$NO_VPN" ] || { echo "keeping existing subscription settings (--no-vpn)"; return 0; }
+    if ! provision_vpn; then
+        echo "warning: monitoring is installed; VPN setup did not complete" >&2
+        return 0
+    fi
+    if setup_subscription; then report_vpn;
+    else echo "warning: monitoring is installed; subscription setup failed" >&2; fi
 }
 
 # agent 的单元。抽成函数是因为订阅那边可能还要再写一次：绑 80 需要能力，而那是
@@ -1064,6 +1136,8 @@ start_pre() {
 RC
 	chmod 0755 "$RC_FILE"
 	rc-update add monitor-agent default >/dev/null
+	sub_caps
+	grant_bind_capability
 	rc-service monitor-agent restart
 	# supervise-daemon reports the service started while it respawns an agent
 	# that exits at once, so the process itself is what is looked for, inside
@@ -1072,10 +1146,9 @@ RC
 	sleep 3
 	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
 	rm -f "$BIN.old"
-	provision_vpn
 	# 订阅装不上不算安装失败：agent 已经在报数了，而它自己会记一条警告继续跑。
 	# `set -e` 下裸调用会把「已装好」变成一次失败退出，把真正的问题盖过去。
-	setup_subscription || true
+	configure_optional_vpn
 	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
 	exit 0
 fi
@@ -1098,6 +1171,5 @@ systemctl restart monitor-agent
 sleep 3
 systemctl is-active --quiet monitor-agent || not_started "journalctl -u monitor-agent -n 20"
 rm -f "$BIN.old"
-provision_vpn
-setup_subscription || true
+configure_optional_vpn
 echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"

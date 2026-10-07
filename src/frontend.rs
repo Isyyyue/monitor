@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode, Uri};
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -85,7 +85,7 @@ pub const DOWNLOADABLE: &[Downloadable] = &[Downloadable {
     url: "https://github.com/Isyyyue/monitor/releases/latest/download/theme-miku.tar.gz",
 }];
 
-pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> Response {
+pub async fn serve(State(app): State<Shared>, headers: HeaderMap, method: Method, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let known = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
     if is_api_path(path) {
@@ -99,7 +99,7 @@ pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> R
 
     let theme = app.db.get("theme").unwrap_or_default();
     if let Some(root) = external_theme(&app.themes, &theme) {
-        if let Some(response) = disk(&root, path, known) {
+        if let Some(response) = disk(&root, path, &headers, &method).await {
             return response;
         }
     }
@@ -133,17 +133,17 @@ fn embedded<T: RustEmbed>(requested: &str, remedy: &str, known: Option<&str>) ->
     }
 }
 
-fn disk(root: &Path, requested: &str, known: Option<&str>) -> Option<Response> {
+async fn disk(root: &Path, requested: &str, headers: &HeaderMap, method: &Method) -> Option<Response> {
     let path = if requested.is_empty() { "index.html" } else { requested };
-    if let Some(data) = read_inside(root, path) {
-        return Some(asset(path, data, known));
+    if let Some(response) = crate::assets::serve(root, path, headers, method).await {
+        return Some(response);
     }
     // None rather than a 404: an external theme lacking the file defers to the
     // built-in one, which issues the refusal.
     if is_asset(path) {
         return None;
     }
-    read_inside(root, "index.html").map(|data| asset("index.html", data, known))
+    crate::assets::serve(root, "index.html", headers, method).await
 }
 
 /// Serves one file with the caching policy its path warrants.
@@ -493,6 +493,20 @@ pub fn preview(themes: &Path, short: &str) -> Option<Vec<u8>> {
         return (meta.len() <= MAX_FILE).then(|| read_inside(&root, PREVIEW)).flatten();
     }
     None
+}
+
+pub fn has_preview(themes: &Path, short: &str) -> bool {
+    if !valid_short(short) {
+        return false;
+    }
+    let root = themes.join(short);
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    let Ok(path) = root.join(PREVIEW).canonicalize() else {
+        return false;
+    };
+    path.starts_with(&root) && fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_FILE)
 }
 
 const PREVIEW: &str = "preview.png";

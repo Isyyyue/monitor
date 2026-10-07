@@ -28,7 +28,15 @@ struct Server {
     token: String,
     client: reqwest::Client,
     /// 串行化取数，并留一个短缓存；取不到就是 `None`，那时**不发这个头**。
-    traffic: tokio::sync::Mutex<Option<(std::time::Instant, Option<String>)>>,
+    traffic: tokio::sync::Mutex<TrafficCache>,
+    refreshed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct TrafficCache {
+    at: Option<std::time::Instant>,
+    value: Option<String>,
+    fetching: bool,
 }
 
 #[derive(Deserialize)]
@@ -55,37 +63,53 @@ fn userinfo(t: &Traffic) -> String {
 }
 
 impl Server {
-    async fn header(&self) -> Option<String> {
+    async fn header(self: &Arc<Self>) -> Option<String> {
+        let ready = self.refreshed.notified();
+        tokio::pin!(ready);
+        ready.as_mut().enable();
         let mut cache = self.traffic.lock().await;
-        if let Some((at, value)) = &*cache {
-            if at.elapsed() < CACHE {
-                return value.clone();
-            }
+        if cache.at.is_some_and(|at| at.elapsed() < CACHE) {
+            return cache.value.clone();
         }
-        let value = async {
-            self.client
-                .get(&self.traffic_url)
-                .bearer_auth(&self.token)
-                .send()
-                .await
-                .ok()?
-                .error_for_status()
-                .ok()?
-                .json::<Traffic>()
-                .await
-                .ok()
-                .map(|t| userinfo(&t))
+        if !cache.fetching {
+            cache.fetching = true;
+            let server = Arc::clone(self);
+            // The task outlives a cancelled HTTP request and always clears the
+            // in-flight flag. Other clients wait for the same bounded refresh.
+            tokio::spawn(async move {
+                let value = server.fetch_header().await;
+                let mut cache = server.traffic.lock().await;
+                cache.value = value;
+                cache.at = Some(std::time::Instant::now());
+                cache.fetching = false;
+                drop(cache);
+                server.refreshed.notify_waiters();
+            });
         }
-        .await;
-        *cache = Some((std::time::Instant::now(), value.clone()));
-        value
+        drop(cache);
+        let _ = tokio::time::timeout(Duration::from_millis(1200), ready).await;
+        let cache = self.traffic.lock().await;
+        cache.at.filter(|at| at.elapsed() < CACHE).and_then(|_| cache.value.clone())
+    }
+
+    async fn fetch_header(&self) -> Option<String> {
+        self.client
+            .get(&self.traffic_url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json::<Traffic>()
+            .await
+            .ok()
+            .map(|t| userinfo(&t))
     }
 }
 
 async fn serve(State(server): State<Arc<Server>>, uri: Uri) -> Response {
-    // 每次请求都重读状态文件：`provision` 每次重跑都会换一个随机文件名，缓存过或
-    // 写死的名字会让每次抓取都变成 404 —— 而客户端把 404 显示成「卡片上少了那一行」，
-    // 不会报错。
+    // 每次请求重读状态文件，使重新部署后的路径立即生效。
     let routes = match tokio::fs::read(&server.state)
         .await
         .ok()
@@ -129,7 +153,7 @@ async fn serve(State(server): State<Arc<Server>>, uri: Uri) -> Response {
 ///
 /// 起不来**不致命**：调用方只记一条警告，监控照常。订阅和监控是两件事，一个坏了
 /// 不该把另一个带走。
-pub async fn start(server: &str, token: &str) -> Result<()> {
+pub async fn start(server: &str, token: &str, insecure: bool) -> Result<()> {
     let Some(port) = std::env::var("MONITOR_SUB_PORT").ok().filter(|p| !p.is_empty()) else {
         return Ok(());
     };
@@ -167,11 +191,13 @@ pub async fn start(server: &str, token: &str) -> Result<()> {
         traffic_url: url.into(),
         token: token.to_owned(),
         client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(1))
+            .danger_accept_invalid_certs(insecure)
             // 取数不该跟着跳转走：地址是我们自己拼的，跳转只可能是被中间人改过。
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
-        traffic: tokio::sync::Mutex::new(None),
+        traffic: tokio::sync::Mutex::new(TrafficCache::default()),
+        refreshed: tokio::sync::Notify::new(),
     });
     tokio::spawn(async move {
         let app = Router::new().fallback(axum::routing::get(serve)).with_state(server);
@@ -185,6 +211,60 @@ pub async fn start(server: &str, token: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn concurrent_clients_share_one_bounded_refresh() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        "{\"month_tx\":12,\"month_rx\":34,\"traffic_limit\":100,\"expires_at\":null}",
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let server = Arc::new(Server {
+            state: PathBuf::new(),
+            traffic_url: format!("http://{address}/"),
+            token: "test".into(),
+            client: reqwest::Client::builder().timeout(Duration::from_secs(1)).build().unwrap(),
+            traffic: tokio::sync::Mutex::new(TrafficCache::default()),
+            refreshed: tokio::sync::Notify::new(),
+        });
+        let (first, second) = tokio::join!(server.header(), server.header());
+        assert_eq!(first, Some("upload=12; download=34; total=100; expire=0".into()));
+        assert_eq!(first, second);
+        assert_eq!(server.header().await, first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unresponsive_hub_cannot_hold_subscription_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = Arc::new(Server {
+            state: PathBuf::new(),
+            traffic_url: format!("http://{address}/"),
+            token: "test".into(),
+            client: reqwest::Client::builder().timeout(Duration::from_secs(1)).build().unwrap(),
+            traffic: tokio::sync::Mutex::new(TrafficCache::default()),
+            refreshed: tokio::sync::Notify::new(),
+        });
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), server.header()).await.unwrap(), None);
+        assert!(!server.traffic.lock().await.fetching);
+    }
 
     /// 头的字节要和线上那两台一模一样：客户端按这个顺序解析，错一位就整行不显示。
     #[test]

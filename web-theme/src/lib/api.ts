@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react"
+import { connectLive } from "../../../shared/live-stream.ts"
 
 export type Metrics = {
   uptime: number
@@ -117,10 +118,10 @@ const TIMEOUT = 20_000
  */
 const RETRIES = 6
 
-export async function api<T>(path: string): Promise<T> {
+export async function api<T>(path: string, options?: { signal?: AbortSignal }): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     try {
-      const res = await fetch(`/api${path}`, { signal: AbortSignal.timeout(TIMEOUT) })
+      const res = await fetch(`/api${path}`, { signal: options?.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(TIMEOUT)]) : AbortSignal.timeout(TIMEOUT) })
       if (!res.ok) throw await failure(res)
       if (res.status === 204) return undefined as T
       // A 200 carrying HTML is a proxy's page, not the hub's JSON.
@@ -128,6 +129,7 @@ export async function api<T>(path: string): Promise<T> {
         throw e instanceof SyntaxError ? new ApiError(res.status, "收到的不是状态数据，稍后再试") : e
       })
     } catch (e) {
+      if (options?.signal?.aborted) throw e
       if (e instanceof ApiError) throw e
       // Anything else failed on the network, the body's read included, where
       // the timeout also applies. Chrome names a timeout before the response
@@ -213,136 +215,24 @@ export function useNodes() {
   const [closed, setClosed] = useState(false)
 
   useEffect(() => {
-    let socket: WebSocket | null = null
-    let poll: ReturnType<typeof setInterval> | null = null
-    let retry: ReturnType<typeof setTimeout> | null = null
-    let silent: ReturnType<typeof setTimeout> | null = null
-
-    // Set by `resume`. The throughput line is drawn by position, one point per
-    // push, so the samples from before the page was hidden, or the stream went
-    // silent, would join the new ones as if no time had passed in between. They
-    // are dropped on the first arrival rather than at once, which would read as
-    // 0 B/s beside figures that are merely stale.
     let gap = false
-    const receive = (list: Node[]) => {
-      const safe = safeNodes(list)
-      if (gap) speedHistory.clear()
-      gap = false
-      sample(safe)
-      setNodes(safe)
-      setError(null)
-      setClosed(false)
-    }
-
-    // Bumped by `pause`: a request started before the page was hidden may fail
-    // or land after a fresh one, and neither result describes the page now.
-    let epoch = 0
-    const fetchOnce = () => {
-      const started = epoch
-      return api<{ nodes: Node[] }>("/nodes")
-        .then((d) => {
-          if (started === epoch) receive(d.nodes)
-        })
-        .catch((e: Error) => {
-          if (started !== epoch) return
-          // A request lost on a dead pooled connection says nothing of an open
-          // stream, whose own watchdog reports it going quiet.
-          if (e instanceof ApiError && e.status === 0 && socket?.readyState === WebSocket.OPEN) return
-          setError(e.message)
-          if (e instanceof ApiError && e.status === 401) setClosed(true)
-        })
-    }
-
-    const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/ws${GZIP}`
-    // A hub restart closes every stream. Without reconnecting, a page that
-    // outlives a deploy would remain on the fallback poll for the rest of its
-    // life, refreshing every 5 seconds rather than 2 with no indication.
-    const connect = () => {
-      let opened: WebSocket
-      try {
-        opened = new WebSocket(url)
-      } catch {
-        poll ??= setInterval(fetchOnce, 5000)
-        return
-      }
-      socket = opened
-      // Re-armed by every frame read. Five of the hub's two-second pushes without one
-      // mean the connection died without closing, as when a NAT on the path
-      // forgets it or the hub's machine drops off the network; the browser sends
-      // nothing on it and would notice only when TCP keepalive gives up, 450 s
-      // later in Chrome. The stream is replaced rather
-      // than closed and awaited: on a dead connection the close event arrives
-      // only after the 60 s closing handshake times out. The notice stays until
-      // data arrives, since with no network the fetch started alongside may hang
-      // rather than fail.
-      const watch = () => {
-        if (silent) clearTimeout(silent)
-        silent = setTimeout(() => {
-          setError("实时数据中断，正在重新连接")
-          resume()
-        }, 10_000)
-      }
-      watch()
-      // In arrival order: a gzipped frame decodes asynchronously, and one that
-      // finishes after this stream closed or was replaced describes nothing
-      // current. Only a frame that reads re-arms the watchdog, so a stream whose
-      // frames cannot be read counts as silent and is replaced.
-      let decoded = Promise.resolve()
-      opened.onmessage = (event) => {
-        decoded = decoded
-          .then(async () => {
-            const nodes = JSON.parse(await frameText(event.data)).nodes
-            if (opened.readyState !== WebSocket.OPEN) return
-            watch()
-            receive(nodes)
-            // The stream has returned; the poll was only covering for it.
-            if (poll) {
-              clearInterval(poll)
-              poll = null
-            }
-          })
-          .catch((e) => console.warn("live frame dropped:", e))
-      }
-      opened.onerror = () => opened.close()
-      opened.onclose = () => {
-        if (silent) clearTimeout(silent)
-        poll ??= setInterval(fetchOnce, 5000)
-        retry = setTimeout(connect, 5000)
-      }
-    }
-
-    // A phone suspends a page it sends to the background and drops its
-    // connections without telling it. Back in front, the socket may still read
-    // as open while nothing arrives, or close and wait out the retry, either
-    // way leaving the figures from before; a request caught in flight fails.
-    // So a hidden page lets go of the stream and starts nothing, and a visible
-    // one fetches at once and opens a fresh stream.
-    const pause = () => {
-      epoch++
-      if (socket) {
-        socket.onclose = null
-        socket.close()
-        socket = null
-      }
-      if (poll) clearInterval(poll)
-      if (retry) clearTimeout(retry)
-      if (silent) clearTimeout(silent)
-      poll = retry = silent = null
-    }
-    const resume = () => {
-      pause()
-      gap = true
-      fetchOnce()
-      connect()
-    }
-    const visibility = () => (document.hidden ? pause() : resume())
-    document.addEventListener("visibilitychange", visibility)
-    resume()
-
-    return () => {
-      document.removeEventListener("visibilitychange", visibility)
-      pause()
-    }
+    return connectLive<{ nodes: Node[] }>({
+      url: `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/ws${GZIP}`,
+      fetch: (signal) => api("/nodes", { signal }),
+      decode: async (data) => {
+        const frame = JSON.parse(await frameText(data as string | Blob))
+        if (!Array.isArray(frame.nodes)) throw new Error("实时数据格式不正确")
+        return frame
+      },
+      gap: () => { gap = true },
+      receive: ({ nodes }) => {
+        const safe = safeNodes(nodes)
+        if (gap) speedHistory.clear()
+        gap = false
+        sample(safe); setNodes(safe); setError(null); setClosed(false)
+      },
+      error: (error) => { setError((error as Error).message); if (error instanceof ApiError && error.status === 401) setClosed(true) },
+    })
   }, [])
 
   return { nodes, error, closed }

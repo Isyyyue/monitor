@@ -26,6 +26,7 @@ macro_rules! refuse {
 
 mod agent_ws;
 mod api;
+mod assets;
 mod auth;
 mod db;
 mod frontend;
@@ -926,7 +927,14 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_api_path_is_a_404_not_the_single_page_app() {
         let app = Arc::new(app("http://localhost:8080"));
-        let spa = |p: &str| frontend::serve(State(app.clone()), HeaderMap::new(), p.parse::<Uri>().unwrap());
+        let spa = |p: &str| {
+            frontend::serve(
+                State(app.clone()),
+                HeaderMap::new(),
+                axum::http::Method::GET,
+                p.parse::<Uri>().unwrap(),
+            )
+        };
 
         // The case that would conceal a misconfigured OAuth callback.
         assert_eq!(spa("/api/oauth_callback?code=x").await.status(), StatusCode::NOT_FOUND);
@@ -947,7 +955,14 @@ mod tests {
     #[tokio::test]
     async fn a_missing_hashed_asset_is_a_404_not_the_single_page_app() {
         let app = Arc::new(app("http://localhost:8080"));
-        let spa = |p: &str| frontend::serve(State(app.clone()), HeaderMap::new(), p.parse::<Uri>().unwrap());
+        let spa = |p: &str| {
+            frontend::serve(
+                State(app.clone()),
+                HeaderMap::new(),
+                axum::http::Method::GET,
+                p.parse::<Uri>().unwrap(),
+            )
+        };
 
         assert_eq!(spa("/assets/index-STALE.js").await.status(), StatusCode::NOT_FOUND);
         assert_eq!(spa("/admin/assets/index-STALE.js").await.status(), StatusCode::NOT_FOUND);
