@@ -151,6 +151,20 @@ async fn install_script() -> Response {
     ([(header::CONTENT_TYPE, "text/x-shellscript")], include_str!("../install.sh")).into_response()
 }
 
+/// The latency prober, fetched by the installer alongside itself.
+///
+/// It ships in the binary for the same reason `install.sh` does: this repository
+/// has no external dependencies at install time, so a node must be able to get
+/// every file it needs from the hub it is already talking to. Serving it from
+/// GitHub instead would put a second network and a second failure mode between a
+/// fresh machine and a working panel.
+///
+/// `.gitattributes` marks `probe/*.py` linguist-vendored, so this does not put
+/// Python back on the repository's language bar.
+async fn probe_script() -> Response {
+    ([(header::CONTENT_TYPE, "text/x-python")], include_str!("../probe/probe.py")).into_response()
+}
+
 /// Where the hub fetches an agent release, behind the panel's GitHub proxy when
 /// one is configured. The proxy belongs to the hub rather than to each install
 /// command: a hub that cannot reach github.com cannot relay to any node, so the
@@ -308,6 +322,15 @@ struct Args {
     listen_defaulted: bool,
     database: String,
     site: String,
+    /// True when the panel is reached through the self-signed certificate
+    /// `install-hub.sh --https` puts in front of it. Recorded so the panel can
+    /// turn on `--insecure` by itself: the operator told the installer once, and
+    /// asking again at every install command is the same question twice.
+    ///
+    /// Not inferred from the address. An IP address can carry a public
+    /// certificate, and a domain can carry a self-signed one, so the shape of
+    /// `--site` says nothing about who signed what.
+    self_signed: bool,
     themes: PathBuf,
     reset_password: bool,
     /// `Some(name)` when `--add-local-node` was given.
@@ -333,6 +356,7 @@ fn parse_args() -> Result<Args> {
     let mut listen = None;
     let mut database = "monitor.db".to_owned();
     let mut site = String::new();
+    let mut self_signed = false;
     let mut themes = None;
     let mut reset_password = false;
     let mut add_local_node = None;
@@ -343,6 +367,7 @@ fn parse_args() -> Result<Args> {
             "--listen" => listen = Some(value()),
             "--db" => database = value(),
             "--site" => site = value(),
+            "--self-signed" => self_signed = true,
             "--themes" => themes = Some(PathBuf::from(value())),
             "--reset-password" => reset_password = true,
             "--add-local-node" => add_local_node = Some(value()),
@@ -364,6 +389,11 @@ fn parse_args() -> Result<Args> {
                      which adds no node without it; and where the proxy sends no\n\
                      X-Forwarded-Proto, since it then sets the session cookie's Secure\n\
                      flag. A value that is not an https:// domain disables adding nodes.\n\
+                     --self-signed says the panel is reached through a self-signed\n\
+                     certificate, so the panel turns on --insecure in the commands it hands\n\
+                     out instead of asking the operator at every install. install-hub.sh\n\
+                     --https passes it; the panel cannot tell from --site alone, since an\n\
+                     address may carry a public certificate and a name a self-signed one.\n\
                      --reset-password replaces the emergency password, signs every session\n\
                      out, prints the new password and exits. The database must exist.\n\
                      --add-local-node creates the node this machine reports as, prints its\n\
@@ -389,6 +419,7 @@ fn parse_args() -> Result<Args> {
         listen_defaulted,
         database,
         site: site.trim_end_matches('/').to_owned(),
+        self_signed,
         themes,
         reset_password,
         add_local_node,
@@ -451,6 +482,11 @@ async fn main() -> Result<()> {
     // the probes they made, are not handed a pair they did not ask for.
     let db = Db::open(&args.database)?;
     db.ensure_default_ping_tasks()?;
+    // Recorded on every start, not only the first: the panel reads it to decide
+    // whether its install commands need `--insecure`, and a re-run that drops
+    // `--https` has to clear it again. Written unconditionally so the stored
+    // value always describes the run that is actually serving the panel.
+    db.set("self_signed", if args.self_signed { "on" } else { "" })?;
     let app = Arc::new(App::new(db, args.site.clone(), args.themes, notes));
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
@@ -593,6 +629,7 @@ async fn main() -> Result<()> {
                 // through this rather than holding the panel's password.
                 .route("/api/agent/traffic", get(api::agent_traffic))
                 .route("/install.sh", get(install_script))
+                .route("/probe.py", get(probe_script))
                 .route("/agent/{arch}", get(agent_binary))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
                 .with_state(app.clone()),

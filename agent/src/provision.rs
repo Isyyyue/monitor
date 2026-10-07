@@ -716,6 +716,11 @@ pub fn run(args: ProvisionArgs) -> Result<()> {
 /// report as a *failure* and writes nothing, while still answering 200. That is
 /// what happened the first time this ran against a real panel, and no unit test
 /// caught it because the api.rs test hand-writes its request body.
+///
+/// The hub ignores keys it does not read, so the report also carries what the
+/// installer itself needs afterwards: `sni`, which the latency probe's HY2
+/// outbound has to send, and which is the certificate's CN rather than the
+/// server address when a domain was configured.
 pub fn render_report(n: &Node, paths: &SubscriptionPaths, sub_base: &str, reused: bool) -> Value {
     let links: Vec<String> = render_v2ray_txt(n).lines().map(str::to_owned).collect();
     let base = sub_base.trim_end_matches('/');
@@ -724,6 +729,7 @@ pub fn render_report(n: &Node, paths: &SubscriptionPaths, sub_base: &str, reused
         "success": true,
         "reused_credentials": reused,
         "server": n.server,
+        "sni": n.sni_hy2,
         "uuid": n.uuid,
         "reality_public_key": n.reality_public_key,
         "short_id": n.short_id,

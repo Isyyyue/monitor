@@ -1156,12 +1156,13 @@ function useRegisterWindow() {
   }
 }
 
-function RegisterDialog({ site, reg, onClose }: {
+function RegisterDialog({ site, selfSigned, reg, onClose }: {
   site: string
+  selfSigned: boolean
   reg: ReturnType<typeof useRegisterWindow>
   onClose: () => void
 }) {
-  const [acceptUnverified, setAcceptUnverified] = useState(false)
+  const [acceptUnverified, setAcceptUnverified] = useState(selfSigned)
   const iface = useIfaceOption(undefined)
   const interval = useIntervalOption()
   const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag, acceptUnverified) : ""
@@ -1320,9 +1321,10 @@ function IfaceOption({ option, batch = false }: { option: ReturnType<typeof useI
   )
 }
 
-function InstallDialog({ node, site, onClose, onRotated }: {
+function InstallDialog({ node, site, selfSigned, onClose, onRotated }: {
   node: Node
   site: string
+  selfSigned: boolean
   onClose: () => void
   onRotated: () => void
 }) {
@@ -1331,7 +1333,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   const [confirmRotate, setConfirmRotate] = useState(false)
   const iface = useIfaceOption(currentIface(node))
   const interval = useIntervalOption(node.interval)
-  const [acceptUnverified, setAcceptUnverified] = useState(false)
+  const [acceptUnverified, setAcceptUnverified] = useState(selfSigned)
 
   const command = iface.valid ? installCommand(site, token, interval.flag, iface.flag, acceptUnverified) : ""
 
@@ -1432,9 +1434,14 @@ function trafficTone(n: Node, warnAt: number) {
   return n.month_used * 100 >= n.traffic_limit * warnAt ? "text-near" : ""
 }
 
-function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () => void; site: string; refusal: string }) {
+function Nodes({ nodes, refresh, site, selfSigned, refusal }: { nodes: Node[]; refresh: () => void; site: string; selfSigned: boolean; refusal: string }) {
   const warnAt = Number(useSettings().s?.notify_traffic) || 80
-  const [acceptUnverified, setAcceptUnverified] = useState(false)
+  // Preset from what the installer was told. A hub reached through a
+  // self-signed certificate cannot be installed on a node without --insecure,
+  // so leaving this off would hand out a command that fails -- and the operator,
+  // who already answered this question when the hub was installed, is the one
+  // who would have to notice and flip it.
+  const [acceptUnverified, setAcceptUnverified] = useState(selfSigned)
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
@@ -1647,12 +1654,13 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       {billing && (
         <BillingForm node={billing} onClose={() => setBilling(null)} onSaved={refresh} />
       )}
-      {registering && <RegisterDialog site={site} reg={reg} onClose={() => { setRegistering(false); refresh() }} />}
+      {registering && <RegisterDialog site={site} selfSigned={selfSigned} reg={reg} onClose={() => { setRegistering(false); refresh() }} />}
 
       {installing && (
         <InstallDialog
           node={installing}
           site={site}
+          selfSigned={selfSigned}
           onClose={() => setInstalling(null)}
           onRotated={refresh}
         />
@@ -2641,9 +2649,21 @@ function Website() {
   const currentHost = window.location.hostname
   const alreadyBound = currentHost && !/^[\d.]+$/.test(currentHost) && currentHost !== "localhost"
 
+  // The upgrade map and the two headers below are what keep the panel's live
+  // view working: it is one long-lived WebSocket, and a proxy that passes it
+  // through as an ordinary request leaves the page connected until it silently
+  // stops updating. `install-hub.sh --https` writes the same three lines; a
+  // configuration copied from here has to be no worse, or following the panel's
+  // own instructions would break the panel.
   const nginxConf = domain.trim()
-    ? `server {
+    ? `map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ""      close;
+}
+
+server {
     listen 443 ssl;
+    listen [::]:443 ssl;
     server_name ${domain.trim()};
 
     ssl_certificate /etc/letsencrypt/live/${domain.trim()}/fullchain.pem;
@@ -2651,10 +2671,14 @@ function Website() {
 
     location / {
         proxy_pass http://127.0.0.1:28080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade           $http_upgrade;
+        proxy_set_header Connection        $connection_upgrade;
+        proxy_read_timeout 3600s;
     }
 }`
     : ""
@@ -2728,8 +2752,8 @@ sudo nginx -t && sudo systemctl reload nginx`
   )
 }
 
-function Deploy({ site }: { site: string }) {
-  const [acceptUnverified, setAcceptUnverified] = useState(false)
+function Deploy({ site, selfSigned }: { site: string; selfSigned: boolean }) {
+  const [acceptUnverified, setAcceptUnverified] = useState(selfSigned)
   const [nodes, setNodes] = useState<any[]>([])
   const [vpnInfo, setVpnInfo] = useState<Record<number, any>>({})
   // A set, not one id: the point of this page is comparing nodes, and a single
@@ -3091,6 +3115,7 @@ export function Admin({
   nodes,
   refresh,
   site,
+  selfSigned,
   refusal,
 }: {
   path: string
@@ -3098,6 +3123,7 @@ export function Admin({
   nodes: Node[]
   refresh: () => void
   site: string
+  selfSigned: boolean
   refusal: string
   reloadMe: () => void
 }) {
@@ -3136,9 +3162,9 @@ export function Admin({
         ) : path === "/admin/website" ? (
           <Website />
         ) : path === "/admin/deploy" ? (
-          <Deploy site={site} />
+          <Deploy site={site} selfSigned={selfSigned} />
         ) : (
-          <Nodes nodes={nodes} refresh={refresh} site={site} refusal={refusal} />
+          <Nodes nodes={nodes} refresh={refresh} site={site} selfSigned={selfSigned} refusal={refusal} />
         )}
       </div>
     </div>

@@ -34,7 +34,12 @@ VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
 sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" "$STAGE/theme.json"
 cp "$MIKU/miku-bg.css" "$STAGE/dist/assets/miku-bg.css"
 cp "$MIKU/miku-bg.mp4" "$STAGE/dist/assets/miku-bg.mp4"
-[ -f "$SRC/preview.png" ] && cp "$SRC/preview.png" "$STAGE/preview.png"
+# No preview.png, deliberately. The miku theme is the default one with a video
+# behind it, so the only picture to show would be the default theme's own --
+# identical, and the panel would show two cards with the same thumbnail while
+# implying they differ. A theme without one gets no thumbnail at all
+# (`frontend::has_preview` reports false and the card draws without it), which
+# reads as "no picture" rather than "the same picture twice".
 
 # The three insertions, anchored on strings the default theme always emits --
 # `</head>` and `<div id="root">`. Not on the asset names: those carry a hash

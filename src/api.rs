@@ -861,6 +861,18 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
         // default, in which case the browser's address is the only one available
         // and the panel falls back to its own origin.
         "site": app.site,
+        // Whether the panel is reached through a self-signed certificate. The
+        // panel presets its "accept an unverified certificate" switch from this,
+        // so an operator who ran install-hub.sh --https states that once to the
+        // installer instead of re-answering it at every node. Read from the
+        // database rather than inferred from `site`: an address may carry a
+        // public certificate and a domain a self-signed one, so the shape of the
+        // URL says nothing about who signed what.
+        //
+        // Not part of /api/settings: that endpoint echoes every field back to
+        // `save_settings`, which rejects unknown keys, so listing it there would
+        // break the settings form for hubs that are not self-signed too.
+        "self_signed": app.db.get("self_signed").is_some_and(|v| !v.is_empty()),
     }))
 }
 
@@ -2123,6 +2135,11 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     for key in ["register_key", "register_until"] {
         out.insert(key.into(), json!(app.db.get(key).unwrap_or_default()));
     }
+    // Read-only here, like `register_key` below: it is a fact about the running
+    // process, not a preference, and `save_settings` continues to refuse it. The
+    // panel uses it to preset the "accept an unverified certificate" switch, so
+    // an operator who installed with --https states that once to the installer
+    // rather than again at every node.
     crate::notify::settings(&app, &mut out);
     Json(Value::Object(out))
 }
@@ -2338,6 +2355,50 @@ mod tests {
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
+    }
+
+    /// `/api/me` answers whether the panel is behind a self-signed certificate,
+    /// so the install commands it hands out can preset `--insecure`. Read from
+    /// the database, which is what `install-hub.sh` writes through the hub's
+    /// `--self-signed`, and never inferred from the address: an IP may carry a
+    /// public certificate and a domain a self-signed one.
+    #[tokio::test]
+    async fn the_panel_is_told_when_it_is_behind_a_self_signed_certificate() {
+        let app = std::sync::Arc::new(app());
+        let body = me(State(app.clone()), HeaderMap::new()).await.0;
+        assert_eq!(body["self_signed"], json!(false), "a hub with no flag is not self-signed");
+
+        app.db.set("self_signed", "on").unwrap();
+        let body = me(State(app.clone()), HeaderMap::new()).await.0;
+        assert_eq!(body["self_signed"], json!(true));
+
+        // Cleared by an empty value, which is how a re-run without --https puts
+        // it back: the hub writes the flag on every start, not only the first.
+        app.db.set("self_signed", "").unwrap();
+        let body = me(State(app), HeaderMap::new()).await.0;
+        assert_eq!(body["self_signed"], json!(false));
+    }
+
+    /// It must not be settable through `/api/settings`. That endpoint echoes
+    /// every field it is given back through `save_settings`, and a form that
+    /// submitted this one would be refused outright -- breaking the settings
+    /// page on hubs that are not self-signed either. The refusal is what keeps
+    /// it out of `READABLE_SETTINGS`; this pins that down.
+    #[tokio::test]
+    async fn settings_refuses_the_self_signed_flag() {
+        let app = std::sync::Arc::new(app());
+        let response = save_settings(
+            Admin,
+            State(app.clone()),
+            HeaderMap::new(),
+            Json(json!({"self_signed": "on"})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            app.db.get("self_signed").is_none(),
+            "a rejected value must not have been written anyway"
+        );
     }
 
     /// Taken by every test that calls `metrics`. `HISTORY_GATE` is process-wide,

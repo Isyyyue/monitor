@@ -84,13 +84,21 @@ const TOOLTIP = {
 // and a rate axis of 1 KB/s to 100 MB/s its 10 MB/s label and two gridlines.
 const VALUE_AXIS = { ...AXIS, width: 68, interval: 0 }
 
-// The palette is greyscale, so lightness alone is exhausted after two or three
-// series and the dash pattern carries the rest.
+// Five series share one chart, so they are separated by hue and by dash: the
+// palette alone leaves two paths crossing at the same lightness hard to tell
+// apart, and two probes that both happen to plot flat would be told apart by
+// the dash instead.
+//
+// The palette used to be greyscale, on the argument that lightness alone is a
+// clearer separation than hue for anyone who cannot see the difference. That
+// was built, measured, and shipped -- then reversed: the download line is
+// drawn in `--ok` and read as "good" rather than as "one of five greys", and a
+// status page whose healthy line is grey reads as broken next to the same page
+// in the panel, where it has always been green. Hue carries meaning here, so
+// the dashes stay as the second cue rather than the only one.
 // ponytail: the dash period is shorter than the jitter once every ping in the
-// window is on the chart, so at the day range a dotted line and a dashed one both
-// read as texture and only lightness separates them. A muted colour palette was
-// built and measured but not adopted; restoring it means five oklch pairs and
-// dropping `dash`.
+// window is on the chart, so at the day range a dotted line and a dashed one
+// both read as texture and only hue separates them.
 const PALETTE = [
   { stroke: "var(--color-chart-1)", dash: undefined },
   { stroke: "var(--color-chart-3)", dash: "6 3" },

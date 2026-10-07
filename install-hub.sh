@@ -33,6 +33,12 @@ SITE=""
 SITE_SET=""
 # Self-signed HTTPS in front of the loopback hub, for a hub with no domain.
 HTTPS=""
+# Passed to the hub as --self-signed once --https is confirmed, so the panel
+# knows to turn on --insecure by itself rather than asking at every node. Not a
+# command-line flag: it describes --https, and taking it from the operator would
+# let it disagree with the deployment actually being installed.
+SELF_SIGNED=""
+SELF_SIGNED_SET=""
 # 8444, not 443. The hub frequently shares a machine with a node, where sing-box
 # holds 443 -- and REALITY hides itself by forwarding a handshake it does not
 # recognise to its camouflage site, so a panel on that port would never be
@@ -80,9 +86,18 @@ warn() { printf '  %s!%s  %s\n' "$Y" "$N" "$1"; }
 die() { printf '  %s✗%s  %s\n' "$R" "$N" "$1" >&2; exit 1; }
 
 # A default answer on Enter, and the same default when there is no terminal.
+# The prompt is free text, so the fallback is spelled out rather than shown in
+# brackets the way a yes/no choice would be: `[n]` beside a field that accepts a
+# domain name reads as "type n", and `[]` (no default) reads as a rendering bug.
+# A default of nothing gets no hint at all.
 ask() {
 	if [ ! -t 0 ]; then printf '%s' "$2"; return; fi
-	printf '  %s?%s  %s %s[%s]%s ' "$Y" "$N" "$1" "$D" "$2" "$N" >&2
+	if [ -n "$2" ]; then
+		hint=" ${D}留空为 $2${N}"
+	else
+		hint=""
+	fi
+	printf '  %s?%s  %s%s ' "$Y" "$N" "$1" "$hint" >&2
 	read -r reply || reply=""
 	printf '%s' "${reply:-$2}"
 }
@@ -252,6 +267,15 @@ install_hub() {
 		*--site\ *) SITE="${carried##*--site }"; SITE="${SITE%% *}" ;;
 		esac
 	fi
+	# Recovered the same way as --site, and for the same reason: a re-run that
+	# omits --https must not leave the hub claiming a self-signed certificate it
+	# is no longer behind, nor drop the flag while it still is. `setup_https`
+	# below reconciles it with what is actually on disk.
+	if [ -z "$SELF_SIGNED_SET" ]; then
+		case "$(old_exec)" in
+		*--self-signed*) SELF_SIGNED=1 ;;
+		esac
+	fi
 	check_port "$PORT"
 
 	# A self-signed listener an earlier run left behind counts as configured, so
@@ -283,6 +307,21 @@ install_hub() {
 	# entry point left standing is strictly better than one without. Removing it
 	# is the operator's call, not a side effect of passing --plain.
 	[ -z "$SITE" ] || remove_https_site
+
+	# The final word on whether the panel is behind a self-signed certificate,
+	# decided here where both inputs are known: a domain means the panel is
+	# served over a real certificate and the flag is cleared, whatever an earlier
+	# run wrote; no domain with --https (or a listener from one) means it is set.
+	# Nothing else may set it, or the hub would offer `--insecure` to nodes that
+	# do not need it -- a command that still works, which is what makes a wrong
+	# value here silent.
+	if [ -n "$SITE" ] || [ -n "$PLAIN" ]; then
+		SELF_SIGNED=""
+	elif [ -n "$HTTPS" ]; then
+		SELF_SIGNED=1
+	else
+		SELF_SIGNED=""
+	fi
 
 	# Before anything is stopped, replaced or downloaded: a port conflict must
 	# leave the running hub untouched. The hub's own socket is never a conflict,
@@ -381,6 +420,10 @@ install_hub() {
 	fi
 	args="--listen $listen --db $DATA/monitor.db"
 	[ -z "$SITE" ] || args="$args --site $SITE"
+	# Told, not inferred. The panel turns on `--insecure` for its install
+	# commands off this flag, which is how one answer at install time saves the
+	# operator from re-stating it at every node. Only meaningful with --https.
+	[ -z "$SELF_SIGNED" ] || args="$args --self-signed"
 	cat >"$UNIT" <<UNIT
 [Unit]
 Description=monitor hub
@@ -489,11 +532,45 @@ UNIT
 	if [ -z "$SITE" ] && [ -z "$HTTPS" ]; then
 		printf '  %s还差一步：配个反向代理%s\n' "$B" "$N"
 		printf '     面板只监听本机，公网访问不到——这是故意的，凭证不会在链路上裸奔。\n'
-		printf '     用 nginx / caddy / cf tunnel 任选一种，把 hub.example.com 换成你的域名，\n'
-		printf '     配好之后用域名访问面板，我相信这难不倒你。\n'
-		printf '     没有域名的话，重跑一次加 --https，安装器会签一张自签证书并配好 nginx。\n'
-		# The documented configurations use the default port.
-		[ "$PORT" = 28080 ] || printf '     文档里的 28080 换成 %s。\n' "$PORT"
+		printf '     没有域名的话，重跑一次加 --https，安装器会签一张自签证书并配好 nginx，\n'
+		printf '     这一步就不用你做了。\n'
+		printf '\n'
+		printf '     有域名的话，把下面整段存成 /etc/nginx/conf.d/hub.conf，\n'
+		printf '     把 hub.example.com 换成你的域名，然后 nginx -t && systemctl reload nginx。\n'
+		printf '     证书用 certbot 申请：certbot --nginx -d 你的域名\n'
+		printf '\n'
+		# Printed rather than described: the whole point is that it can be
+		# copied, and a config the reader has to reconstruct from prose is the
+		# step this paragraph exists to remove. Kept identical to the one
+		# setup_https writes -- including the upgrade map, without which the
+		# panel's WebSocket dies on reload.
+		printf '     %smap $http_upgrade $connection_upgrade {\n' "$D"
+		printf '         default upgrade;\n'
+		printf '         ""      close;\n'
+		printf '     }\n'
+		printf '\n'
+		printf '     server {\n'
+		printf '         listen 443 ssl;\n'
+		printf '         listen [::]:443 ssl;\n'
+		printf '         server_name hub.example.com;\n'
+		printf '\n'
+		printf '         ssl_certificate     /etc/letsencrypt/live/hub.example.com/fullchain.pem;\n'
+		printf '         ssl_certificate_key /etc/letsencrypt/live/hub.example.com/privkey.pem;\n'
+		printf '         ssl_protocols TLSv1.2 TLSv1.3;\n'
+		printf '\n'
+		printf '         location / {\n'
+		printf '             proxy_pass http://127.0.0.1:%s;\n' "$PORT"
+		printf '             proxy_http_version 1.1;\n'
+		printf '             proxy_set_header Host              \$host;\n'
+		printf '             proxy_set_header X-Real-IP         \$remote_addr;\n'
+		printf '             proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;\n'
+		printf '             proxy_set_header X-Forwarded-Proto \$scheme;\n'
+		printf '             proxy_set_header Upgrade           \$http_upgrade;\n'
+		printf '             proxy_set_header Connection        \$connection_upgrade;\n'
+		printf '             proxy_read_timeout 3600s;\n'
+		printf '         }\n'
+		printf '     }%s\n' "$N"
+		printf '\n'
 		printf '     反向代理文档：https://monitor-document.pages.dev/install/reverse-proxy\n'
 	fi
 	# A self-signed certificate is what lets a hub with no domain encrypt at all,
@@ -860,9 +937,10 @@ monitor hub 安装器
   --https        面板没有域名、但想要加密时用。安装器装好 nginx，签一张
                  自签证书，把 8444 反代到本机的 hub。浏览器第一次会警告「不安全」，
                  点「继续」即可；流量是加密的。节点装 agent 时要带 --insecure
-                 —— 自签证书没有公共 CA 背书，agent 默认不认它；面板给出的
-                 安装命令里已经带好了这个开关。等域名解析过来后加
-                 --site https://你的域名 重跑一次，就可以去掉它
+                 —— 自签证书没有公共 CA 背书，agent 默认不认它；安装器会把这件事
+                 记在 hub 上，面板给出的安装命令里自动带好这个开关，不用你再点。
+                 等域名解析过来后加 --site https://你的域名 重跑一次，
+                 就可以去掉它
   --https-port <n>
                  自签 HTTPS 的监听端口，默认 8444。443 让给 sing-box ——
                  同一台机器既当面板又当节点时，REALITY 会把不认识的握手转发

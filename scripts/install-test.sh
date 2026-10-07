@@ -72,6 +72,28 @@ extract() {
 	' "$from"
 }
 
+# Source a function out of the installer instead of evaluating its text.
+#
+# `eval "$(extract fn)"` re-runs the shell over the function body, and that extra
+# pass strips one level of backslashes: a `sed 's@...@\1...@'` inside the
+# function arrives as `1`, so the test exercises something the installer never
+# runs -- and passes. Writing the body to a file and sourcing it keeps the text
+# exactly as it was read.
+#
+# $1 = function name, $2 = file to read (default $INSTALL). When a caller needs
+# to rewrite paths in the body first, it should extract into its own file with
+# `extract ... > f` && sed that file, then call `load_file f`.
+load() {
+	body="$DIR/fn-$1.sh"
+	extract "$1" "${2:-$INSTALL}" >"$body"
+	load_file "$body"
+}
+
+load_file() {
+	# shellcheck disable=SC1090  # the path is this test's own temporary file
+	. "$1"
+}
+
 FUNCS="pick_sub_port pick_public_port read_prev_sub write_sub_nginx sub_file_names check_subscription"
 {
 	for fn in $FUNCS; do extract "$fn"; done
@@ -105,6 +127,10 @@ nginx_holds() { [ "\${NGINX_HOLDS:-1}" = 1 ]; }
 # can hold 80 free while something else is busy -- or the reverse.
 listening() { [ "\${LISTENING:-0}" = 1 ] && [ "\$1" = 80 ] || [ "\$1" = "\${TAKEN:-}" ]; }
 sub_service_running() { [ "\${SUBRUN:-0}" = 1 ]; }
+# write_sub_nginx calls this before writing its config. Its own behaviour is
+# covered in section 9; here it only has to exist, or the port scenarios die on
+# "command not found" instead of reaching their assertion.
+sub_default_server_patch() { return 0; }
 
 . $DIR/funcs.sh
 
@@ -597,5 +623,368 @@ check "nothing to drop reports non-zero" "rc=1 left=0" "$got"
     configure_optional_vpn
     echo '  ok  rollback restores files, public port and checks real success; --no-vpn skips changes'
 )
+
+# --- 9. 80 端口上别人的 default_server 要让位 ---------------------------------
+#
+# A stock `apt install nginx` on Debian and Ubuntu enables sites-enabled/default,
+# which already declares `listen 80 default_server`. A second one on the same
+# port is not "last writer wins" -- `nginx -t` rejects the whole tree with
+# `a duplicate default server for 0.0.0.0:80`. So on a fresh machine the
+# subscription vhost could not be installed at all, the installer fell back to
+# 8080, and the client's address grew a `:8080` -- with the only explanation
+# being `nginx refused the subscription config`, which reads as our config being
+# wrong. Reproduced on a real machine.
+#
+# sub_default_server_patch comments out just that keyword on the other file,
+# leaving the site itself (root, location, try_files) untouched, and records the
+# file so uninstall can put it back.
+
+grep -q '^sub_default_server_patch() {' "$INSTALL" ||
+	fail "install.sh has no sub_default_server_patch"
+grep -q '^sub_default_server_unpatch() {' "$INSTALL" ||
+	fail "install.sh has no sub_default_server_unpatch"
+# Counted as a live call, not merely present: a commented-out or `:`-prefixed
+# line (the no-op form) still matches a plain grep, so the line is taken whole
+# and its first non-blank character checked instead.
+patched=$(awk '
+	index($0, "sub_default_server_patch") && index($0, "$SUB_PORT") {
+		line = $0
+		sub(/^[ \t]+/, "", line)
+		if (substr(line, 1, 1) != "#" && substr(line, 1, 1) != ":") n++
+	}
+	END { print n + 0 }
+' "$INSTALL")
+[ "$patched" -ge 1 ] ||
+	fail "write_sub_nginx never calls sub_default_server_patch on the port, so a stock nginx still breaks it"
+
+# The uninstall branch at the top of the script runs before any function is
+# defined, so it cannot call sub_default_server_unpatch; it restores in place.
+# Both use the same `nginx -T` file walk, or one would miss what the other moved.
+awk '/^if \[ -n "\$UNINSTALL" \]; then$/,/^fi$/' "$INSTALL" |
+	grep -q 'monitor-orig' ||
+	fail "uninstall does not restore the default_server markers it removed"
+
+# Exercised against a directory tree with nginx stubbed, so the file handling and
+# the restore are the installer's own.
+#
+# `nginx -T` is the only thing that tells the function which files are live, and
+# its output format is `# configuration file <path>:` -- the stub reproduces it,
+# and its `nginx -t` answer is scripted per case so both the accepted and the
+# rejected patch can be reached.
+patch_probe() {
+	case_name=$1
+	root="$DIR/default-server"
+	rm -rf "$root"
+	mkdir -p "$root/sites-enabled" "$root/conf.d"
+	printf 'server {\n\tlisten 80 default_server;\n\troot /var/www/html;\n}\n' \
+		>"$root/sites-enabled/default"
+	printf 'server {\n\tlisten 8444 ssl default_server;\n}\n' \
+		>"$root/sites-enabled/monitor-hub-https.conf"
+	(
+		cd "$root" || exit 1
+		SUB_NGINX_CONF="$root/conf.d/monitor-sub.conf"
+		export SUB_NGINX_CONF
+		extract sub_default_server_patch >"$DIR/fn-patch.sh"
+		sed -i 's#/etc/nginx#'"$root"'#g' "$DIR/fn-patch.sh"
+		load_file "$DIR/fn-patch.sh"
+		load sub_default_server_unpatch
+		# `nginx -T` lists every live file, the way the real one does.
+		nginx() {
+			case "$1" in
+			-T)
+				printf '# configuration file %s:\n' \
+					"$root/sites-enabled/default" "$root/sites-enabled/monitor-hub-https.conf"
+				;;
+			-t)
+				# The rejected case: this tree never validates.
+				[ "$case_name" = reject ] && return 1
+				return 0
+				;;
+			esac
+		}
+		sub_default_server_patch 80
+		marked=$(grep -c 'listen 80 default_server' "$root/sites-enabled/default" || true)
+		commented=$(grep -c '# default_server (monitor' "$root/sites-enabled/default" || true)
+		kept=$(grep -c 'root /var/www/html' "$root/sites-enabled/default" || true)
+		orig=$(find "$root" -name '*.monitor-orig' | wc -l | tr -d ' ')
+		# 8444 must be untouched: a different port is someone else's business.
+		other=$(grep -c 'listen 8444 ssl default_server' "$root/sites-enabled/monitor-hub-https.conf" || true)
+		printf 'marked=%s commented=%s kept=%s orig=%s other=%s' \
+			"$marked" "$commented" "$kept" "$orig" "$other"
+	)
+}
+
+got=$(patch_probe accept)
+check "the other default_server on 80 is taken over, its site kept" \
+	"marked=0 commented=1 kept=1 orig=1 other=1" "$got"
+
+# A tree that still will not validate must be left exactly as it was found: a
+# patch we could not justify would otherwise be a machine we broke.
+got=$(patch_probe reject)
+check "a refused patch is rolled back, marker and site intact" \
+	"marked=1 commented=0 kept=1 orig=0 other=1" "$got"
+
+# And the restore puts the file back the way it was. Run against a tree patched
+# by the accept case above, whose .monitor-orig is the untouched original.
+(
+	root="$DIR/default-server"
+	# The reject case above rebuilt the tree; lay down the patched state again.
+	printf 'server {\n\tlisten 80 default_server;\n\troot /var/www/html;\n}\n' \
+		>"$root/sites-enabled/default.monitor-orig"
+	printf 'server {\n\tlisten 80 # default_server (monitor: moved to monitor-sub.conf);\n\troot /var/www/html;\n}\n' \
+		>"$root/sites-enabled/default"
+	(
+		cd "$root" || exit 1
+		SUB_NGINX_CONF="$root/conf.d/monitor-sub.conf"
+		# shellcheck disable=SC2034
+		SUB_DEFAULT_RESTORE="$root/sites-enabled/default"
+		load sub_default_server_unpatch
+		sub_default_server_unpatch
+	)
+	grep -q 'listen 80 default_server;' "$root/sites-enabled/default" ||
+		fail "unpatch did not restore the original default_server"
+	grep -q 'root /var/www/html' "$root/sites-enabled/default" ||
+		fail "unpatch lost the site it restored"
+	[ -z "$(find "$root" -name '*.monitor-orig')" ] ||
+		fail "unpatch left a .monitor-orig file behind"
+	echo "  ok  unpatch restores the original file byte for byte"
+)
+
+# --- 10. 订阅伺服失败不等于 VPN 没部署 ----------------------------------------
+#
+# report_vpn used to sit inside setup_subscription's success branch, so anything
+# wrong with serving the subscription -- a port it could not take, an nginx that
+# refused the config -- also suppressed the report. The hub then had no vpn row
+# and the panel said "未部署 VPN" while sing-box was running and carrying traffic.
+# The user is sent looking for a VPN that is already up, and nothing in the
+# output explains the contradiction.
+#
+# The two outcomes are independent: provision_vpn succeeding means the node is
+# deployed; setup_subscription is only about putting the links on a URL.
+
+grep -q '^report_vpn() {' "$INSTALL" || fail "install.sh has no report_vpn"
+
+# Measured live: a node with a running sing-box, a subscription it could not
+# serve, and an empty vpn table on the hub.
+(
+	prov=0 sub=0
+	NO_VPN=
+	eval "$(extract configure_optional_vpn)"
+	# report_vpn and setup_subscription are both stubbed: this checks only the
+	# order and the independence of the two, not what either does. The probe is
+	# stubbed too -- it needs a real machine and a sing-box client; section 11
+	# covers what it writes.
+	provision_vpn() { return 0; }
+	report_vpn() { prov=$((prov + 1)); }
+	setup_subscription() { sub=$((sub + 1)); return 1; }
+	setup_latency_probe() { return 0; }
+	configure_optional_vpn
+	[ "$prov" -eq 1 ] ||
+		fail "a failed subscription suppressed the deployment report (reported $prov time(s))"
+	[ "$sub" -eq 1 ] || fail "setup_subscription ran $sub time(s)"
+	echo "  ok  a failed subscription still reports the deployment to the hub"
+)
+
+# The reverse, so the check is not one-sided: a successful subscription must not
+# turn one report into two.
+(
+	prov=0
+	NO_VPN=
+	eval "$(extract configure_optional_vpn)"
+	provision_vpn() { return 0; }
+	report_vpn() { prov=$((prov + 1)); }
+	setup_subscription() { return 0; }
+	setup_latency_probe() { return 0; }
+	configure_optional_vpn
+	[ "$prov" -eq 1 ] || fail "the deployment was reported $prov time(s), expected once"
+	echo "  ok  a served subscription reports it exactly once"
+)
+
+# A failed provision must report nothing: there is no deployment to record, and
+# a vpn row for a node that never got one is worse than an empty table.
+(
+	prov=0
+	# Read by the function pulled in with extract; shellcheck cannot see that.
+	# shellcheck disable=SC2034
+	NO_VPN=
+	eval "$(extract configure_optional_vpn)"
+	provision_vpn() { return 1; }
+	report_vpn() { prov=$((prov + 1)); }
+	setup_subscription() { fail "subscription ran after a failed provision"; }
+	setup_latency_probe() { fail "the probe ran without a deployment to measure"; }
+	configure_optional_vpn
+	[ "$prov" -eq 0 ] || fail "a failed provision still reported a deployment"
+	echo "  ok  a failed provision reports nothing"
+)
+
+# --- 11. 延迟探针自动装起来 ----------------------------------------------------
+#
+# The panel has a 网络延迟 tab and the hub creates the two proxy tasks at
+# startup, but the thing that measures them was never installed: probe/ ships a
+# README that says "Optional" and a list of manual steps -- fill in
+# YOUR_SERVER_IP, YOUR_VLESS_UUID, YOUR_REALITY_PUBLIC_KEY. Nobody did, so
+# ping_record stayed empty and the tab said 这段时间没有延迟数据, which reads as
+# "broken" rather than "never installed".
+#
+# Measured on a real node: ping_task rows=2, ping_node rows=2, ping_record rows=0,
+# no /opt/probe, no probe process.
+#
+# The installer now writes the client config itself, from the credentials
+# provision just generated -- it holds them in $VPN_JSON, so there is nothing for
+# the user to fill in.
+
+grep -q '^setup_latency_probe() {' "$INSTALL" ||
+	fail "install.sh has no setup_latency_probe"
+grep -q '^json_str() {' "$INSTALL" ||
+	fail "install.sh has no json_str"
+# Called from the VPN path, and only after the report, so the probe can rely on
+# $VPN_JSON being the deployment it just reported.
+probe_call=$(awk '
+	index($0, "setup_latency_probe") && !index($0, "setup_latency_probe()") {
+		line = $0
+		sub(/^[ \t]+/, "", line)
+		if (substr(line, 1, 1) != "#" && substr(line, 1, 1) != ":") n++
+	}
+	END { print n + 0 }
+' "$INSTALL")
+[ "$probe_call" -ge 1 ] ||
+	fail "setup_latency_probe is never called, so the latency tab stays empty"
+
+# json_str is the whole reason this can be done without jq: the machine is not
+# guaranteed to have one, so the report is parsed with tr/sed. `grep -o` was
+# measured to return only the first match per line on a single-line JSON, which
+# is why the value is taken after splitting on commas.
+load json_str
+REPORT='{"success":true,"reused_credentials":false,"server":"1.2.3.4","sni":"vpn.example.com","uuid":"76b86267-f1b2-4f4b-87fb-e1a0e9e80bc8","reality_public_key":"BsN37-DA66bg7fqRkZWounOYs6ssqqKfPe-eP2--cWo","short_id":"f08819fd94b685fe","hy2_password":"ca4d1ee4e4a1e5e8abbb65b13e933947","obfs_password":"3fb4f7b17040adbc00eb14f27fb0510c","vless_link":"vless://76b8@1.2.3.4:443","clash_sub_url":"http://1.2.3.4/sub-a.yaml"}'
+
+check "json_str reads a key from the report" "1.2.3.4" "$(json_str "$REPORT" server)"
+check "json_str reads the sni, not the server" "vpn.example.com" "$(json_str "$REPORT" sni)"
+check "json_str reads a key near the end" "3fb4f7b17040adbc00eb14f27fb0510c" "$(json_str "$REPORT" obfs_password)"
+check "json_str reads every credential it is asked for" \
+	"76b86267-f1b2-4f4b-87fb-e1a0e9e80bc8 BsN37-DA66bg7fqRkZWounOYs6ssqqKfPe-eP2--cWo f08819fd94b685fe ca4d1ee4e4a1e5e8abbb65b13e933947" \
+	"$(json_str "$REPORT" uuid) $(json_str "$REPORT" reality_public_key) $(json_str "$REPORT" short_id) $(json_str "$REPORT" hy2_password)"
+# An absent key must come back empty rather than as some other key's value: this
+# is what the caller's completeness check reads.
+check "an absent key reads as empty" "" "$(json_str "$REPORT" no_such_key)"
+# The last value on the line has no trailing comma; a parser that only looks
+# after one would drop it and the probe would be skipped as incomplete.
+check "the last key on the line is still read" "http://1.2.3.4/sub-a.yaml" "$(json_str "$REPORT" clash_sub_url)"
+
+# The installer must refuse rather than write a half-filled client config: a
+# config missing a credential starts and then fails every round, which looks
+# exactly like a dead proxy.
+grep -q 'missing a credential' "$INSTALL" ||
+	fail "setup_latency_probe writes a config even when a credential is missing"
+
+# And it must not claim to have installed the probe when the runtime it needs is
+# absent -- python3 for the prober, sing-box for the client.
+grep -q 'python3 is not installed' "$INSTALL" ||
+	fail "the probe does not check for python3"
+grep -q 'sing-box is not on PATH' "$INSTALL" ||
+	fail "the probe does not check for sing-box"
+
+# The node id is not written into PROBE_TARGETS: the agent holds a token, never
+# an id, so a constant there would file this machine's latency under whichever
+# node happens to be number 1. The prober looks it up from ping_node instead.
+grep -q 'PROBE_TARGETS=vless:\$PROBE_VLESS_PORT,hy2:\$PROBE_HY2_PORT' "$INSTALL" ||
+	fail "PROBE_TARGETS carries a node id, which the installer has no way to know"
+grep -q '^def node_for(' "$ROOT/probe/probe.py" ||
+	fail "probe.py has no node_for, so a two-field target cannot be resolved"
+grep -q 'SELECT node_id FROM ping_node WHERE task_id' "$ROOT/probe/probe.py" ||
+	fail "probe.py does not look the node up from ping_node"
+
+# Uninstall must take the probe with it: it runs its own sing-box client, which
+# would otherwise keep holding 127.0.0.1:18083/18084 with nothing left to test.
+awk '/^if \[ -n "\$UNINSTALL" \]; then$/,/^fi$/' "$INSTALL" |
+	grep -q 'probe-singbox' ||
+	fail "uninstall leaves the latency probe's sing-box client running"
+
+# The hub serves the prober to the installer, the same way it serves itself: a
+# fresh machine must not need a second network to reach GitHub.
+grep -q 'route("/probe.py"' "$ROOT/src/main.rs" ||
+	fail "the hub does not serve /probe.py, so the installer cannot fetch the prober"
+
+# --- 12. 自签证书这件事要一路告诉面板 ---------------------------------------
+#
+# The panel presets its "accept an unverified certificate" switch from what the
+# installer was told, so one answer at install time is not asked again at every
+# node -- and, more importantly, the command it hands out is correct without the
+# operator having to know it needed a switch. That is a three-link chain:
+# install-hub.sh writes the flag into the unit, the hub records it, the panel
+# reads it off /api/me. Any one link missing leaves the switch off, and the
+# command it produces still runs and still looks right -- it just fails to
+# connect, which is exactly the silent failure this test exists for.
+
+HUB="$ROOT/install-hub.sh"
+
+# Whether a line of code is live, as opposed to text in a comment. A plain
+# `grep -q` cannot tell them apart, and every assertion below would then pass on
+# a file where the line had been commented out -- which is how the check for the
+# flag reaching ExecStart was first written, and it stayed green when the line
+# was disabled. `#` and `:` (the POSIX "do nothing" command) both stop the line
+# from running, so both are excluded.
+live() {
+	awk -v pat="$1" '
+		index($0, pat) {
+			line = $0
+			sub(/^[ \t]+/, "", line)
+			if (substr(line, 1, 1) != "#" && substr(line, 1, 1) != ":") n++
+		}
+		END { exit (n > 0 ? 0 : 1) }
+	' "$2"
+}
+
+# Link 1: --https sets it, and a domain clears it. Both directions are asserted
+# because only one of them breaks loudly: a stale "on" hands out `--insecure`
+# where it is not needed, and that command works.
+live 'SELF_SIGNED=1' "$HUB" ||
+	fail "install-hub.sh never sets SELF_SIGNED, so the hub cannot know"
+awk '/^	if \[ -n "\$SITE" \] \|\| \[ -n "\$PLAIN" \]; then$/,/^	fi$/' "$HUB" |
+	grep -q 'SELF_SIGNED=""' ||
+	fail "a hub with a domain keeps claiming a self-signed certificate"
+
+# Link 1b: the unit carries it, and a re-run that omits --https recovers it from
+# the unit it is about to replace. Without the recovery the second run would
+# silently turn the switch off on a hub that is still self-signed.
+live 'args="$args --self-signed"' "$HUB" ||
+	fail "the flag never reaches the hub's ExecStart"
+live ') SELF_SIGNED=1' "$HUB" ||
+	fail "a re-run drops --self-signed instead of recovering it from the old unit"
+
+# Link 2: the hub accepts the flag and records it. Read unconditionally on every
+# start, so a re-run that drops --https clears it again.
+live '"--self-signed" => self_signed = true' "$ROOT/src/main.rs" ||
+	fail "the hub does not accept --self-signed"
+live 'db.set("self_signed"' "$ROOT/src/main.rs" ||
+	fail "the hub accepts --self-signed but never records it"
+live '"self_signed": app.db.get("self_signed")' "$ROOT/src/api.rs" ||
+	fail "the hub records it but never tells the panel"
+
+# Link 2b: it is deliberately NOT a /api/settings key. That endpoint echoes every
+# field back to save_settings, which rejects unknown keys -- listing it there
+# would make the settings form fail on every hub, self-signed or not.
+awk '/^const READABLE_SETTINGS/,/^\];$/' "$ROOT/src/api.rs" | grep -q 'self_signed' &&
+	fail "self_signed is a readable setting, so saving settings would reject it"
+
+# Link 3: the panel reads it and seeds all four install/register dialogs from it.
+live 'self_signed: boolean' "$ROOT/web-admin/src/App.tsx" ||
+	fail "the panel does not read self_signed from /api/me"
+live 'selfSigned={me.self_signed}' "$ROOT/web-admin/src/App.tsx" ||
+	fail "the panel reads self_signed but never passes it down"
+seeded=$(awk '
+	index($0, "useState(selfSigned)") {
+		line = $0
+		sub(/^[ \t]+/, "", line)
+		if (substr(line, 1, 1) != "#" && substr(line, 1, 1) != ":") n++
+	}
+	END { print n + 0 }
+' "$ROOT/web-admin/src/components/Admin.tsx")
+[ "$seeded" = 4 ] ||
+	fail "expected all four certificate switches seeded from selfSigned, found $seeded"
+# The switch must still be operator-overridable: seeding the state is not the
+# same as latching it, and a hub behind a proxy the installer did not configure
+# may legitimately differ from what --https recorded.
+live 'onCheckedChange={onChange}' "$ROOT/web-admin/src/components/Admin.tsx" ||
+	fail "the certificate switch can no longer be changed by the operator"
 
 echo "install-test: ok"

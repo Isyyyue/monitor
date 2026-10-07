@@ -56,6 +56,8 @@ SUB_PREV_BIND=""
 SUB_PREV_STATE=""
 SUB_BACKUP_DIR=""
 SUB_LEGACY_RUNNING=""
+# 被我们摘掉 default_server 的那些文件，卸载时逐行还原。
+SUB_DEFAULT_RESTORE=""
 read_prev_sub() {
 	[ -f "$ENV_FILE" ] || return 0
 	SUB_PREV_PUBLIC=$(sed -n 's/^MONITOR_SUB_PUBLIC_PORT=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
@@ -119,6 +121,16 @@ if [ -n "$UNINSTALL" ]; then
 	rc-update del monitor-agent default >/dev/null 2>&1 || true
 	systemctl disable --now monitor-agent 2>/dev/null || true
 	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE" "$ROOT/subscription.json"
+	# 延迟探针也一起走：它跑着一个自己的 sing-box 客户端，留着会一直占着
+	# 127.0.0.1:18083/18084，而它所测的东西（节点 token、本地库）已经没了。
+	#
+	# 与安装时用同一组名字与路径，见 setup_latency_probe；这段在顶层、函数定义
+	# 之前，所以就地写而不是调 drop_latency_probe。
+	systemctl disable --now monitor-probe 2>/dev/null || true
+	systemctl disable --now probe-singbox 2>/dev/null || true
+	rm -f /etc/systemd/system/monitor-probe.service /etc/systemd/system/probe-singbox.service
+	rm -rf /opt/probe
+	rm -f "$ROOT/.probe-installed"
 	# 订阅现在由 agent 自己伺服，随它一起走 —— 上面那行已经删了它的环境文件，
 	# 订阅的三条配置就在里面。这里再收掉上一代那份独立服务，以及 nginx 前面
 	# 那一段：留着一条指向已删服务的 location，要等下一次 reload 才会发现。
@@ -130,6 +142,16 @@ if [ -n "$UNINSTALL" ]; then
 	# nginx 前面那一段也撤掉，并重载 —— 留着一条指向已删服务的 location，
 	# 要等下一次 reload 才会发现。
 	rm -f "$SUB_NGINX_CONF" "$SUB_NGINX_CONF.monitor-prev"
+	# 装的时候可能从别人的站点上摘过 default_server（Ubuntu 的
+	# sites-enabled/default 就带着一个）。卸载要把那些字还回去，否则那个站点
+	# 在 80 端口上永远不再兜底，而没有任何地方提过这事。
+	#
+	# 这里在顶层、函数定义之前，所以逻辑就地写：踩路是 `nginx -T` 报的文件列表，
+	# 与安装时那次的取值方式保持逐字一致。
+	for _f in $(nginx -T 2>/dev/null | sed -n 's/^# configuration file \(.*\):$/\1/p'); do
+		[ -f "$_f.monitor-orig" ] || continue
+		mv -f "$_f.monitor-orig" "$_f" 2>/dev/null || true
+	done
 	if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
 		systemctl reload nginx 2>/dev/null || rc-service nginx reload >/dev/null 2>&1 || true
 	fi
@@ -857,6 +879,67 @@ restore_prev_sub() {
     check_subscription "http://127.0.0.1:$SUB_PORT"
 }
 
+# 同一个端口上只能有一个 `default_server`，而 nginx 撞上第二个时不是「后写的赢」，
+# 是整个配置**验不过**：`nginx -t` 报 `a duplicate default server for 0.0.0.0:80`，
+# 我们那份连装都装不上。
+#
+# 而 Ubuntu/Debian 的 nginx 包**默认就带着一个** `sites-enabled/default`，里面正是
+# `listen 80 default_server` —— 也就是说，在一个刚 `apt install nginx` 的机器上，
+# 想拿 80 端口做订阅**必然撞车**，脚本于是退到 8080，客户端拿到的订阅地址从此带着
+# `:8080`。而这一切在输出里只有一句 `nginx refused the subscription config`，
+# 看着像我们写错了配置，其实是别人的站点先占了这个坑。
+#
+# 所以写自己那份之前，先把**别的文件里**同端口上的 `default_server` 摘掉：只注释
+# 掉这四个字，站点本身（root、location、try_files）一个字不动 —— 它照旧服务自己
+# 的 `server_name`，只是不再是「这个端口上没匹配到时的兜底」。兜底由我们接管，那正是
+# 我们要的。
+#
+# 改过的文件记在 $SUB_DEFAULT_RESTORE 里，卸载时逐行还原。
+sub_default_server_patch() {
+	[ -n "$1" ] || return 0
+	SUB_DEFAULT_RESTORE=""
+	# 拿真实生效的文件列表：`nginx -T` 每读一个文件就打一行
+	# `# configuration file <path>:`，比自己去猜 sites-enabled 与 conf.d 稳
+	# —— 有些发行版把整个 sites-enabled 也塞在 include 里，有些不是。
+	files=$(nginx -T 2>/dev/null | sed -n 's/^# configuration file \(.*\):$/\1/p')
+	[ -n "$files" ] || return 0
+	for f in $files; do
+		[ -f "$f" ] || continue
+		# 不动自己那份：它的 default_server 正是我们要留下的。
+		[ "$f" = "$SUB_NGINX_CONF" ] && continue
+		case "$f" in *monitor*) continue ;; esac
+		# 只挑「监听这个端口、且带 default_server」的那些 listen 行。
+		# 端口要按词边界匹配，否则 8080 会被 ":80" 连带命中。
+		grep -qE "^[[:space:]]*listen[[:space:]]+(\[::\]:)?$1[[:space:]].*default_server" "$f" 2>/dev/null || continue
+		cp "$f" "$f.monitor-orig" 2>/dev/null || continue
+		# 只把 `default_server` 这四个字注释掉：站点本身（root、location、
+		# try_files）一个字不动，它照旧服务自己的 server_name，只是不再兜底。
+		sed -i -E "s@^([[:space:]]*listen[[:space:]]+(\[::\]:)?$1[[:space:]].*)default_server@\1# default_server (monitor: moved to monitor-sub.conf)@" "$f"
+		if nginx -t >/dev/null 2>&1; then
+			SUB_DEFAULT_RESTORE="$SUB_DEFAULT_RESTORE$f
+"
+			echo "note: took over the default server on port $1 from $f" >&2
+		else
+			# 改完反而验不过（比如那个文件本来就有别的毛病）—— 还原，别把
+			# 机器上本来能用的配置弄坏。
+			cp "$f.monitor-orig" "$f" 2>/dev/null || true
+			rm -f "$f.monitor-orig"
+		fi
+	done
+	# 改完都行不通时，把 .monitor-orig 清掉不留垃圾。
+	[ -n "$SUB_DEFAULT_RESTORE" ] || rm -f /etc/nginx/conf.d/*.monitor-orig /etc/nginx/sites-*/*.monitor-orig 2>/dev/null || true
+	return 0
+}
+
+# 把上面摘掉的 default_server 还回去。
+sub_default_server_unpatch() {
+	for f in $SUB_DEFAULT_RESTORE; do
+		[ -f "$f.monitor-orig" ] || continue
+		mv -f "$f.monitor-orig" "$f" 2>/dev/null || true
+	done
+	SUB_DEFAULT_RESTORE=""
+}
+
 # 让 nginx 把订阅路径转到我们的回环端口。写成一个独立文件，不动别人的站点。
 #
 # 必须是 default_server：同端口上已经有别的 server 时，`server_name _` 那份会被
@@ -874,6 +957,19 @@ write_sub_nginx() {
 		backup="$SUB_NGINX_CONF.monitor-prev"
 		cp "$SUB_NGINX_CONF" "$backup" 2>/dev/null || backup=""
 	fi
+	# 同端口上已经有别人的 default_server 时，我们这份根本装不进去（nginx 报
+	# duplicate default server）。先把坑挪开，再写自己那份。
+	#
+	# 挪之前要把**上一轮我们写的那份**先移出配置树：它还带着一个
+	# `listen $SUB_PORT default_server`，若留在原地，下面 patch 里那次 `nginx -t`
+	# 就会因为我们自己那份而报 duplicate，于是 patch 以为「是我把别人改坏了」，
+	# 误把摘掉的标记还回去 —— 结果新那份照样装不进去。
+	#
+	# 内容已经在 $backup 里，移走不丢东西。
+	if [ -n "$backup" ]; then
+		rm -f "$SUB_NGINX_CONF"
+	fi
+	sub_default_server_patch "$SUB_PORT"
 	cat >"$SUB_NGINX_CONF" <<CONF
 # Written by monitor's install.sh; removed by install.sh --uninstall.
 server {
@@ -908,9 +1004,14 @@ CONF
 		# 连旧的那份都不通，说明问题不在我们这儿；撤掉，避免把一份 nginx
 		# 起不来的配置留在 conf.d 里 —— 那会让 reload 把整个 nginx 打死。
 		rm -f "$SUB_NGINX_CONF"
+		# 我们这份也要撤，那从别人那儿摘来的 default_server 就没有理由继续
+		# 挂着 —— 还回去，恢复原样。返回 2 的那条路**不能**还原：旧配置也
+		# 要靠这个 default_server 才装得进去。
+		sub_default_server_unpatch
 		return 1
 	fi
 	rm -f "$SUB_NGINX_CONF"
+	sub_default_server_unpatch
 	return 1
 }
 
@@ -1059,14 +1160,220 @@ sub_caps() {
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
 }
 
+# ---------------------------------------------------------------- 延迟探针
+#
+# 面板上的「网络延迟」页要有数据，得有人真的走一遍代理链路去量。这件事 agent
+# 做不了：它量的是 TCP 握手到 `host:port`，而这里要的是「请求经 VLESS/Hysteria2
+# 出到外面再绕回来的耗时」—— 那需要一个 sing-box **客户端**，把本地的 HTTP
+# inbound 路由到真实的代理 outbound。
+#
+# 原先这活儿交给 `probe/`，而它的 README 写着 "Optional" 加一串手工步骤：自己填
+# `YOUR_SERVER_IP`、`YOUR_VLESS_UUID`、`YOUR_REALITY_PUBLIC_KEY`…… 于是没有任何
+# 人做。面板上那个页签永远空着，只写一句「这段时间没有延迟数据」，看不出是没装
+# 还是坏了。**而这一条正好是最该自动的**：凭据本来就是这台机器刚刚生成的，安装器
+# 手里就有。
+#
+# 所以 provision 成功之后，安装器自己把客户端配起来。取的是 `provision` 刚打印的
+# 那份 JSON（$VPN_JSON），字段与它写给订阅的逐个对应，所以探针量的就是客户端真正
+# 会走的链路，不是另一条。
+#
+# 失败不致命，与其它可选段一致：探测是锦上添花，装不上不该把一次成功的安装判成
+# 失败，但要说出来。
+PROBE_DIR="/opt/probe"
+PROBE_DB="$ROOT/data/monitor.db"
+# 本地 inbound 的端口，与 probe.py 的默认 PROBE_TARGETS 对齐。
+PROBE_VLESS_PORT="18083"
+PROBE_HY2_PORT="18084"
+
+# 从一行 JSON 里取一个字符串键的值。没有 jq 可用（机器上不保证有），所以按老办法
+# 抓：**先按逗号拆行**，否则单行 JSON 上只会拿到第一个匹配，其余的静默漏掉。
+json_str() {
+	printf '%s' "$1" | tr ',' '\n' | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n 1
+}
+
+setup_latency_probe() {
+	[ -z "$NO_VPN" ] || return 0
+	[ -n "$VPN_JSON" ] || return 0
+
+	server=$(json_str "$VPN_JSON" server)
+	uuid=$(json_str "$VPN_JSON" uuid)
+	pbk=$(json_str "$VPN_JSON" reality_public_key)
+	sid=$(json_str "$VPN_JSON" short_id)
+	hy2pw=$(json_str "$VPN_JSON" hy2_password)
+	obfspw=$(json_str "$VPN_JSON" obfs_password)
+	# HY2 的 sni 是自签证书的 CN：有域名时是那个域名，没有时是地址本身。
+	# 客户端拿它去 SNI。`insecure` 已开，所以对不上也能连 —— 但仍然要用对，
+	# 否则用户拿着一个「能连但证书永远对不上」的配置去排查别的地方。
+	sni=$(json_str "$VPN_JSON" sni)
+	[ -n "$sni" ] || sni="$server"
+	for v in "$server" "$uuid" "$pbk" "$sid" "$hy2pw" "$obfspw"; do
+		[ -n "$v" ] || {
+			echo "warning: the deployment report is missing a credential, so the latency probe is skipped" >&2
+			return 0
+		}
+	done
+
+	# 有没有 python3。没有就不装：探针是 Python 写的，装了也是死的。
+	command -v python3 >/dev/null 2>&1 || {
+		echo "note: python3 is not installed, so the latency probe stays off" >&2
+		return 0
+	}
+	# 客户端 sing-box。与服务端是同一个二进制 —— 包安装时已经有了；这里只是
+	# 确认它在，因为单元要拿它当 ExecStart。
+	command -v sing-box >/dev/null 2>&1 || {
+		echo "note: sing-box is not on PATH, so the latency probe stays off" >&2
+		return 0
+	}
+
+	mkdir -p "$PROBE_DIR" || return 0
+
+	# 客户端配置。inbound 是本地 HTTP，route 把每个 inbound 钉到一个 outbound。
+	# 两个 inbound 各测一条协议，所以面板上 VLESS 与 HY2 各有一条自己的曲线。
+	cat >"$PROBE_DIR/sing-box.json" <<PROBE_CFG
+{
+  "log": { "level": "warn" },
+  "inbounds": [
+    { "type": "http", "tag": "in-vless", "listen": "127.0.0.1", "listen_port": $PROBE_VLESS_PORT },
+    { "type": "http", "tag": "in-hy2",   "listen": "127.0.0.1", "listen_port": $PROBE_HY2_PORT }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "vless",
+      "server": "$server",
+      "server_port": 443,
+      "uuid": "$uuid",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.cloudflare.com",
+        "utls": { "enabled": true, "fingerprint": "chrome" },
+        "reality": { "enabled": true, "public_key": "$pbk", "short_id": "$sid" }
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy2",
+      "server": "$server",
+      "server_port": 443,
+      "password": "$hy2pw",
+      "obfs": { "type": "salamander", "password": "$obfspw" },
+      "tls": { "enabled": true, "server_name": "$sni", "insecure": true }
+    }
+  ],
+  "route": {
+    "rules": [
+      { "inbound": ["in-vless"], "outbound": "vless" },
+      { "inbound": ["in-hy2"],   "outbound": "hy2" }
+    ]
+  }
+}
+PROBE_CFG
+	chmod 0600 "$PROBE_DIR/sing-box.json"
+
+	# 探针本体。从 hub 取，与 install.sh 同一个来源 —— 本仓库在安装期不允许依赖
+	# 外部地址，而 hub 是这台机器已经在说话的对方。
+	url="${SERVER%/}/probe.py"
+	if ! curl -sSL $CURL_INSECURE --max-time 60 "$url" -o "$PROBE_DIR/probe.py" 2>/dev/null ||
+		! grep -q 'ping_record' "$PROBE_DIR/probe.py" 2>/dev/null; then
+		echo "warning: could not fetch the latency prober from $url; the latency page will stay empty" >&2
+		echo "         run the install again, or copy probe/probe.py there by hand" >&2
+		rm -f "$PROBE_DIR/probe.py"
+		return 0
+	fi
+	chmod 0755 "$PROBE_DIR/probe.py"
+
+	# 两个单元：一个跑客户端，一个跑测量。测量那个要等客户端起来 —— 否则第一轮
+	# 全部拨不通，全被跳过（探针在失败时**不写** -1，见它的文档），面板上于是
+	# 又是什么都没有，而这次连"没装"都不是。
+	#
+	# PROBE_TARGETS 只写 tag:port：node id 由探针按 task 从 ping_node 反查。
+	# 安装器这时**不知道**这个节点在面板上的 id —— agent 拿到的是 token，不是
+	# id —— 写个常数会把本机的测量记到编号恰好是 1 的那个节点名下。
+	cat >/etc/systemd/system/probe-singbox.service <<UNIT1
+[Unit]
+Description=Proxy probe sing-box client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$(command -v sing-box) run -c $PROBE_DIR/sing-box.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT1
+	cat >/etc/systemd/system/monitor-probe.service <<UNIT2
+[Unit]
+Description=Latency probe through the local proxies
+After=network-online.target probe-singbox.service
+Wants=network-online.target
+Requires=probe-singbox.service
+
+[Service]
+Type=simple
+Environment=PROBE_DB=$PROBE_DB
+Environment=PROBE_INTERVAL=60
+Environment=PROBE_TARGETS=vless:$PROBE_VLESS_PORT,hy2:$PROBE_HY2_PORT
+ExecStart=$(command -v python3) $PROBE_DIR/probe.py
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+UNIT2
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	if systemctl enable --now probe-singbox.service >/dev/null 2>&1 &&
+		systemctl enable --now monitor-probe.service >/dev/null 2>&1; then
+		echo "latency probe enabled (VLESS + HY2 through 127.0.0.1:$PROBE_VLESS_PORT/$PROBE_HY2_PORT)"
+		touch "$ROOT/.probe-installed" 2>/dev/null || true
+	else
+		echo "warning: the latency probe files were written but its services did not start" >&2
+	fi
+	return 0
+}
+
+# 装过的探针要撤干净：单元、客户端配置、探针本体。数据（ping_record）留在库里，
+# 那是面板的历史，不属于"装的东西"。
+#
+# 与 `--uninstall` 里那段是同一件事 —— 那一段在顶层、函数定义之前，只能就地写，
+# 所以这里的名字与路径必须与它逐字一致，改一处要改两处。
+drop_latency_probe() {
+	systemctl disable --now monitor-probe.service >/dev/null 2>&1 || true
+	systemctl disable --now probe-singbox.service >/dev/null 2>&1 || true
+	rm -f /etc/systemd/system/monitor-probe.service /etc/systemd/system/probe-singbox.service
+	rm -rf "$PROBE_DIR"
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	rm -f "$ROOT/.probe-installed" 2>/dev/null || true
+}
+
 configure_optional_vpn() {
     [ -z "$NO_VPN" ] || { echo "keeping existing subscription settings (--no-vpn)"; return 0; }
     if ! provision_vpn; then
         echo "warning: monitoring is installed; VPN setup did not complete" >&2
         return 0
     fi
-    if setup_subscription; then report_vpn;
-    else echo "warning: monitoring is installed; subscription setup failed" >&2; fi
+    # 先上报，再伺服订阅。
+    #
+    # 这两件事的成败是独立的：`provision_vpn` 成功就意味着 sing-box 已经在跑、
+    # 凭据已经生成、客户端拿到的链接已经能用 —— 面板该显示「已部署」。而订阅伺服
+    # 只是把那份链接放到一个 URL 上；它失败只影响「能不能一键导入」，不影响
+    # 「VPN 有没有部署」。
+    #
+    # 原来把上报放进 `setup_subscription` 的成功分支，于是订阅服务器的任何毛病
+    # （端口占不到、nginx 拒了配置）都会让面板永久显示「未部署 VPN」，而节点实际
+    # 正在转发流量 —— 用户看着面板去找一个已经在跑的 VPN，且输出里没有一个字
+    # 解释这个矛盾。
+    report_vpn
+    if ! setup_subscription; then
+        echo "warning: the VPN is deployed and working, but its subscription link could not be served" >&2
+        echo "         clients can still import the node from the panel's node list" >&2
+    fi
+    # 最后才是探针：它要的是刚 provision 出来的凭据，而此刻那些已经在
+    # $VPN_JSON 里了。放在订阅之后，是因为订阅失败与否都不影响能不能测延迟。
+    setup_latency_probe
 }
 
 # agent 的单元。抽成函数是因为订阅那边可能还要再写一次：绑 80 需要能力，而那是

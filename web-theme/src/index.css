@@ -28,16 +28,19 @@
   --destructive: oklch(0.3 0 0);
   --border: oklch(0.9 0 0);
   --ring: oklch(0.62 0 0);
-  --chart-1: oklch(0.3 0 0);
-  --chart-2: oklch(0.45 0 0);
-  --chart-3: oklch(0.58 0 0);
-  --chart-4: oklch(0.7 0 0);
-  --chart-5: oklch(0.82 0 0);
-  /* Greyscale has no green or amber, so lightness carries both: --ok draws the
-     download line, lighter than the upload's --chart-1, and --warn an expiry
-     within a week, darker than the muted text beside it. */
-  --ok: oklch(0.62 0 0);
-  --warn: oklch(0.44 0 0);
+  /* The chart palette carries meaning, not decoration: --ok is the download
+     line and must read green, --warn an expiry within a week. Both are the same
+     hues the dashboard uses, so a node's throughput means the same thing in the
+     panel and in the client theme. The remaining five tone the traffic and
+     resource curves, distinct under red-green colour blindness by lightness as
+     well as hue. */
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --ok: oklch(0.63 0.17 149);
+  --warn: oklch(0.75 0.17 70);
   /* The status dot. Each clears 3:1 against the card (3.7 and 5.5), and 1.5:1
      against the other, the separation red-green colour blindness still
      perceives. */
@@ -64,14 +67,15 @@
   --destructive: oklch(0.95 0 0);
   --border: oklch(1 0 0 / 12%);
   --ring: oklch(0.55 0 0);
-  --chart-1: oklch(0.95 0 0);
-  --chart-2: oklch(0.82 0 0);
-  --chart-3: oklch(0.68 0 0);
-  --chart-4: oklch(0.54 0 0);
-  --chart-5: oklch(0.42 0 0);
-  /* Inverted against the dark ground: --warn is brighter than the muted text. */
-  --ok: oklch(0.62 0 0);
-  --warn: oklch(0.79 0 0);
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+  /* Brighter than the light palette: on the dark ground the same hues need more
+     lightness to clear the card behind them. */
+  --ok: oklch(0.7 0.16 150);
+  --warn: oklch(0.8 0.16 75);
   /* 7.8 and 3.7 against the card, 2.1 apart. The muted grey would sit 1.15 from
      the green. */
   --online: oklch(0.72 0.17 150);
