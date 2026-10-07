@@ -9,3 +9,11 @@ probe/*.json linguist-vendored
 *.lock text eol=lf
 *.yml text eol=lf
 *.md text eol=lf
+
+# Keep GitHub language statistics focused on the three primary languages.
+# Other files retain their original contents and syntax highlighting.
+* -linguist-detectable
+*.rs linguist-detectable
+*.ts linguist-detectable
+*.tsx linguist-detectable
+*.sh linguist-detectable
