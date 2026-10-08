@@ -605,6 +605,10 @@ const MIN_PROBE_INTERVAL: i64 = 5;
 const MAX_PROBES: usize = 64;
 /// 够一次跨洋握手，又不至于让黑洞目标把下一次探测挤到间隔之外。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+// VPN deployment restarts sing-box and the agent together. Give the local
+// inbounds a moment to bind before the first proxy sample, otherwise a healthy
+// tunnel is drawn with one artificial loss at the deployment boundary.
+const PROXY_WARMUP: Duration = Duration::from_secs(5);
 
 /// 一次 TCP 连接的耗时，毫秒；连不上回报 -1。
 ///
@@ -724,6 +728,9 @@ async fn run_probe(
     let period = Duration::from_secs(interval.max(MIN_PROBE_INTERVAL) as u64);
     let mut ticker = tokio::time::interval(period);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    if proxies.supports(&target) {
+        tokio::time::sleep(PROXY_WARMUP).await;
+    }
     loop {
         ticker.tick().await;
         let latency = if proxies.supports(&target) {

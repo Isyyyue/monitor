@@ -475,6 +475,12 @@ const SINGBOX_BIN: &str = "/usr/bin/sing-box";
 /// the packaged one.
 pub fn ensure_singbox() -> Result<()> {
     let had_repo = Path::new(SAGERNET_SOURCES).exists();
+    let has_binary = Path::new(SINGBOX_BIN).exists();
+    let has_service_user = std::process::Command::new("getent")
+        .args(["passwd", "sing-box"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
     if !had_repo {
         // Official instructions: https://sing-box.sagernet.org/installation/package-manager/
         std::fs::create_dir_all("/etc/apt/keyrings").context("mkdir /etc/apt/keyrings")?;
@@ -482,9 +488,15 @@ pub fn ensure_singbox() -> Result<()> {
         run_cmd("chmod", &["a+r", SAGERNET_KEY])?;
         std::fs::write(SAGERNET_SOURCES, SAGERNET_BODY).context("write sagernet.sources")?;
     }
-    if !had_repo || !Path::new(SINGBOX_BIN).exists() {
+    if !had_repo || !has_binary {
         run_cmd("apt-get", &["update"])?;
         run_cmd("apt-get", &["install", "-y", "sing-box"])?;
+    } else if !has_service_user {
+        // A package can remain installed after an over-aggressive cleanup
+        // removed its service account. A plain install is then a no-op and
+        // systemd fails later with status=217/USER; reinstall the package so
+        // its maintainer scripts recreate the account and ownership.
+        run_cmd("apt-get", &["install", "--reinstall", "-y", "sing-box"])?;
     }
     Ok(())
 }

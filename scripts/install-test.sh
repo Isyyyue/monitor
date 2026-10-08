@@ -666,10 +666,9 @@ patched=$(awk '
 	fail "write_sub_nginx never calls sub_default_server_patch on the port, so a stock nginx still breaks it"
 
 # The uninstall branch at the top of the script runs before any function is
-# defined, so it cannot call sub_default_server_unpatch; it restores in place.
-# Both use the same `nginx -T` file walk, or one would miss what the other moved.
+# defined, so it restores the private manifest itself.
 awk '/^if \[ -n "\$UNINSTALL" \]; then$/,/^fi$/' "$INSTALL" |
-	grep -q 'monitor-orig' ||
+	grep -q 'SUB_DEFAULT_MANIFEST' ||
 	fail "uninstall does not restore the default_server markers it removed"
 
 # Exercised against a directory tree with nginx stubbed, so the file handling and
@@ -691,6 +690,9 @@ patch_probe() {
 	(
 		cd "$root" || exit 1
 		SUB_NGINX_CONF="$root/conf.d/monitor-sub.conf"
+		ROOT="$root"
+		SUB_DEFAULT_BACKUP_DIR="$root/monitor-state"
+		SUB_DEFAULT_MANIFEST="$SUB_DEFAULT_BACKUP_DIR/manifest"
 		export SUB_NGINX_CONF
 		extract sub_default_server_patch >"$DIR/fn-patch.sh"
 		sed -i 's#/etc/nginx#'"$root"'#g' "$DIR/fn-patch.sh"
@@ -717,37 +719,40 @@ patch_probe() {
 		commented=$(grep -c '# default_server (monitor' "$root/sites-enabled/default" || true)
 		kept=$(grep -c 'root /var/www/html' "$root/sites-enabled/default" || true)
 		orig=$(find "$root" -name '*.monitor-orig' | wc -l | tr -d ' ')
+		backup=$(find "$root/monitor-state" -type f ! -name manifest | wc -l | tr -d ' ')
 		# 8444 must be untouched: a different port is someone else's business.
 		other=$(grep -c 'listen 8444 ssl default_server' "$root/sites-enabled/monitor-hub-https.conf" || true)
-		printf 'marked=%s commented=%s kept=%s orig=%s other=%s' \
-			"$marked" "$commented" "$kept" "$orig" "$other"
+		printf 'marked=%s commented=%s kept=%s orig=%s backup=%s other=%s' \
+			"$marked" "$commented" "$kept" "$orig" "$backup" "$other"
 	)
 }
 
 got=$(patch_probe accept)
 check "the other default_server on 80 is taken over, its site kept" \
-	"marked=0 commented=1 kept=1 orig=1 other=1" "$got"
+	"marked=0 commented=1 kept=1 orig=0 backup=1 other=1" "$got"
 
 # A tree that still will not validate must be left exactly as it was found: a
 # patch we could not justify would otherwise be a machine we broke.
 got=$(patch_probe reject)
 check "a refused patch is rolled back, marker and site intact" \
-	"marked=1 commented=0 kept=1 orig=0 other=1" "$got"
+	"marked=1 commented=0 kept=1 orig=0 backup=0 other=1" "$got"
 
 # And the restore puts the file back the way it was. Run against a tree patched
-# by the accept case above, whose .monitor-orig is the untouched original.
+# by the accept case above, whose private backup is the untouched original.
 (
 	root="$DIR/default-server"
 	# The reject case above rebuilt the tree; lay down the patched state again.
+	mkdir -p "$root/monitor-state"
 	printf 'server {\n\tlisten 80 default_server;\n\troot /var/www/html;\n}\n' \
-		>"$root/sites-enabled/default.monitor-orig"
+		>"$root/monitor-state/original"
 	printf 'server {\n\tlisten 80 # default_server (monitor: moved to monitor-sub.conf);\n\troot /var/www/html;\n}\n' \
 		>"$root/sites-enabled/default"
 	(
 		cd "$root" || exit 1
 		SUB_NGINX_CONF="$root/conf.d/monitor-sub.conf"
-		# shellcheck disable=SC2034
-		SUB_DEFAULT_RESTORE="$root/sites-enabled/default"
+		SUB_DEFAULT_BACKUP_DIR="$root/monitor-state"
+		SUB_DEFAULT_MANIFEST="$root/monitor-state/manifest"
+		printf '%s|%s\n' "$root/monitor-state/original" "$root/sites-enabled/default" >"$SUB_DEFAULT_MANIFEST"
 		load sub_default_server_unpatch
 		sub_default_server_unpatch
 	)
@@ -755,8 +760,7 @@ check "a refused patch is rolled back, marker and site intact" \
 		fail "unpatch did not restore the original default_server"
 	grep -q 'root /var/www/html' "$root/sites-enabled/default" ||
 		fail "unpatch lost the site it restored"
-	[ -z "$(find "$root" -name '*.monitor-orig')" ] ||
-		fail "unpatch left a .monitor-orig file behind"
+	[ ! -e "$root/monitor-state" ] || fail "unpatch left the private backup directory behind"
 	echo "  ok  unpatch restores the original file byte for byte"
 )
 

@@ -59,6 +59,11 @@ SUB_BACKUP_DIR=""
 SUB_LEGACY_RUNNING=""
 # 被我们摘掉 default_server 的那些文件，卸载时逐行还原。
 SUB_DEFAULT_RESTORE=""
+# Backups must not live below an nginx include glob such as sites-enabled/*.
+# Keep the original file and its path in a private manifest under the Monitor
+# root, then restore it explicitly on uninstall or rollback.
+SUB_DEFAULT_BACKUP_DIR="$ROOT/.nginx-default-backups"
+SUB_DEFAULT_MANIFEST="$SUB_DEFAULT_BACKUP_DIR/manifest"
 read_prev_sub() {
 	[ -f "$ENV_FILE" ] || return 0
 	SUB_PREV_PUBLIC=$(sed -n 's/^MONITOR_SUB_PUBLIC_PORT=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
@@ -166,12 +171,13 @@ if [ -n "$UNINSTALL" ]; then
 	# sites-enabled/default 就带着一个）。卸载要把那些字还回去，否则那个站点
 	# 在 80 端口上永远不再兜底，而没有任何地方提过这事。
 	#
-	# 这里在顶层、函数定义之前，所以逻辑就地写：踩路是 `nginx -T` 报的文件列表，
-	# 与安装时那次的取值方式保持逐字一致。
-	for _f in $(nginx -T 2>/dev/null | sed -n 's/^# configuration file \(.*\):$/\1/p'); do
-		[ -f "$_f.monitor-orig" ] || continue
-		mv -f "$_f.monitor-orig" "$_f" 2>/dev/null || true
-	done
+	# The manifest is outside nginx's include paths. Restore each file explicitly.
+	if [ -f "$SUB_DEFAULT_MANIFEST" ]; then
+		while IFS='|' read -r _backup _f; do
+			[ -f "$_backup" ] && mv -f "$_backup" "$_f" 2>/dev/null || true
+		done <"$SUB_DEFAULT_MANIFEST"
+		rm -rf "$SUB_DEFAULT_BACKUP_DIR"
+	fi
 	if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
 		systemctl reload nginx 2>/dev/null || rc-service nginx reload >/dev/null 2>&1 || true
 	fi
@@ -984,6 +990,7 @@ sub_default_server_patch() {
 	# —— 有些发行版把整个 sites-enabled 也塞在 include 里，有些不是。
 	files=$(nginx -T 2>/dev/null | sed -n 's/^# configuration file \(.*\):$/\1/p')
 	[ -n "$files" ] || return 0
+	mkdir -p "$SUB_DEFAULT_BACKUP_DIR" || return 0
 	for f in $files; do
 		[ -f "$f" ] || continue
 		# 不动自己那份：它的 default_server 正是我们要留下的。
@@ -992,7 +999,8 @@ sub_default_server_patch() {
 		# 只挑「监听这个端口、且带 default_server」的那些 listen 行。
 		# 端口要按词边界匹配，否则 8080 会被 ":80" 连带命中。
 		grep -qE "^[[:space:]]*listen[[:space:]]+(\[::\]:)?$1[[:space:]].*default_server" "$f" 2>/dev/null || continue
-		cp "$f" "$f.monitor-orig" 2>/dev/null || continue
+		backup="$SUB_DEFAULT_BACKUP_DIR/$(printf '%s' "$f" | sha256sum | cut -d' ' -f1)"
+		cp "$f" "$backup" 2>/dev/null || continue
 		# 只把 `default_server` 这四个字注释掉：站点本身（root、location、
 		# try_files）一个字不动，它照旧服务自己的 server_name，只是不再兜底。
 		sed -i -E "s@^([[:space:]]*listen[[:space:]]+(\[::\]:)?$1[[:space:]].*)default_server(.*)\$@\1\3 # default_server (monitor: moved to monitor-sub.conf)@" "$f"
@@ -1003,21 +1011,29 @@ sub_default_server_patch() {
 		else
 			# 改完反而验不过（比如那个文件本来就有别的毛病）—— 还原，别把
 			# 机器上本来能用的配置弄坏。
-			cp "$f.monitor-orig" "$f" 2>/dev/null || true
-			rm -f "$f.monitor-orig"
+			cp "$backup" "$f" 2>/dev/null || true
+			rm -f "$backup"
 		fi
 	done
-	# 改完都行不通时，把 .monitor-orig 清掉不留垃圾。
-	[ -n "$SUB_DEFAULT_RESTORE" ] || rm -f /etc/nginx/conf.d/*.monitor-orig /etc/nginx/sites-*/*.monitor-orig 2>/dev/null || true
+	# Record only accepted changes. The backup stays outside nginx's include tree
+	# until uninstall or a later rollback restores it.
+	[ -n "$SUB_DEFAULT_RESTORE" ] && {
+		for f in $SUB_DEFAULT_RESTORE; do
+			backup="$SUB_DEFAULT_BACKUP_DIR/$(printf '%s' "$f" | sha256sum | cut -d' ' -f1)"
+			printf '%s|%s\n' "$backup" "$f" >>"$SUB_DEFAULT_MANIFEST"
+		done
+	} || rm -rf "$SUB_DEFAULT_BACKUP_DIR"
 	return 0
 }
 
 # 把上面摘掉的 default_server 还回去。
 sub_default_server_unpatch() {
-	for f in $SUB_DEFAULT_RESTORE; do
-		[ -f "$f.monitor-orig" ] || continue
-		mv -f "$f.monitor-orig" "$f" 2>/dev/null || true
-	done
+	if [ -f "$SUB_DEFAULT_MANIFEST" ]; then
+		while IFS='|' read -r backup f; do
+			[ -f "$backup" ] && mv -f "$backup" "$f" 2>/dev/null || true
+		done <"$SUB_DEFAULT_MANIFEST"
+		rm -rf "$SUB_DEFAULT_BACKUP_DIR"
+	fi
 	SUB_DEFAULT_RESTORE=""
 }
 
