@@ -555,13 +555,21 @@ pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
 
 async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
         // Closed rather than downgraded to the public frame, which would leave the
         // panel rendering a list with every admin field missing. The close allows
         // a client to re-query /api/me and determine its current state.
         let Some(full) = stream_audience(&app, session.as_deref()) else { break };
-        if socket.send(Message::Text(live_snapshot(&app, full))).await.is_err() {
+        if !matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                socket.send(Message::Text(live_snapshot(&app, full)))
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
             break;
         }
     }
@@ -1233,6 +1241,9 @@ pub async fn reorder_ping_tasks(_: Admin, State(app): State<Shared>, Json(order)
 /// draws a probe at 100% loss indefinitely with nothing in any log identifying
 /// the target as the cause.
 fn valid_target(target: &str) -> bool {
+    if matches!(target, "proxy:vless" | "proxy:hy2") {
+        return true;
+    }
     let (host, port) = match target.strip_prefix('[') {
         Some(rest) => match rest.split_once("]:") {
             Some(pair) => pair,
@@ -1262,7 +1273,7 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
     // A TCP probe requires an explicit port; a bare host would silently never
     // connect.
     if !valid_target(&task.target) {
-        return bad("目标要写成「主机:端口」，例如 1.1.1.1:443 或 [2606:4700:4700::1111]:443");
+        return bad("目标要写成「主机:端口」，例如 1.1.1.1:443；代理链路用 proxy:vless 或 proxy:hy2");
     }
     // Refused rather than clamped, for the reason `setting_error` gives for
     // `retention_days`: the agent clamps this again on arrival, so an
@@ -2563,12 +2574,27 @@ mod tests {
         // Each of these causes `lookup_host` to return an error, verified against
         // it: a bare IPv6 address is all colons, and the other two omit the half
         // the message requires.
-        for bad in
-            ["2606:4700:4700::1111", ":443", "example.com:", "1.1.1.1", "1.1.1.1:0", "[::1]:x", "[::1]"]
-        {
+        for bad in [
+            "2606:4700:4700::1111",
+            ":443",
+            "example.com:",
+            "1.1.1.1",
+            "1.1.1.1:0",
+            "[::1]:x",
+            "[::1]",
+            "proxy:other",
+            "proxy:",
+        ] {
             assert!(!valid_target(bad), "{bad}");
         }
-        for good in ["1.1.1.1:443", "[2606:4700:4700::1111]:443", "example.com:80", "[::1]:1"] {
+        for good in [
+            "1.1.1.1:443",
+            "[2606:4700:4700::1111]:443",
+            "example.com:80",
+            "[::1]:1",
+            "proxy:vless",
+            "proxy:hy2",
+        ] {
             assert!(valid_target(good), "{good}");
         }
     }
