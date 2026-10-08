@@ -855,8 +855,7 @@ grep -q '^setup_latency_probe() {' "$INSTALL" ||
 	fail "install.sh has no setup_latency_probe"
 grep -q '^json_str() {' "$INSTALL" ||
 	fail "install.sh has no json_str"
-# Called from the VPN path, and only after the report, so the probe can rely on
-# $VPN_JSON being the deployment it just reported.
+# Called after provision with its explicit credentials, independent of subscription validation.
 probe_call=$(awk '
 	index($0, "setup_latency_probe") && !index($0, "setup_latency_probe()") {
 		line = $0
@@ -894,22 +893,10 @@ check "the last key on the line is still read" "http://1.2.3.4/sub-a.yaml" "$(js
 grep -q 'missing a credential' "$INSTALL" ||
 	fail "setup_latency_probe writes a config even when a credential is missing"
 
-# And it must not claim to have installed the probe when the runtime it needs is
-# absent -- python3 for the prober, sing-box for the client.
-grep -q 'python3 is not installed' "$INSTALL" ||
-	fail "the probe does not check for python3"
-grep -q 'sing-box is not on PATH' "$INSTALL" ||
-	fail "the probe does not check for sing-box"
-
-# The node id is not written into PROBE_TARGETS: the agent holds a token, never
-# an id, so a constant there would file this machine's latency under whichever
-# node happens to be number 1. The prober looks it up from ping_node instead.
-grep -q 'PROBE_TARGETS=vless:\$PROBE_VLESS_PORT,hy2:\$PROBE_HY2_PORT' "$INSTALL" ||
-	fail "PROBE_TARGETS carries a node id, which the installer has no way to know"
-grep -q '^def node_for(' "$ROOT/probe/probe.py" ||
-	fail "probe.py has no node_for, so a two-field target cannot be resolved"
-grep -q 'SELECT node_id FROM ping_node WHERE task_id' "$ROOT/probe/probe.py" ||
-	fail "probe.py does not look the node up from ping_node"
+# The sampler lives in Agent; only sing-box remains a separate client.
+grep -q 'supports-proxy-probes' "$INSTALL" || fail "installer does not check proxy capability"
+grep -q 'MONITOR_PROXY_PORTS=vless:' "$INSTALL" || fail "installer does not configure agent proxy ports"
+grep -q 'sing-box is not on PATH' "$INSTALL" || fail "probe client is not checked"
 
 # Uninstall must take the probe with it: it runs its own sing-box client, which
 # would otherwise keep holding 127.0.0.1:18083/18084 with nothing left to test.
@@ -996,13 +983,13 @@ seeded=$(awk '
 		if (substr(line, 1, 1) != "#" && substr(line, 1, 1) != ":") n++
 	}
 	END { print n + 0 }
-' "$ROOT/web-admin/src/components/Admin.tsx")
+' "$ROOT/web-admin/src/components/admin/Nodes.tsx" "$ROOT/web-admin/src/components/admin/Deploy.tsx")
 [ "$seeded" = 4 ] ||
 	fail "expected all four certificate switches seeded from selfSigned, found $seeded"
 # The switch must still be operator-overridable: seeding the state is not the
 # same as latching it, and a hub behind a proxy the installer did not configure
 # may legitimately differ from what --https recorded.
-live 'onCheckedChange={onChange}' "$ROOT/web-admin/src/components/Admin.tsx" ||
+live 'onCheckedChange={onChange}' "$ROOT/web-admin/src/components/admin/shared.tsx" ||
 	fail "the certificate switch can no longer be changed by the operator"
 
 echo "install-test: ok"

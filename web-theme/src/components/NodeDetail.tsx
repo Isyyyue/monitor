@@ -201,6 +201,7 @@ export function NodeDetail({ node, historyDays, onBack }: {
 
   useEffect(() => {
     let active = true
+    const controller = new AbortController()
     // The charts must not continue drawing the old range while the new one is in
     // flight.
     // oxlint-disable-next-line react/set-state-in-effect
@@ -221,12 +222,13 @@ export function NodeDetail({ node, historyDays, onBack }: {
     const series = tab === "latency" ? "ping" : "metrics"
     api<{ metrics: Point[]; ping: PingPoint[]; probes: Probes; loss?: Loss }>(
       `/nodes/${node.id}/metrics?hours=${hours}&points=${points}&series=${series}`,
+      { signal: controller.signal },
     )
       .then((next) => { if (active) setData(next) })
       .catch((e: Error) => {
         if (active) { setFailed(e.message); setData({ metrics: [], ping: [], probes: {} }) }
       })
-    return () => { active = false }
+    return () => { active = false; controller.abort() }
   }, [node.id, hours, tab, attempt])
 
   const m = node.metrics
@@ -235,13 +237,17 @@ export function NodeDetail({ node, historyDays, onBack }: {
   // seconds as live metrics arrive, and rebuilding the chart's data array on those
   // renders would reset the brush.
   const pingSeries = useMemo(
-    () =>
-      [...new Set((data?.ping ?? []).map((p) => p.task_id))]
-        .map((id) => {
+    () => {
+      const grouped = new Map<number, PingPoint[]>()
+      for (const point of data?.ping ?? []) {
+        const points = grouped.get(point.task_id)
+        if (points) points.push(point)
+        else grouped.set(point.task_id, [point])
+      }
+      return [...grouped].map(([id, points]) => {
           // Timeouts are retained: dropping them would draw a probe losing half
           // its packets as an unbroken line, and one that never answered not at
           // all.
-          const points = (data?.ping ?? []).filter((p) => p.task_id === id)
           // Taken from the hub rather than summed from the buckets above, each of
           // which is already a percentage of its own bucket, so averaging them
           // would report one lost round in thirteen as 50%. Left unrounded, since
@@ -250,7 +256,7 @@ export function NodeDetail({ node, historyDays, onBack }: {
           const loss = data?.loss?.[id] ?? 0
           return { id, name: data?.probes?.[id] ?? `探测 ${id}`, points, loss }
         })
-        .filter((s) => s.points.length > 0),
+    },
     [data],
   )
 

@@ -13,6 +13,53 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use serde_json::{json, Value};
 
+/// The installer normally holds its own lock; direct provision invocations also
+/// need exclusion around credential reuse, scratch config and rollback files.
+struct ProvisionLock(std::fs::File);
+impl ProvisionLock {
+    fn acquire(directory: &Path) -> Result<Self> {
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+        std::fs::create_dir_all(directory)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(directory.join(".monitor-provision.lock"))?;
+        anyhow::ensure!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+            "another VPN provision is running"
+        );
+        Ok(Self(file))
+    }
+}
+impl Drop for ProvisionLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn running_current_binary() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(pid) = Command::new("systemctl").args(["show", "sing-box", "-p", "MainPID", "--value"]).output()
+    else {
+        return false;
+    };
+    let Ok(pid) = String::from_utf8_lossy(&pid.stdout).trim().parse::<u32>() else {
+        return false;
+    };
+    let (Ok(running), Ok(installed)) =
+        (std::fs::metadata(format!("/proc/{pid}/exe")), std::fs::metadata(SINGBOX_BIN))
+    else {
+        return false;
+    };
+    running.dev() == installed.dev() && running.ino() == installed.ino()
+}
+
 /// Replace a complete file on its own filesystem, retaining its permissions.
 fn atomic_write(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
     atomic_write_mode(path, contents, 0o600)
@@ -585,11 +632,23 @@ pub fn parse_args(values: impl IntoIterator<Item = String>) -> Result<ProvisionA
     Ok(args)
 }
 
+// This is a change detector, not a credential/authentication hash. A Rust
+// toolchain changing the hash representation only causes one safe restart.
+fn certificate_revision(paths: &[&Path]) -> Result<String> {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    for path in paths {
+        std::fs::read(path).with_context(|| format!("read {}", path.display()))?.hash(&mut hash);
+    }
+    Ok(format!("{:016x}", hash.finish()))
+}
+
 /// 执行 provision。**必须在 root 下运行。**
 pub fn run(args: ProvisionArgs) -> Result<()> {
     if unsafe { libc::getuid() } != 0 {
         anyhow::bail!("provision writes /etc and installs packages; run it as root");
     }
+    let _lock = ProvisionLock::acquire(&args.config_dir)?;
     ensure_singbox()?;
 
     let config_path = args.config_dir.join("config.json");
@@ -680,20 +739,42 @@ pub fn run(args: ProvisionArgs) -> Result<()> {
     run_cmd("systemctl", &["daemon-reload"])?;
     let was_active = run_cmd("systemctl", &["is-active", "--quiet", "sing-box"]).is_ok();
     let was_enabled = run_cmd("systemctl", &["is-enabled", "--quiet", "sing-box"]).is_ok();
-    let snapshot =
-        FileSnapshot::capture(&[&config_path, &paths.clash, &paths.v2ray_txt, &paths.v2ray_b64, &state])?;
-    std::fs::rename(&scratch, &config_path).context("replace sing-box config")?;
+    let changed = existing.as_ref() != Some(&serde_json::from_str::<Value>(&rendered)?);
+    let revision_path = args.config_dir.join(".monitor-certificate-revision");
+    let revision = certificate_revision(&[Path::new(CERT_PATH), Path::new(KEY_PATH)])?;
+    let certificates_changed = std::fs::read_to_string(&revision_path).ok().as_deref() != Some(&revision);
+    let restart = changed || certificates_changed || !was_active || !running_current_binary();
+    let snapshot = FileSnapshot::capture(&[
+        &config_path,
+        &paths.clash,
+        &paths.v2ray_txt,
+        &paths.v2ray_b64,
+        &state,
+        &revision_path,
+    ])?;
+    if changed {
+        std::fs::rename(&scratch, &config_path).context("replace sing-box config")?;
+    } else {
+        std::fs::remove_file(&scratch)?;
+    }
     let activate = (|| -> Result<()> {
-        run_cmd("systemctl", &["enable", "sing-box"])?;
-        run_cmd("systemctl", &["restart", "sing-box"])?;
+        if !was_enabled {
+            run_cmd("systemctl", &["enable", "sing-box"])?;
+        }
+        if restart {
+            run_cmd("systemctl", &["restart", "sing-box"])?;
+        }
         run_cmd("systemctl", &["is-active", "--quiet", "sing-box"])?;
-        write_subscriptions(&n, &paths, &state)
+        write_subscriptions(&n, &paths, &state)?;
+        atomic_write(&revision_path, &revision)
     })();
     if let Err(error) = activate {
         snapshot.restore().context("deployment failed and restoring previous files also failed")?;
         if was_active {
-            run_cmd("systemctl", &["restart", "sing-box"])
-                .context("previous files restored but previous service could not restart")?;
+            if restart {
+                run_cmd("systemctl", &["restart", "sing-box"])
+                    .context("previous files restored but previous service could not restart")?;
+            }
             run_cmd("systemctl", &["is-active", "--quiet", "sing-box"])?;
         } else {
             run_cmd("systemctl", &["stop", "sing-box"])?;
@@ -744,6 +825,15 @@ pub fn render_report(n: &Node, paths: &SubscriptionPaths, sub_base: &str, reused
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provision_lock_excludes_concurrent_calls_and_releases_on_drop() {
+        let dir = std::env::temp_dir().join(format!("monitor-lock-{}", super::random_hex(8).unwrap()));
+        let first = super::ProvisionLock::acquire(&dir).unwrap();
+        assert!(super::ProvisionLock::acquire(&dir).is_err());
+        drop(first);
+        assert!(super::ProvisionLock::acquire(&dir).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn failed_publication_restores_previous_and_removes_new_files() {
         let dir = std::env::temp_dir().join(format!("monitor-rollback-{}", super::random_hex(8).unwrap()));

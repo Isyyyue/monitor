@@ -2,13 +2,13 @@
 
 自托管的 Linux 服务器监控与 VPN 部署面板，集中管理节点状态、流量、延迟、到期信息及 Telegram 告警。
 
-Hub 使用 Rust、axum 和 SQLite，管理后台与公开状态页使用 React、TypeScript。前端和默认主题嵌入 Hub 二进制，运行时无需 Node.js 或独立数据库服务。Agent 使用单线程异步运行，指标采集、TCP 探测和订阅服务共用一个进程。
+Hub 使用 Rust、axum 和 SQLite，管理后台与公开状态页使用 React、TypeScript。前端和默认主题嵌入 Hub 二进制，运行时无需 Node.js 或独立数据库服务。Agent 使用单线程异步运行，指标采集、TCP 与代理链路探测、订阅服务共用一个进程。
 
 ## 功能
 
 - **节点监控**：在线状态、系统信息、CPU、负载、内存、磁盘与网络；实时推送、历史趋势、公开或私有节点及独立 token。
 - **流量与账单**：周期用量、额度、计费方式、起始日、到期日、价格与币种。统计来自节点计数器，账单以服务商记录为准。
-- **延迟探测**：Agent 执行 TCP 连通性与延迟任务；[代理探针](probe/README.md)独立测量经 VLESS、Hysteria2 等代理链路的 HTTP 耗时。
+- **延迟探测**：Agent 执行 TCP 连通性与延迟任务，并通过本地 sing-box 客户端连续测量 VLESS、Hysteria2 链路的 HTTP 耗时；[代理探测说明](probe/README.md)。
 - **Telegram 告警**：离线与恢复、流量、到期和后台登录提醒，支持规则及通知模板配置。
 - **数据与主题**：备份、恢复、历史保留、密码与会话管理；主题上传、安装、预览和切换。
 - **VPN 与订阅**：节点安装 sing-box，配置 VLESS + REALITY、Hysteria2，生成 Clash YAML 与 v2rayN TXT/Base64 订阅，并提供流量和到期响应头。
@@ -104,7 +104,7 @@ mkdir -p data
 
 Hub 与 Agent 分别位于 `target/release/monitor-hub`、`agent/target/release/monitor-agent`。Hub 构建脚本自动暂存已构建的默认主题；修改公开页应编辑 `web-theme/`。
 
-主要目录：`src/` 为 Hub，`agent/` 为节点 Agent 与 VPN 配置模块，`web-admin/` 为后台，`web-theme/` 为公开页，`probe/` 为独立代理探针。
+主要目录：`src/` 为 Hub，`agent/` 为节点 Agent 与 VPN 配置模块，`web-admin/` 为后台，`web-theme/` 为公开页，`probe/` 为代理客户端示例与兼容旧部署的探针。
 
 CI 检查两个前端的 lint、测试和构建，Hub/Agent 的格式、Clippy、测试，以及安装脚本和联调。具体命令见 [.github/workflows/ci.yml](.github/workflows/ci.yml)。这些检查不替代目标机器上的安装、升级与代理连通验证。
 

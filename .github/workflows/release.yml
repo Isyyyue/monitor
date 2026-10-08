@@ -9,23 +9,10 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  frontend:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
     steps:
       - uses: actions/checkout@v7
-
-      # A v* tag can be neither moved nor deleted, so one that disagrees with the
-      # version the binary reports stops here, before anything is published.
-      - if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          V=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
-          A=v$(sed -n 's/^version = "\(.*\)"/\1/p' agent/Cargo.toml)
-          [ "$V" = "$A" ] || { echo "::error::hub and agent versions disagree"; exit 1; }
-          [ "$GITHUB_REF_NAME" = "$V" ] || { echo "::error::tag $GITHUB_REF_NAME, Cargo.toml $V"; exit 1; }
-
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -44,7 +31,45 @@ jobs:
       # either; it finds both the theme and the panel already in place.
       - run: npm ci && npm run build
         working-directory: web-theme
-      - run: ./scripts/theme.sh
+
+      - run: |
+          git rev-parse HEAD > frontend-revision.txt
+          find web-admin/dist web-theme/dist -type f -print0 | sort -z | xargs -0 sha256sum > frontend-sha256s.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: frontend
+          path: |
+            web-admin/dist
+            web-theme/dist
+            frontend-revision.txt
+            frontend-sha256s.txt
+
+  build:
+    needs: frontend
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v7
+
+      # A v* tag can be neither moved nor deleted, so one that disagrees with the
+      # version the binary reports stops here, before anything is published.
+      - if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          V=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+          A=v$(sed -n 's/^version = "\(.*\)"/\1/p' agent/Cargo.toml)
+          [ "$V" = "$A" ] || { echo "::error::hub and agent versions disagree"; exit 1; }
+          [ "$GITHUB_REF_NAME" = "$V" ] || { echo "::error::tag $GITHUB_REF_NAME, Cargo.toml $V"; exit 1; }
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: frontend
+          path: .
+      - run: |
+          test "$(cat frontend-revision.txt)" = "$(git rev-parse HEAD)"
+          sha256sum -c frontend-sha256s.txt
+          sh scripts/theme.sh
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -66,7 +91,7 @@ jobs:
             monitor-agent-${{ matrix.target }}
 
   release:
-    needs: build
+    needs: [frontend, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -76,6 +101,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
+          pattern: "*-unknown-linux-musl"
           path: bin
           merge-multiple: true
       # A manual dispatch builds and collects the binaries; only a tag publishes,
@@ -98,19 +124,15 @@ jobs:
       # scripts/theme-miku.sh. The panel fetches it by name through
       # /api/themes/{short}/install.
       #
-      # The default theme has to be built here, not borrowed from the build
-      # job: that job's target/ does not travel to this one, and web-theme/dist/
-      # is not committed either, so there is nothing to fall back on. This is
-      # why the archive is assembled in this job rather than packed as an
-      # artifact beside the binaries.
-      - uses: actions/setup-node@v7
+      # Both archives use the same frontend artifact embedded by the two hubs.
+      - uses: actions/download-artifact@v8
         with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: web-theme/package-lock.json
-      - run: npm ci && npm run build
-        working-directory: web-theme
-      - run: ./scripts/theme.sh
+          name: frontend
+          path: .
+      - run: |
+          test "$(cat frontend-revision.txt)" = "$(git rev-parse HEAD)"
+          sha256sum -c frontend-sha256s.txt
+          sh scripts/theme.sh
 
       - if: startsWith(github.ref, 'refs/tags/')
         run: |

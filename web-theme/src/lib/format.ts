@@ -1,24 +1,5 @@
-const UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
-
-const unitOf = (n: number) => Math.min(Math.floor(Math.log(n) / Math.log(1024)), UNITS.length - 1)
-
-/**
- * 1024-based, as VPS dashboards and `df` report bytes, but labelled MB/GB the way
- * `df -h` and hosting plans write them: no plan is sold as "1000 GiB", and the two
- * extra letters push the memory and traffic lines past their column.
- *
- * Three significant digits by default. Two decimals throughout would end the
- * card's lines in an ellipsis on a four-column grid; a pair sharing a unit
- * recovers them through pair() below.
- */
-export function bytes(n: number, digits?: number): string {
-  // `< 1` rather than `< 0`: a fraction of a byte puts `unitOf` at -1 and prints
-  // "512 undefined".
-  if (!n || n < 1) return "0 B"
-  const i = unitOf(n)
-  const v = n / 1024 ** i
-  return `${v.toFixed(i === 0 ? 0 : (digits ?? (v >= 100 ? 0 : v >= 10 ? 1 : 2)))} ${UNITS[i]}`
-}
+import { bytes, UNITS, unitOf } from "../../../shared/format.ts"
+export { bytes, uptime, FOREVER, money } from "../../../shared/format.ts"
 
 /**
  * A "used / total" pair. Sharing a unit means writing it once, and those four
@@ -55,14 +36,6 @@ export function percent(used: number, total: number): number {
   return total > 0 ? (used / total) * 100 : 0
 }
 
-export function uptime(seconds: number): string {
-  if (!seconds) return "—"
-  const d = Math.floor(seconds / 86400)
-  const h = Math.floor((seconds % 86400) / 3600)
-  const m = Math.floor((seconds % 3600) / 60)
-  return d > 0 ? `${d} 天 ${h} 小时` : h > 0 ? `${h} 小时 ${m} 分` : `${m} 分`
-}
-
 /** Whole days until a date, negative once it has passed. */
 export function daysUntil(date?: string | null): number | null {
   if (!date) return null
@@ -76,9 +49,6 @@ export function daysUntil(date?: string | null): number | null {
  * U+221E rather than the emoji, which arrives as a coloured tile from whatever
  * font the visitor has; this inherits the text colour and size.
  */
-export const FOREVER = "∞"
-
-const MONEY = new Map<string, Intl.NumberFormat>()
 
 /**
  * A price as zh-CN writes it: ¥12.00, US$12.00, HK$12.00, JP¥1,200, and the code
@@ -89,20 +59,6 @@ const MONEY = new Map<string, Intl.NumberFormat>()
  * yen would show a price of 0.4 as JP¥0. A formatter costs about 100 µs to
  * build, hence one per currency.
  */
-export function money(amount: number, currency: string): string {
-  try {
-    let format = MONEY.get(currency)
-    if (!format) {
-      format = new Intl.NumberFormat("zh-CN", { style: "currency", currency, maximumFractionDigits: 2 })
-      MONEY.set(currency, format)
-    }
-    return format.format(amount)
-  } catch {
-    // Intl throws on anything but three letters, which hubs before 1.3.1 stored
-    // unchecked when written through the API.
-    return `${currency} ${amount.toFixed(2)}`.trim()
-  }
-}
 
 // Hub 1.3.0 and earlier store only these names; later hubs store any other
 // length as `<n>m`.

@@ -73,6 +73,9 @@ jobs:
       - run: python3 scripts/subscription-state-test.py
       - run: python3 scripts/vpn-opt-in-test.py
       - run: python3 scripts/prompt-pty-test.py
+      - run: python3 scripts/proxy-probe-test.py
+      - run: python3 scripts/upgrade-idempotence-test.py
+      - run: python3 scripts/proxy-install-test.py
 
       # This commit's hub against the latest agent we have released: the field
       # contract between a hub and an agent already running in the field, and
@@ -80,6 +83,8 @@ jobs:
       # agent this hub ships beside is the one it has to keep talking to, and a
       # rename on either side is exactly the breakage this catches.
       - run: cargo build
+      - run: cargo build --locked --manifest-path agent/Cargo.toml
+      - run: python3 scripts/proxy-e2e.py target/debug/monitor-hub agent/target/debug/monitor-agent
       - run: |
           curl -fsSL --retry 3 -o target/released-monitor-agent https://github.com/Isyyyue/monitor/releases/latest/download/monitor-agent-x86_64-unknown-linux-musl
           chmod +x target/released-monitor-agent

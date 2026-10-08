@@ -23,6 +23,7 @@ use tokio_tungstenite::{
 use tracing::{error, info, warn};
 
 mod provision;
+mod proxy_probe;
 mod subscription;
 
 /// Arguments also accept the environment written by install.sh.
@@ -277,11 +278,22 @@ fn uptime() -> u64 {
 /// draws one figure per family, and reading the state column would mean parsing
 /// addresses this does not need.
 fn socket_count(paths: &[&str]) -> u64 {
-    paths
-        .iter()
-        .filter_map(|p| std::fs::read_to_string(p).ok())
-        .map(|body| body.lines().count().saturating_sub(1) as u64)
-        .sum()
+    paths.iter().filter_map(|p| std::fs::File::open(p).ok().and_then(|f| count_socket_rows(f).ok())).sum()
+}
+
+fn count_socket_rows(mut reader: impl std::io::Read) -> std::io::Result<u64> {
+    let mut buffer = [0; 8192];
+    let mut lines = 0u64;
+    let mut last = None;
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        lines += buffer[..n].iter().filter(|&&b| b == b'\n').count() as u64;
+        last = Some(buffer[n - 1]);
+    }
+    Ok((lines + u64::from(last.is_some_and(|b| b != b'\n'))).saturating_sub(1))
 }
 
 /// Processes, counted from `/proc` rather than through `sysinfo`: the count is all
@@ -608,12 +620,8 @@ async fn probe_once(target: &str) -> i64 {
 
 /// 这个目标是不是一个拨得动的 `host:port`。
 ///
-/// 面板上的任务不全是给 agent 的。`proxy:vless` 这类是给 `probe/` 那条代理探针的
-/// 标签 —— 探针按 task id 认它，自己去量代理链路的 HTTP 耗时，写的是同一张
-/// `ping_record`。agent 拨不动它：端口位不是数字。
-///
-/// 照拨的后果不是「少一个数据点」：每 `interval` 秒会写一条 -1，而 hub 把负值记成
-/// 丢包 —— 探针量出来的曲线被每分钟一次的假丢包污染，且看不出哪条是假的。
+/// 普通 TCP 任务必须有可解析的端口。`proxy:vless` / `proxy:hy2` 由已配置的
+/// 本地 HTTP 代理测量；未配置的代理标签不执行，避免产生虚假的失败记录。
 fn dialable(target: &str) -> bool {
     let Some((host, port)) = target.rsplit_once(':') else {
         return false;
@@ -625,10 +633,10 @@ fn dialable(target: &str) -> bool {
 ///
 /// hub 在保存任务时已经拦过一遍，这里是兜底：一个越界的列表会让多出来的探针跑了
 /// 却发不出去，节点白忙，面板上却什么都没有。
-fn runnable(tasks: Vec<PingTask>) -> Vec<PingTask> {
+fn runnable(tasks: Vec<PingTask>, proxies: &proxy_probe::Proxies) -> Vec<PingTask> {
     tasks
         .into_iter()
-        .filter(|t| t.id > 0 && dialable(t.target.trim()))
+        .filter(|t| t.id > 0 && (dialable(t.target.trim()) || proxies.supports(t.target.trim())))
         .take(MAX_PROBES)
         .map(|t| PingTask {
             target: t.target.trim().to_owned(),
@@ -649,6 +657,7 @@ struct Running {
 #[derive(Default)]
 struct Probes {
     running: std::collections::HashMap<i64, Running>,
+    proxies: proxy_probe::Proxies,
 }
 
 impl Probes {
@@ -658,7 +667,7 @@ impl Probes {
     /// 把其余的重启会重置它们的计时，还会丢掉正要发出的那一次读数。
     fn reconcile(&mut self, tasks: Vec<PingTask>, results: &tokio::sync::mpsc::Sender<Message>) {
         let mut keep = std::collections::HashSet::new();
-        for task in runnable(tasks) {
+        for task in runnable(tasks, &self.proxies) {
             keep.insert(task.id);
             let unchanged = self
                 .running
@@ -670,8 +679,13 @@ impl Probes {
             if let Some(old) = self.running.remove(&task.id) {
                 old.handle.abort();
             }
-            let handle =
-                tokio::spawn(run_probe(task.id, task.target.clone(), task.interval, results.clone()));
+            let handle = tokio::spawn(run_probe(
+                task.id,
+                task.target.clone(),
+                task.interval,
+                results.clone(),
+                self.proxies.clone(),
+            ));
             self.running.insert(task.id, Running { target: task.target, interval: task.interval, handle });
         }
         // 这一轮没提到的任务：面板删了它，或者本节点被取消了分配。
@@ -700,10 +714,23 @@ impl Drop for Probes {
 /// 一条探针的循环：连、回报、等。
 ///
 /// 第一次立刻做，面板上刚加的监控不用等满一个间隔才有数字。
-async fn run_probe(id: i64, target: String, interval: i64, results: tokio::sync::mpsc::Sender<Message>) {
+async fn run_probe(
+    id: i64,
+    target: String,
+    interval: i64,
+    results: tokio::sync::mpsc::Sender<Message>,
+    proxies: proxy_probe::Proxies,
+) {
     let period = Duration::from_secs(interval.max(MIN_PROBE_INTERVAL) as u64);
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let latency = probe_once(&target).await;
+        ticker.tick().await;
+        let latency = if proxies.supports(&target) {
+            proxies.measure(&target).await
+        } else {
+            probe_once(&target).await
+        };
         let frame = json!({
             "jsonrpc": "2.0",
             "method": "ping.result",
@@ -713,11 +740,13 @@ async fn run_probe(id: i64, target: String, interval: i64, results: tokio::sync:
         if results.send(Message::Text(frame.to_string())).await.is_err() {
             return;
         }
-        tokio::time::sleep(period).await;
     }
 }
 
 fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--supports-proxy-probes") {
+        return Ok(());
+    }
     // `provision` 是安装器以 root 调用的一次性动作，与常驻服务无关。
     // 在起 tracing、连 hub 之前就分派掉 —— 也就不用先起一个 runtime。
     if std::env::args().nth(1).as_deref() == Some("provision") {
@@ -801,7 +830,11 @@ async fn session(args: &Args) -> Result<()> {
     // 有界：hub 那头慢下来时，无限队列会一直攒帧。有界则让探针在写端堵住时等一等，
     // 而 64 条正好是一个节点能跑的最大探针数。
     let (results_tx, mut results_rx) = tokio::sync::mpsc::channel::<Message>(MAX_PROBES);
-    let mut probes = Probes::default();
+    let proxies = proxy_probe::Proxies::from_env().unwrap_or_else(|e| {
+        warn!("proxy measurements disabled: {e:#}");
+        Default::default()
+    });
+    let mut probes = Probes { proxies, running: Default::default() };
 
     loop {
         tokio::select! {
@@ -869,6 +902,22 @@ async fn session(args: &Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_row_count_matches_text_count_across_chunks() {
+        for input in [
+            String::new(),
+            "header".into(),
+            "header\n".into(),
+            "header\r\nrow\r\nrow".into(),
+            format!("header\n{}", "row\n".repeat(100_000)),
+        ] {
+            assert_eq!(
+                count_socket_rows(input.as_bytes()).unwrap(),
+                input.lines().count().saturating_sub(1) as u64
+            );
+        }
+    }
 
     #[test]
     fn reports_the_interface_configuration_to_the_panel() {
@@ -1102,19 +1151,22 @@ mod tests {
     #[test]
     fn probes_are_clamped_to_what_the_hub_will_accept() {
         let task = |id, target: &str, interval| PingTask { id, target: target.into(), interval };
-        let kept = runnable(vec![
-            task(1, "1.1.1.1:443", 60),
-            task(0, "1.1.1.1:443", 60),
-            task(-3, "1.1.1.1:443", 60),
-            task(2, "   ", 60),
-            task(3, "1.1.1.1:443", 1),
-        ]);
+        let kept = runnable(
+            vec![
+                task(1, "1.1.1.1:443", 60),
+                task(0, "1.1.1.1:443", 60),
+                task(-3, "1.1.1.1:443", 60),
+                task(2, "   ", 60),
+                task(3, "1.1.1.1:443", 1),
+            ],
+            &Default::default(),
+        );
         assert_eq!(kept.len(), 2, "只有 id 和目标都成立的留下");
         assert_eq!(kept[0].id, 1);
         assert_eq!(kept[1].interval, MIN_PROBE_INTERVAL, "低于下限的间隔夹到下限");
 
         let many: Vec<_> = (1..=MAX_PROBES as i64 + 10).map(|i| task(i, "1.1.1.1:443", 60)).collect();
-        assert_eq!(runnable(many).len(), MAX_PROBES, "超出上限的截掉");
+        assert_eq!(runnable(many, &Default::default()).len(), MAX_PROBES, "超出上限的截掉");
     }
 
     /// 面板上的任务不全是给 agent 的：`proxy:vless` 这类是给代理探针的标签。
@@ -1137,7 +1189,7 @@ mod tests {
             PingTask { id: 2, target: "proxy:hy2".into(), interval: 60 },
             PingTask { id: 3, target: "1.1.1.1:443".into(), interval: 60 },
         ];
-        let kept = runnable(tasks);
+        let kept = runnable(tasks, &Default::default());
         assert_eq!(kept.len(), 1, "只留拨得动的那条");
         assert_eq!(kept[0].id, 3);
     }

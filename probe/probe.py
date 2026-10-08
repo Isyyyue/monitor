@@ -22,8 +22,8 @@ knowing either: the agent holds a token, never a node id. The older three- and
 four-field forms (`tag:port:node_id`, `tag:port:node_id:task_id`) are still
 accepted, for a deployment that has a number pinned somewhere.
 
-On measurement failure the round is skipped (no -1 written). The current
-Rust Agent skips proxy:* targets; no periodic -1 cleanup is required.
+Measurement failures are stored as -1 (loss); unassigned tasks are not sampled.
+Ambiguous node assignments must be made explicit rather than guessed.
 """
 import os
 import sqlite3
@@ -59,12 +59,10 @@ def parse_targets():
                     "PROBE_TARGETS 每项要写成 tag:port（旧的三段/四段形式也认）：%r" % entry
                 )
         return targets
-    # Default: two nodes x two protocols, matching the example sing-box config.
+    # Never invent node IDs. A task with several nodes needs an explicit ID.
     return [
-        ("vless", 18083, 1, None),
-        ("hy2", 18084, 1, None),
-        ("vless", 18085, 2, None),
-        ("hy2", 18086, 2, None),
+        ("vless", 18083, None, None),
+        ("hy2", 18084, None, None),
     ]
 
 
@@ -82,12 +80,16 @@ def node_for(db, task_id, declared):
     working.
     """
     if declared is not None:
-        return declared
-    row = db.execute(
-        "SELECT node_id FROM ping_node WHERE task_id = ? ORDER BY node_id LIMIT 1",
+        row = db.execute(
+            "SELECT node_id FROM ping_node WHERE task_id = ? AND node_id = ?",
+            (task_id, declared),
+        ).fetchone()
+        return row[0] if row else None
+    rows = db.execute(
+        "SELECT node_id FROM ping_node WHERE task_id = ? LIMIT 2",
         (task_id,),
-    ).fetchone()
-    return row[0] if row else None
+    ).fetchall()
+    return rows[0][0] if len(rows) == 1 else None
 
 
 def task_id(db, tag, pinned):
@@ -116,11 +118,13 @@ def test_proxy(port):
     try:
         r = subprocess.run(
             ["curl", "-x", "http://127.0.0.1:%d" % port,
-             "-o", "/dev/null", "-s", "-w", "%{time_total}",
+             "--noproxy", "", "-o", "/dev/null", "-s", "-w", "%{http_code} %{time_total}",
              "--max-time", "15", TEST_URL],
             capture_output=True, text=True, timeout=20)
         if r.returncode == 0 and r.stdout.strip():
-            return int(float(r.stdout.strip()) * 1000)
+            status, elapsed = r.stdout.strip().split()
+            if 200 <= int(status) < 300:
+                return int(float(elapsed) * 1000)
     except Exception as e:
         print("probe fail port %d: %s" % (port, e), flush=True)
     return -1
@@ -129,8 +133,10 @@ def test_proxy(port):
 def main():
     while True:
         ts = int(time.time())
+        db = None
         try:
             db = sqlite3.connect(DB, timeout=10)
+            rows = []
             for tag, port, declared_node, pinned in PROXIES:
                 tid = task_id(db, tag, pinned)
                 if tid is None:
@@ -145,22 +151,22 @@ def main():
                     # The task exists but is bound to no node, so there is
                     # nowhere to file this. Named rather than written to a made-up
                     # id, which would show another node's line as this one's.
-                    print("%d %s: 任务 %d 没有绑定任何节点，这一轮跳过" % (ts, tag, tid),
+                    print("%d %s: 任务 %d 的节点归属无法确定，这一轮跳过" % (ts, tag, tid),
                           flush=True)
                     continue
                 lat = test_proxy(port)
                 if lat == -1:
-                    print("%d %s=FAIL(skip)" % (ts, tag), flush=True)
-                    continue
-                db.execute(
-                    "INSERT INTO ping_record(node_id,task_id,ts,latency)"
-                    " VALUES(?,?,?,?)",
-                    (node_id, tid, ts, lat))
+                    print("%d %s=FAIL" % (ts, tag), flush=True)
+                rows.append((node_id, tid, ts, lat))
                 print("%d %s=%dms" % (ts, tag, lat), flush=True)
+            # Acquire the write lock only after network measurements finish.
+            db.executemany("INSERT INTO ping_record(node_id,task_id,ts,latency) VALUES(?,?,?,?)", rows)
             db.commit()
-            db.close()
         except Exception as e:
             print("db fail: %s" % e, flush=True)
+        finally:
+            if db is not None:
+                db.close()
         time.sleep(INTERVAL)
 
 

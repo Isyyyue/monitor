@@ -69,7 +69,6 @@ read_prev_sub() {
 		SUB_PREV_PUBLIC=$(sed -n 's/^[[:space:]]*listen \([0-9][0-9]*\).*/\1/p' "$SUB_NGINX_CONF" | head -n 1)
 	fi
 }
-read_prev_sub
 
 save_sub_file() {
     [ ! -f "$1" ] || cp -p "$1" "$SUB_BACKUP_DIR/$2"
@@ -82,6 +81,7 @@ restore_sub_file() {
 cleanup_install() {
     [ -z "${TMP:-}" ] || rm -f "$TMP"
     case "$SUB_BACKUP_DIR" in "$ROOT"/.subscription-backup.*) rm -rf "$SUB_BACKUP_DIR" ;; esac
+    [ -z "${INSTALL_LOCK_DIR:-}" ] || rmdir "$INSTALL_LOCK_DIR" 2>/dev/null || true
 }
 
 while [ $# -gt 0 ]; do
@@ -111,6 +111,24 @@ while [ $# -gt 0 ]; do
 done
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
+
+# Acquire before reading old state or touching services. flock releases on exit;
+# minimal OpenRC hosts fall back to an owned directory, removed by the trap.
+install -d -m 0755 "$ROOT"
+trap cleanup_install EXIT
+if command -v flock >/dev/null 2>&1; then
+    (umask 077; : >>"$ROOT/.install.lock")
+    exec 9>>"$ROOT/.install.lock"
+    flock -n 9 || { echo "another monitor-agent installation is running" >&2; exit 1; }
+else
+    if mkdir "$ROOT/.install-lock" 2>/dev/null; then
+        INSTALL_LOCK_DIR="$ROOT/.install-lock"
+    else
+        echo "another installation is running (or left $ROOT/.install-lock after a forced stop)" >&2
+        exit 1
+    fi
+fi
+read_prev_sub
 
 # Removes exactly what an install writes and nothing else, for both init
 # systems: the one present now need not be the one the install found, and
@@ -452,26 +470,16 @@ if [ -z "$TOKEN" ]; then
 	fi
 fi
 
-# Stop an agent already running here before replacing its binary. The service
-# name is fixed, so a reinstall could never start a second copy, but without this
-# the new binary lands beneath a live process and only the restart at the end
-# picks it up. Stopping first also means the copy does not depend on `install`
-# unlinking rather than failing with ETXTBSY. Placed after the download, so a
-# node that cannot fetch the binary keeps running.
-if [ "$INIT" = openrc ]; then
-	rc-service monitor-agent stop 2>/dev/null || true
-else
-	systemctl stop monitor-agent 2>/dev/null || true
-	# An agent installed before the fixed user ran under DynamicUser=, and while
-	# it runs nss-systemd resolves its transient user of the same name: the check
-	# above passes, and useradd refuses the name as taken. Stopping the unit
-	# releases that user, so the fixed one is created here. Should that fail, the
-	# old binary and unit are still in place and are started again.
-	id -u monitor-agent >/dev/null 2>&1 || add_user || {
-		systemctl start monitor-agent 2>/dev/null || true
-		echo "cannot create the system user monitor-agent" >&2
-		exit 1
-	}
+# Normal upgrades keep the process running until a changed binary/env/unit is
+# ready. Only the old DynamicUser migration needs an early stop to release its
+# transient account before creating the fixed local service user.
+if [ "$INIT" != openrc ] && ! grep -q '^monitor-agent:' /etc/passwd; then
+    systemctl stop monitor-agent 2>/dev/null || true
+    add_user || {
+        systemctl start monitor-agent 2>/dev/null || true
+        echo "cannot create the system user monitor-agent" >&2
+        exit 1
+    }
 fi
 install -d -m 0755 "$ROOT"
 SUB_BACKUP_DIR=$(mktemp -d "$ROOT/.subscription-backup.XXXXXX")
@@ -482,6 +490,11 @@ save_sub_file "$RC_FILE" rc
 save_sub_file "$SUB_NGINX_CONF" nginx
 save_sub_file "$SUB_UNIT" legacy-unit
 save_sub_file "$SUB_RC" legacy-rc
+save_sub_file "$ENV_FILE" running-env
+save_sub_file "$UNIT_FILE" running-unit
+save_sub_file "$RC_FILE" running-rc
+AGENT_BINARY_CHANGED=""
+cmp -s "$TMP" "$BIN" || AGENT_BINARY_CHANGED=1
 if [ -f "$SUB_HOME/env" ]; then
     if [ "$INIT" = openrc ]; then
         rc-service sub-dynamic status >/dev/null 2>&1 && SUB_LEGACY_RUNNING=1 || true
@@ -493,7 +506,10 @@ fi
 # an existing copy: a run that died before that check left an unproven binary
 # in $BIN, and the copy is the one that ran before it.
 [ ! -f "$BIN" ] || [ -f "$BIN.old" ] || cp "$BIN" "$BIN.old"
-install -m 0755 "$TMP" "$BIN"
+if [ -n "$AGENT_BINARY_CHANGED" ]; then
+    install -m 0755 "$TMP" "$BIN.new"
+    mv -f "$BIN.new" "$BIN"
+fi
 
 # The token lives in a root-only environment file rather than the unit, keeping
 # it out of `systemctl cat` and the world-readable journal. 0600 root is what
@@ -516,6 +532,10 @@ ENV
 	[ -z "$SUB_PREV_PORT" ] || printf 'MONITOR_SUB_PORT=%s\n' "$SUB_PREV_PORT" >>"$ENV_FILE"
 	[ -z "$SUB_PREV_PUBLIC" ] || printf 'MONITOR_SUB_PUBLIC_PORT=%s\n' "$SUB_PREV_PUBLIC" >>"$ENV_FILE"
 	[ -z "$SUB_PREV_STATE" ] || printf 'MONITOR_SUB_STATE=%s\n' "$SUB_PREV_STATE" >>"$ENV_FILE"
+    # Existing opt-in proxy configuration survives monitoring-only upgrades.
+    if [ -f "$SUB_BACKUP_DIR/env" ]; then
+        sed -n '/^MONITOR_PROXY_/p' "$SUB_BACKUP_DIR/env" >>"$ENV_FILE"
+    fi
 )
 
 # The new agent is not running. The binary it replaced is put back and started
@@ -682,6 +702,17 @@ nginx_usable() {
 # 名字），只看服务在不在跑会把它当成自己。
 foreign_sub_server() {
 	agent_holds "$SUB_PORT" && return 1
+    # A saved Agent backend behind our nginx vhost is still our subscription.
+    # Checking only the public listener mistakes nginx for a foreign server and
+    # skips configuration validation and rollback on subsequent upgrades.
+    if [ "$SUB_PREV_BIND" = 127.0.0.1 ] &&
+        [ "$SUB_PREV_PUBLIC" = "$SUB_PORT" ] &&
+        [ "$SUB_PREV_STATE" = "$ROOT/subscription.json" ] &&
+        [ -f "$SUB_NGINX_CONF" ] && nginx_holds "$SUB_PORT" &&
+        agent_holds "$SUB_PREV_PORT" &&
+        grep -Fq "proxy_pass http://127.0.0.1:$SUB_PREV_PORT;" "$SUB_NGINX_CONF"; then
+        return 1
+    fi
 	[ -f "$SUB_HOME/env" ] && return 1
 	[ -f "$SUB_STATE" ] || return 1
 	clash="$(sed -n 's/.*"clash"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SUB_STATE" | head -n 1)"
@@ -1101,12 +1132,43 @@ retire_legacy_sub_service() {
 	# 它自己那份 env 和脚本留着不动：里面有上一轮记的端口，回退时还要用。
 }
 
+# Environment assignment order is irrelevant except for repeated keys (last
+# assignment wins). Subscription/proxy setup can reorder their unchanged keys.
+same_agent_env() {
+    [ -f "$ENV_FILE" ] && [ -f "$SUB_BACKUP_DIR/running-env" ] || return 1
+    for env_kind in current running; do
+        env_path="$ENV_FILE"
+        [ "$env_kind" = current ] || env_path="$SUB_BACKUP_DIR/running-env"
+        awk '
+            /^[[:space:]]*(#|$)/ { next }
+            { key = $0; sub(/=.*/, "", key); entries[key] = $0 }
+            END { for (key in entries) print entries[key] }
+        ' "$env_path" | LC_ALL=C sort >"$SUB_BACKUP_DIR/$env_kind-normalized"
+    done
+    cmp -s "$SUB_BACKUP_DIR/current-normalized" "$SUB_BACKUP_DIR/running-normalized"
+}
+
 restart_agent() {
+	if [ -n "${SUB_BACKUP_DIR:-}" ] && [ -z "${AGENT_BINARY_CHANGED-1}" ] &&
+        same_agent_env; then
+        if [ "$INIT" = openrc ]; then
+            if cmp -s "$RC_FILE" "$SUB_BACKUP_DIR/running-rc" && rc-service monitor-agent status >/dev/null 2>&1; then return 0; fi
+        elif cmp -s "$UNIT_FILE" "$SUB_BACKUP_DIR/running-unit" && systemctl is-active --quiet monitor-agent; then
+            agent_pid=$(systemctl show monitor-agent -p MainPID --value 2>/dev/null || true)
+            if [ "$BIN" -ef "/proc/$agent_pid/exe" ]; then return 0; fi
+        fi
+    fi
 	if [ "$INIT" = openrc ]; then
-		rc-service monitor-agent restart >/dev/null 2>&1 || true
+		rc-service monitor-agent restart
 	else
-		systemctl restart monitor-agent 2>/dev/null || true
+		systemctl restart monitor-agent
 	fi
+    if [ -n "${SUB_BACKUP_DIR:-}" ]; then
+        cp -p "$ENV_FILE" "$SUB_BACKUP_DIR/running-env"
+        [ ! -f "$UNIT_FILE" ] || cp -p "$UNIT_FILE" "$SUB_BACKUP_DIR/running-unit"
+        [ ! -f "$RC_FILE" ] || cp -p "$RC_FILE" "$SUB_BACKUP_DIR/running-rc"
+        AGENT_BINARY_CHANGED=""
+    fi
 }
 
 # 订阅的对外端口：客户端 URL 里带的那个。确定的顺序是**先读上一轮记下的值**、
@@ -1214,25 +1276,12 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
 
 # ---------------------------------------------------------------- 延迟探针
 #
-# 面板上的「网络延迟」页要有数据，得有人真的走一遍代理链路去量。这件事 agent
-# 做不了：它量的是 TCP 握手到 `host:port`，而这里要的是「请求经 VLESS/Hysteria2
-# 出到外面再绕回来的耗时」—— 那需要一个 sing-box **客户端**，把本地的 HTTP
-# inbound 路由到真实的代理 outbound。
-#
-# 原先这活儿交给 `probe/`，而它的 README 写着 "Optional" 加一串手工步骤：自己填
-# `YOUR_SERVER_IP`、`YOUR_VLESS_UUID`、`YOUR_REALITY_PUBLIC_KEY`…… 于是没有任何
-# 人做。面板上那个页签永远空着，只写一句「这段时间没有延迟数据」，看不出是没装
-# 还是坏了。**而这一条正好是最该自动的**：凭据本来就是这台机器刚刚生成的，安装器
-# 手里就有。
-#
-# 所以 provision 成功之后，安装器自己把客户端配起来。取的是 `provision` 刚打印的
-# 那份 JSON（$VPN_JSON），字段与它写给订阅的逐个对应，所以探针量的就是客户端真正
-# 会走的链路，不是另一条。
-#
-# 失败不致命，与其它可选段一致：探测是锦上添花，装不上不该把一次成功的安装判成
-# 失败，但要说出来。
+# sing-box's client provides the local HTTP proxy inbounds for VLESS/HY2.
+# The unprivileged Agent measures continuous HTTP requests through these
+# inbounds and reports over its authenticated WebSocket. Credentials come from
+# provision's report; the Agent never reads the server configuration or Hub DB.
+# Client setup failure keeps the previous configuration and sampler working.
 PROBE_DIR="/opt/probe"
-PROBE_DB="$ROOT/data/monitor.db"
 # 本地 inbound 的端口，与 probe.py 的默认 PROBE_TARGETS 对齐。
 PROBE_VLESS_PORT="18083"
 PROBE_HY2_PORT="18084"
@@ -1243,10 +1292,38 @@ json_str() {
 	printf '%s' "$1" | tr ',' '\n' | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n 1
 }
 
+# Roll back both configuration and unit; preserve the prior service state.
+restore_probe_client() {
+    if [ -f "$PROBE_DIR/sing-box.json.prev" ]; then
+        mv -f "$PROBE_DIR/sing-box.json.prev" "$PROBE_DIR/sing-box.json"
+    else
+        rm -f "$PROBE_DIR/sing-box.json"
+    fi
+    if [ -f "$PROBE_DIR/probe-unit.prev" ]; then
+        mv -f "$PROBE_DIR/probe-unit.prev" /etc/systemd/system/probe-singbox.service
+    else
+        rm -f /etc/systemd/system/probe-singbox.service
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ -n "$probe_was_active" ]; then
+        systemctl restart probe-singbox.service >/dev/null 2>&1 || true
+    else
+        systemctl stop probe-singbox.service >/dev/null 2>&1 || true
+    fi
+    [ -n "$probe_was_enabled" ] || systemctl disable probe-singbox.service >/dev/null 2>&1 || true
+    echo "warning: proxy client did not start; previous configuration and sampler retained" >&2
+}
+
 setup_latency_probe() {
 	[ -z "$NO_VPN" ] || return 0
 	probe_json=$1
 	[ -n "$probe_json" ] || return 0
+    # A newer script can be served by an older hub during a rolling upgrade.
+    # Never remove the existing sampler until this installed binary supports it.
+    if ! "$BIN" --supports-proxy-probes >/dev/null 2>&1; then
+        echo "warning: upgrade the hub/agent to enable integrated proxy measurements" >&2
+        return 0
+    fi
 
 	server=$(json_str "$probe_json" server)
 	uuid=$(json_str "$probe_json" uuid)
@@ -1266,11 +1343,6 @@ setup_latency_probe() {
 		}
 	done
 
-	# 有没有 python3。没有就不装：探针是 Python 写的，装了也是死的。
-	command -v python3 >/dev/null 2>&1 || {
-		echo "note: python3 is not installed, so the latency probe stays off" >&2
-		return 0
-	}
 	# 客户端 sing-box。与服务端是同一个二进制 —— 包安装时已经有了；这里只是
 	# 确认它在，因为单元要拿它当 ExecStart。
 	command -v sing-box >/dev/null 2>&1 || {
@@ -1279,10 +1351,16 @@ setup_latency_probe() {
 	}
 
 	mkdir -p "$PROBE_DIR" || return 0
+    probe_was_active=""
+    probe_was_enabled=""
+    systemctl is-active --quiet probe-singbox.service && probe_was_active=1 || true
+    systemctl is-enabled --quiet probe-singbox.service && probe_was_enabled=1 || true
+    probe_before=$(sha256sum "$PROBE_DIR/sing-box.json" /etc/systemd/system/probe-singbox.service 2>/dev/null || true)
 
 	# 客户端配置。inbound 是本地 HTTP，route 把每个 inbound 钉到一个 outbound。
 	# 两个 inbound 各测一条协议，所以面板上 VLESS 与 HY2 各有一条自己的曲线。
-	cat >"$PROBE_DIR/sing-box.json" <<PROBE_CFG
+    (umask 077
+	cat >"$PROBE_DIR/sing-box.json.new" <<PROBE_CFG
 {
   "log": { "level": "warn" },
   "inbounds": [
@@ -1322,27 +1400,21 @@ setup_latency_probe() {
   }
 }
 PROBE_CFG
-	chmod 0600 "$PROBE_DIR/sing-box.json"
+    )
+	chmod 0600 "$PROBE_DIR/sing-box.json.new"
+    if ! sing-box check -c "$PROBE_DIR/sing-box.json.new" >/dev/null 2>&1; then
+        rm -f "$PROBE_DIR/sing-box.json.new"
+        echo "warning: invalid proxy client configuration; existing sampler retained" >&2
+        return 0
+    fi
+    rm -f "$PROBE_DIR/sing-box.json.prev" "$PROBE_DIR/probe-unit.prev"
+    [ ! -f /etc/systemd/system/probe-singbox.service ] || cp -p /etc/systemd/system/probe-singbox.service "$PROBE_DIR/probe-unit.prev"
+    [ ! -f "$PROBE_DIR/sing-box.json" ] || cp -p "$PROBE_DIR/sing-box.json" "$PROBE_DIR/sing-box.json.prev"
+    mv -f "$PROBE_DIR/sing-box.json.new" "$PROBE_DIR/sing-box.json"
 
-	# 探针本体。从 hub 取，与 install.sh 同一个来源 —— 本仓库在安装期不允许依赖
-	# 外部地址，而 hub 是这台机器已经在说话的对方。
-	url="${SERVER%/}/probe.py"
-	if ! curl -sSL $CURL_INSECURE --max-time 60 "$url" -o "$PROBE_DIR/probe.py" 2>/dev/null ||
-		! grep -q 'ping_record' "$PROBE_DIR/probe.py" 2>/dev/null; then
-		echo "warning: could not fetch the latency prober from $url; the latency page will stay empty" >&2
-		echo "         run the install again, or copy probe/probe.py there by hand" >&2
-		rm -f "$PROBE_DIR/probe.py"
-		return 0
-	fi
-	chmod 0755 "$PROBE_DIR/probe.py"
 
-	# 两个单元：一个跑客户端，一个跑测量。测量那个要等客户端起来 —— 否则第一轮
-	# 全部拨不通，全被跳过（探针在失败时**不写** -1，见它的文档），面板上于是
-	# 又是什么都没有，而这次连"没装"都不是。
-	#
-	# PROBE_TARGETS 只写 tag:port：node id 由探针按 task 从 ping_node 反查。
-	# 安装器这时**不知道**这个节点在面板上的 id —— agent 拿到的是 token，不是
-	# id —— 写个常数会把本机的测量记到编号恰好是 1 的那个节点名下。
+    # sing-box implements the VPN protocols; the Agent measures HTTP through its
+    # loopback inbounds and reports using its authenticated node identity.
 	cat >/etc/systemd/system/probe-singbox.service <<UNIT1
 [Unit]
 Description=Proxy probe sing-box client
@@ -1358,33 +1430,35 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 UNIT1
-	cat >/etc/systemd/system/monitor-probe.service <<UNIT2
-[Unit]
-Description=Latency probe through the local proxies
-After=network-online.target probe-singbox.service
-Wants=network-online.target
-Requires=probe-singbox.service
-
-[Service]
-Type=simple
-Environment=PROBE_DB=$PROBE_DB
-Environment=PROBE_INTERVAL=60
-Environment=PROBE_TARGETS=vless:$PROBE_VLESS_PORT,hy2:$PROBE_HY2_PORT
-ExecStart=$(command -v python3) $PROBE_DIR/probe.py
-Restart=always
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
-UNIT2
 	systemctl daemon-reload >/dev/null 2>&1 || true
-	if systemctl enable --now probe-singbox.service >/dev/null 2>&1 &&
-		systemctl enable --now monitor-probe.service >/dev/null 2>&1; then
-		echo "latency probe enabled (VLESS + HY2 through 127.0.0.1:$PROBE_VLESS_PORT/$PROBE_HY2_PORT)"
-		touch "$ROOT/.probe-installed" 2>/dev/null || true
-	else
-		echo "warning: the latency probe files were written but its services did not start" >&2
-	fi
+    systemctl enable probe-singbox.service >/dev/null 2>&1 || { restore_probe_client; return 0; }
+    probe_after=$(sha256sum "$PROBE_DIR/sing-box.json" /etc/systemd/system/probe-singbox.service)
+    probe_pid=$(systemctl show probe-singbox.service -p MainPID --value 2>/dev/null || true)
+    probe_changed=""
+    if [ "$probe_before" != "$probe_after" ] || ! systemctl is-active --quiet probe-singbox.service ||
+        ! [ "$(command -v sing-box)" -ef "/proc/$probe_pid/exe" ]; then
+        probe_changed=1
+    fi
+    if [ -n "$probe_changed" ] && ! systemctl restart probe-singbox.service; then
+        restore_probe_client
+        return 0
+    fi
+    if ! systemctl is-active --quiet probe-singbox.service; then
+        restore_probe_client
+        return 0
+    fi
+    rm -f "$PROBE_DIR/sing-box.json.prev" "$PROBE_DIR/probe-unit.prev"
+    sed -i '/^MONITOR_PROXY_PORTS=/d' "$ENV_FILE"
+    printf 'MONITOR_PROXY_PORTS=vless:%s,hy2:%s\n' "$PROBE_VLESS_PORT" "$PROBE_HY2_PORT" >>"$ENV_FILE"
+    restart_agent
+    systemctl is-active --quiet monitor-agent || { echo "warning: integrated probe not active" >&2; return 0; }
+    # Only retire the sampler managed by this installer. Manual probe-latency
+    # deployments remain under the operator's control; history stays in SQLite.
+    systemctl disable --now monitor-probe.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/monitor-probe.service "$PROBE_DIR/probe.py"
+    systemctl daemon-reload
+    touch "$ROOT/.probe-installed"
+    echo "latency probe enabled in monitor-agent (continuous VLESS + HY2)"
 	return 0
 }
 
@@ -1414,6 +1488,7 @@ configure_optional_vpn() {
         echo "warning: monitoring is installed; VPN setup did not complete" >&2
         return 0
     fi
+    setup_latency_probe "$VPN_JSON"
     SUB_READY=""
     # setup_subscription may restore the old endpoint. Validate the route map
     # actually served after that decision, rather than provision's candidate map.
@@ -1427,7 +1502,6 @@ configure_optional_vpn() {
     fi
     SUB_STATE="$candidate_state"
     report_vpn || true
-    setup_latency_probe "$VPN_JSON"
 }
 
 # agent 的单元。抽成函数是因为订阅那边可能还要再写一次：绑 80 需要能力，而那是
@@ -1499,7 +1573,7 @@ RC
 	rc-update add monitor-agent default >/dev/null
 	sub_caps
 	grant_bind_capability
-	rc-service monitor-agent restart
+	restart_agent
 	# supervise-daemon reports the service started while it respawns an agent
 	# that exits at once, so the process itself is what is looked for, inside
 	# the respawn delay. pidof rather than pgrep -x, which BusyBox matches
@@ -1523,7 +1597,7 @@ systemctl enable monitor-agent >/dev/null
 # restart rather than `enable --now`: --now leaves an already-running service
 # untouched, so reinstalling over a live agent would keep the old binary
 # running.
-systemctl restart monitor-agent
+restart_agent
 # Type=simple counts the service started once it is forked, so `restart` above
 # succeeds also for one that fails at once -- a user it cannot resolve
 # (217/USER), a binary that exits -- and is then restarted every RestartSec.

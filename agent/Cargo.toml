@@ -1,6 +1,6 @@
 [package]
 name = "monitor-agent"
-version = "1.9.10"
+version = "1.9.11"
 edition = "2021"
 
 [[bin]]
@@ -45,3 +45,9 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # 只用来把 `2026-11-01` 换成订阅头里的 unix 时间戳。
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+opt-level = 2

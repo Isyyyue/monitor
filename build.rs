@@ -20,6 +20,9 @@ fn main() {
     // no rebuild, and the hub keeps serving the previous bundle in silence --
     // which is how a panel change can be built, tested and then not shipped.
     println!("cargo:rerun-if-changed=web-admin/dist");
+    // These public install assets are embedded with include_str! as well.
+    println!("cargo:rerun-if-changed=install.sh");
+    println!("cargo:rerun-if-changed=probe/probe.py");
 
     match Command::new("sh").arg("scripts/theme.sh").status() {
         Ok(status) if status.success() => {}

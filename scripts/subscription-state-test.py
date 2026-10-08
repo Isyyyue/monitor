@@ -142,6 +142,29 @@ if agent_holds 18082; then exit 1; fi
 '''
         run(script)
         print('ok: listener ownership uses the executable, rejecting unrelated processes')
+
+        # Both front and backend ownership are needed. An unrelated nginx route
+        # that serves the same files must remain outside the installer's control.
+        conf = root / 'nginx.conf'
+        conf.write_text('proxy_pass http://127.0.0.1:18081;\n')
+        script = function('foreign_sub_server') + f"""
+ROOT='{root}'
+SUB_PORT=18090; SUB_PREV_PUBLIC=18090; SUB_PREV_PORT=18081
+SUB_PREV_BIND=127.0.0.1; SUB_PREV_STATE="$ROOT/subscription.json"
+SUB_NGINX_CONF='{conf}'; SUB_HOME="$ROOT/no-legacy-service"; SUB_STATE='{state}'
+nginx_holds() {{ return 0; }}
+agent_holds() {{ [ "$1" = 18081 ]; }}
+curl() {{ return 0; }}
+if foreign_sub_server; then exit 1; fi
+SUB_PREV_BIND=0.0.0.0
+foreign_sub_server
+SUB_PREV_BIND=127.0.0.1
+printf 'proxy_pass http://127.0.0.1:18082;\n' >"$SUB_NGINX_CONF"
+foreign_sub_server
+"""
+        run(script)
+        print('ok: owned nginx plus Agent backend is retained; unrelated routes remain foreign')
+
 finally:
     server.shutdown()
     server.server_close()

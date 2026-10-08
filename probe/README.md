@@ -1,16 +1,26 @@
 # Proxy Latency Probe
 
-Optional end-to-end proxy latency measurements for the Monitor panel. The Rust
-Agent measures TCP connectivity and latency to dialable `host:port` targets;
-this separate probe measures HTTP requests through real VLESS/Hysteria2 routes.
-It requires Python 3, curl and a sing-box client on the Hub machine.
+The Agent can continuously measure HTTP requests through local sing-box client
+inbounds and report results over its authenticated WebSocket connection. VPN
+installation configures `MONITOR_PROXY_PORTS=vless:18083,hy2:18084`; tasks
+`proxy:vless` and `proxy:hy2` use these routes. `MONITOR_PROXY_TEST_URL` defaults
+to `https://www.google.com/generate_204`. Only HTTP 2xx responses succeed;
+connection, timeout and HTTP failures report -1 using the Hub's loss convention.
+The client remains bound to loopback. Ordinary `host:port` tasks retain TCP
+measurement. Unconfigured proxy tasks are skipped.
 
-## How it works
+`probe.py` remains available for manual, legacy deployments on the Hub. Do not
+run it for the same node/task while the Agent's integrated measurement is enabled:
+duplicate samplers would produce duplicate history. New installer deployments do
+not require Python or curl for continuous measurements.
+
+## Legacy measurement
 
 Every 60 seconds, `probe.py` fetches `PROBE_TEST_URL` through local sing-box HTTP
-inbounds. sing-box routes each inbound to its configured proxy outbound. The
-elapsed time in milliseconds is written to the Hub's SQLite `ping_record` table.
-Failed measurements are skipped; this probe does not calculate proxy packet loss.
+inbounds and writes elapsed milliseconds to the Hub's SQLite `ping_record`
+table. HTTP 2xx responses succeed; failures are stored as -1. Tasks with no
+assignment, or several assignments without an explicit node ID, are skipped.
+This legacy mode requires Python 3, curl and a sing-box client on the Hub machine.
 
 ## Setup
 
@@ -28,7 +38,7 @@ systemctl enable --now probe-singbox.service probe-latency.service
 ```
 
 Create panel tasks with targets `proxy:vless` and `proxy:hy2`, and use the actual
-panel node IDs in `PROBE_TARGETS`. The Agent skips these non-dialable task targets.
+panel node IDs in `PROBE_TARGETS`. Leave `MONITOR_PROXY_PORTS` unset for these tasks when using the legacy sampler.
 Keep the sing-box HTTP inbounds bound to `127.0.0.1`.
 
 ## Configuration
@@ -45,7 +55,7 @@ Set environment variables in `probe-latency.service` or a systemd override:
 Default targets match `sing-box.example.json`:
 
 ```text
-vless:18083:1,hy2:18084:1,vless:18085:2,hy2:18086:2
+vless:18083,hy2:18084
 ```
 
 `tag` identifies the panel task by its target (`vless` → `proxy:vless`,
