@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 
 source=(pathlib.Path(__file__).resolve().parents[1]/'install.sh').read_text()
-function='\n'.join(re.search(r'^'+name+r'\(\) \{\n.*?^\}',source,re.M|re.S).group() for name in ['same_agent_env','restart_agent'])
+function='\n'.join(re.search(r'^'+name+r'\(\) \{\n.*?^\}',source,re.M|re.S).group() for name in ['same_agent_env','same_executable','restart_agent'])
 with tempfile.TemporaryDirectory(prefix='monitor-restart-test-') as tmp:
     script="""set -eu
 root=$1
@@ -29,6 +29,9 @@ systemctl() {
     esac
 }
 """+function+"""
+! same_executable "$root/missing" "$root/also-missing"
+! same_executable "$BIN" /proc/0/exe
+same_executable "$BIN" "/proc/$pid/exe"
 restart_agent
 [ "$calls" = 0 ] || { echo 'unchanged install restarted'; exit 1; }
 printf 'B=2\nA=1\n' >"$ENV_FILE"

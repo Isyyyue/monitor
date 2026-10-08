@@ -1148,6 +1148,12 @@ same_agent_env() {
     cmp -s "$SUB_BACKUP_DIR/current-normalized" "$SUB_BACKUP_DIR/running-normalized"
 }
 
+same_executable() {
+    executable_id=$(stat -Lc '%d:%i' "$1" 2>/dev/null) || return 1
+    running_id=$(stat -Lc '%d:%i' "$2" 2>/dev/null) || return 1
+    [ "$executable_id" = "$running_id" ]
+}
+
 restart_agent() {
 	if [ -n "${SUB_BACKUP_DIR:-}" ] && [ -z "${AGENT_BINARY_CHANGED-1}" ] &&
         same_agent_env; then
@@ -1155,7 +1161,7 @@ restart_agent() {
             if cmp -s "$RC_FILE" "$SUB_BACKUP_DIR/running-rc" && rc-service monitor-agent status >/dev/null 2>&1; then return 0; fi
         elif cmp -s "$UNIT_FILE" "$SUB_BACKUP_DIR/running-unit" && systemctl is-active --quiet monitor-agent; then
             agent_pid=$(systemctl show monitor-agent -p MainPID --value 2>/dev/null || true)
-            if [ "$BIN" -ef "/proc/$agent_pid/exe" ]; then return 0; fi
+            if same_executable "$BIN" "/proc/$agent_pid/exe"; then return 0; fi
         fi
     fi
 	if [ "$INIT" = openrc ]; then
@@ -1436,7 +1442,7 @@ UNIT1
     probe_pid=$(systemctl show probe-singbox.service -p MainPID --value 2>/dev/null || true)
     probe_changed=""
     if [ "$probe_before" != "$probe_after" ] || ! systemctl is-active --quiet probe-singbox.service ||
-        ! [ "$(command -v sing-box)" -ef "/proc/$probe_pid/exe" ]; then
+        ! same_executable "$(command -v sing-box)" "/proc/$probe_pid/exe"; then
         probe_changed=1
     fi
     if [ -n "$probe_changed" ] && ! systemctl restart probe-singbox.service; then

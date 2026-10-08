@@ -2,7 +2,7 @@
 """Exercise rollback of the actual installer proxy setup in a private filesystem."""
 import json,pathlib,re,subprocess,tempfile
 source=(pathlib.Path(__file__).resolve().parents[1]/'install.sh').read_text()
-functions='\n'.join(re.search(r'^'+name+r'\(\) \{\n.*?^\}\n(?=\n)',source,re.M|re.S).group() for name in ['json_str','restore_probe_client','setup_latency_probe'])
+functions='\n'.join(re.search(r'^'+name+r'\(\) \{\n.*?^\}\n(?=\n)',source,re.M|re.S).group() for name in ['json_str','same_executable','restore_probe_client','setup_latency_probe'])
 report=json.dumps(dict(server='127.0.0.1',uuid='test',reality_public_key='test',short_id='test',hy2_password='test',obfs_password='test'))
 with tempfile.TemporaryDirectory(prefix='monitor-proxy-install-') as tmp:
  root=pathlib.Path(tmp);(root/'probe').mkdir();(root/'agent').write_text('#!/bin/sh\nexit 0\n');(root/'agent').chmod(0o700)
