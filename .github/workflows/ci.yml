@@ -40,10 +40,9 @@ jobs:
       # stage.
       #
       # `dist/` is not committed -- the same as web-admin's -- so a stale one
-      # cannot be the thing that gets shipped. `TZ=UTC` because the format tests
-      # read clock times out of timestamps, and the runner is UTC while a
-      # developer's machine is not; without it they pass here and fail there.
-      - run: npm ci && npm run lint && TZ=UTC npm test && npm run build
+      # cannot be the thing that gets shipped. The formatter test fixes its own
+      # timezone so this is the same command developers can run on any host.
+      - run: npm ci && npm run lint && npm test && npm run build
         working-directory: web-theme
 
       # Stages web-theme/dist/ into target/theme/, where build.rs and rust-embed

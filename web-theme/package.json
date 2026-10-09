@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "test": "node src/lib/format.test.ts && node src/lib/api.test.ts",
+    "test": "node src/lib/run-format-test.mjs && node src/lib/api.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {
