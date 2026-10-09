@@ -1,6 +1,6 @@
 [package]
 name = "monitor-agent"
-version = "1.9.12"
+version = "1.9.13"
 edition = "2021"
 
 [[bin]]
