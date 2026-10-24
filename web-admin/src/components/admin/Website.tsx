@@ -4,6 +4,7 @@ import { useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
+import { HOSTNAME_PATTERN, shellQuote, validHostname } from "@/lib/install-command"
 import { copy, Field } from "./shared"
 
 
@@ -18,13 +19,26 @@ export function Website() {
   const currentHost = window.location.hostname
   const alreadyBound = currentHost && !/^[\d.]+$/.test(currentHost) && currentHost !== "localhost"
 
+  // The name goes into a command the operator runs as root, so it is checked as
+  // a hostname before anything is built from it. An empty box is not a mistake
+  // to report, only a name that was typed and does not hold up.
+  const typed = domain.trim()
+  const valid = validHostname(typed)
+  const invalid = typed !== "" && !valid
+  // The name as the shell receives it. The nginx block below is written through
+  // `<< 'NGINX'`, a quoted heredoc: its body is copied verbatim and never
+  // expanded or split, so quoting inside it would reach the file as part of the
+  // certificate path. Only the one line that is shell -- certbot's `-d` -- is
+  // quoted, and the check above already keeps it to a hostname.
+  const host = shellQuote(typed)
+
   // The upgrade map and the two headers below are what keep the panel's live
   // view working: it is one long-lived WebSocket, and a proxy that passes it
   // through as an ordinary request leaves the page connected until it silently
   // stops updating. `install-hub.sh --https` writes the same three lines; a
   // configuration copied from here has to be no worse, or following the panel's
   // own instructions would break the panel.
-  const nginxConf = domain.trim()
+  const nginxConf = valid
     ? `map $http_upgrade $connection_upgrade {
     default upgrade;
     ""      close;
@@ -33,10 +47,10 @@ export function Website() {
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
-    server_name ${domain.trim()};
+    server_name ${typed};
 
-    ssl_certificate /etc/letsencrypt/live/${domain.trim()}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${domain.trim()}/privkey.pem;
+    ssl_certificate /etc/letsencrypt/live/${typed}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${typed}/privkey.pem;
 
     location / {
         proxy_pass http://127.0.0.1:28080;
@@ -52,12 +66,12 @@ server {
 }`
     : ""
 
-  const commands = domain.trim()
+  const commands = valid
     ? `# 1. 安装 nginx 和 certbot
 sudo apt install -y nginx certbot python3-certbot-nginx
 
 # 2. 申请证书
-sudo certbot --nginx -d ${domain.trim()}
+sudo certbot --nginx -d ${host}
 
 # 3. 写入 nginx 配置
 sudo tee /etc/nginx/sites-enabled/monitor << 'NGINX'
@@ -82,16 +96,27 @@ sudo nginx -t && sudo systemctl reload nginx`
             当前已通过域名 <b>{currentHost}</b> 访问，无需重复绑定。
           </div>
         )}
-        <Field label="域名" hint="如 panel.example.com，需先解析到本机 IP">
+        <Field label="域名" hint={invalid ? undefined : "如 panel.example.com，需先解析到本机 IP"}>
           <Input
             value={domain}
             onChange={(e) => setDomain(e.target.value)}
             placeholder="panel.example.com"
+            pattern={HOSTNAME_PATTERN}
+            spellCheck={false}
+            autoCapitalize="off"
+            autoComplete="off"
+            aria-invalid={invalid}
+            className="font-mono text-xs"
           />
+          {invalid && (
+            <p className="text-xs leading-relaxed text-destructive">
+              这不是一个合法的域名。只填域名本身，例如 panel.example.com：不含协议、端口、路径和空格。
+            </p>
+          )}
         </Field>
       </Card>
 
-      {domain.trim() && (
+      {valid && (
         <>
           <Card className="gap-4 p-5">
             <div className="flex items-center justify-between">

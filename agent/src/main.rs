@@ -16,8 +16,12 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::{
-    connect_async, connect_async_tls_with_config,
-    tungstenite::{client::IntoClientRequest, Message},
+    connect_async_tls_with_config,
+    tungstenite::{
+        client::IntoClientRequest,
+        protocol::WebSocketConfig,
+        Message,
+    },
     Connector,
 };
 use tracing::{error, info, warn};
@@ -120,10 +124,34 @@ fn websocket_url(server: &str) -> Result<String> {
     {
         anyhow::bail!("server URL must contain a host and no credentials, query or fragment");
     }
+    // `install.sh` documents this refusal as a property of the agent ("the agent
+    // already refuses plaintext ws:// to a remote hub"), and operators rely on
+    // that when they decide a deployment is safe. The check lived only in the
+    // installer, so a hand-written env file or a downgraded hub URL reached the
+    // agent unchecked and the token crossed the network in the clear. Refused
+    // here, where the connection is actually made. Loopback is exempt: there is
+    // no path to intercept, and it is how a hub is reached on the same machine.
+    if scheme == "ws" && !is_loopback(&url) {
+        anyhow::bail!(
+            "refusing plaintext ws:// to a remote hub: the node token would travel in the clear. \
+             Use https:// (or wss://), or --insecure if the hub has no TLS"
+        );
+    }
     if url.path().is_empty() || url.path() == "/" {
         url.set_path("/api/agent/ws");
     }
     Ok(url.into())
+}
+
+/// True for a host that cannot be reached over the network: a loopback literal or
+/// the name that always resolves to one.
+fn is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(v4)) => v4.is_loopback(),
+        Some(url::Host::Ipv6(v6)) => v6.is_loopback(),
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
 }
 
 fn websocket_request(server: &str, token: &str) -> Result<http::Request<()>> {
@@ -796,17 +824,31 @@ async fn session(args: &Args) -> Result<()> {
 
     let request = websocket_request(&args.server, &args.token)?;
 
+    // The same frame ceiling the hub applies to what it receives. Left at the
+    // library default of 64 MiB, a hub -- or anything that has taken the hub's
+    // place -- could push one oversized frame and take the agent's 64 MiB
+    // `MemoryMax` with it; `Restart=always` then turns that into a loop. The
+    // agent's own frames are a few hundred bytes, so the hub's 64 KiB is
+    // generous in the other direction too.
+    let config = WebSocketConfig {
+        max_message_size: Some(64 * 1024),
+        max_frame_size: Some(64 * 1024),
+        ..WebSocketConfig::default()
+    };
+
     // `connect_async` keeps webpki's roots and is what every normal deployment
     // takes. The TLS-aware entry point is the only one that accepts a
     // connector, so it is reached only when the operator asked for it -- a
     // deployment that did not ask cannot end up with the loosened connector by
     // accident.
     let (ws_stream, _) = if args.insecure {
-        connect_async_tls_with_config(request, None, false, Some(any_certificate()))
+        connect_async_tls_with_config(request, Some(config), false, Some(any_certificate()))
             .await
             .context("Failed to connect to hub")?
     } else {
-        connect_async(request).await.context("Failed to connect to hub")?
+        connect_async_tls_with_config(request, Some(config), false, None)
+            .await
+            .context("Failed to connect to hub")?
     };
 
     info!("Connected to hub");

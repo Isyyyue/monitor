@@ -159,6 +159,18 @@ check_self() {
 	warn "这份脚本不是最新发布的那一版，先换成新的"
 	curl -fsSL --max-time 30 "$base/install-hub.sh" -o "$self/new" || die "新脚本下载失败：$base/install-hub.sh"
 	[ "$(sha256sum "$self/new" | cut -d' ' -f1)" = "$want" ] || die "新脚本校验不通过，已丢弃，$0 未改动"
+	# 校验和与产物同源，这一点靠代码解决不了：两个文件都从同一个 release 取，
+	# 谁把 install-hub.sh 换掉，就能把 sha256sums.txt 一起换掉。所以它挡得住
+	# 传输截断，挡不住上游被接管 —— 说出来，别让「校验通过」被读成更强的保证。
+	warn "校验和与脚本来自同一来源，只能防止传输损坏，不能防止上游被接管"
+	# 写之前确认 $0 不是符号链接。`cat >"$0"` 会顺着链接写到目标上，而那个目标
+	# 可以是任何路径：把 ./install-hub.sh 链到 /etc/passwd 或某个服务脚本上的
+	# 机器，重跑一次就等于让这个安装器以 root 覆写那个文件。链接本身也是别人
+	# 放的，所以这里不解析真实路径，直接拒绝：正常安装不会把脚本做成链接，
+	# `curl -o` 和 cp 都不会。
+	if [ -L "$0" ]; then
+		die "$0 是符号链接，拒绝透过它覆写目标文件。删掉链接、换成真实文件后重跑：rm $0"
+	fi
 	# Written through the existing file, which keeps its mode and owner. The shell
 	# reads nothing further from it: exec follows.
 	cat "$self/new" >"$0" || die "写不进 $0。手动更新：curl -fsSL $base/install-hub.sh -o $0"
@@ -197,6 +209,24 @@ check_site() {
 	*/*) die "--site 后面不能带路径，只要 协议://主机[:端口]：$SITE" ;;
 	*@*) die "--site 里不能带用户名：$SITE" ;;
 	esac
+	# 这个值会原样进 unit 的 ExecStart（`args="$args --site $SITE"`），而
+	# systemd 按空白把 ExecStart 切成参数：一个空格就把后面的字变成 hub 的
+	# 另一个命令行参数 —— `--site "http://a --db /etc/shadow"` 会让 hub 拿
+	# 另一个数据库起，而 unit 里看着只是一条普通地址。所以字符集收到 URL
+	# 里合法的那些，空白、引号、反引号、`$`、`;`、`|`、`&`、`<>`、`()` 都不
+	# 在里面。
+	#
+	# 用「删掉允许的、要求什么都不剩」而不是 case 的方括号表达式：`[`、`]`、
+	# `-` 都要留在集合里（IPv6 字面量就是 `[::1]`），而它们方括号表达式里的
+	# 位置正是 dash 与 BusyBox 有分歧的地方。tr 没有这个歧义，LC_ALL=C 让它
+	# 按字节走，多字节字符也不会作为一个被放行的字节混过去。
+	#
+	# 字节数从管道上的 `wc -c` 取，不经过变量：`$(...)` 会吃掉结尾的换行，
+	# 一个以换行收尾的地址就会以「干净」的样子回来并被放行 —— 而那个换行
+	# 正是这条检查要拦的东西。
+	if [ "$(printf '%s' "$SITE" | LC_ALL=C tr -d 'A-Za-z0-9._:/[]-' | wc -c)" -ne 0 ]; then
+		die "--site 只能有字母、数字和 . _ : / [ ] - ，不能有空格或 shell 元字符：$SITE"
+	fi
 	# IPv6 literals are bracketed, so the port is not split off at the first
 	# colon. The same shape `loopback_origin` parses on the hub.
 	case "$rest" in
@@ -275,6 +305,12 @@ install_hub() {
 		case "$carried" in
 		*--site\ *) SITE="${carried##*--site }"; SITE="${SITE%% *}" ;;
 		esac
+		# 从旧 unit 里读回来的值一样要过 check_site。它出自一个 root 写过的
+		# 文件，但那个文件不是只有这个安装器能改：手改过的 unit、上一个版本
+		# 留下的、或者别人写进去的 ExecStart，都会原样变成这一轮的 --site，
+		# 再原样写进新的 ExecStart。命令行给的值在下面已经过了一次，这条路
+		# 是另一条 —— 只把参数从哪来当成可信度，就是这里原本的缺口。
+		[ -z "$SITE" ] || check_site
 	fi
 	# Recovered the same way as --site, and for the same reason: a re-run that
 	# omits --https must not leave the hub claiming a self-signed certificate it
@@ -428,6 +464,10 @@ install_hub() {
 		listen="127.0.0.1:$PORT"
 	fi
 	args="--listen $listen --db $DATA/monitor.db"
+	# 不加引号，靠 check_site 的字符集保证安全：这个串会被 systemd 按空白切成
+	# 参数，所以只要值里不可能出现空白，它就只能是 --site 的一个参数，而不是
+	# 第二个选项。加引号反而会破坏 old_exec 的回读 —— 那里按 `--site ` 取到
+	# 空格为止，带引号的值会把引号一起带回来。
 	[ -z "$SITE" ] || args="$args --site $SITE"
 	# Told, not inferred. The panel turns on `--insecure` for its install
 	# commands off this flag, which is how one answer at install time saves the

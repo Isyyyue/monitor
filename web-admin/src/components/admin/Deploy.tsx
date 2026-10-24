@@ -4,7 +4,7 @@ import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { api } from "@/lib/api"
-import { installScriptCommand } from "@/lib/install-command"
+import { argPair, installScriptCommand } from "@/lib/install-command"
 import { CertificateOption, Field } from "./shared"
 
 
@@ -42,8 +42,14 @@ export function Deploy({ site, selfSigned }: { site: string; selfSigned: boolean
   // sing-box and the subscription are written by `install.sh` on the node, as root,
   // once. The hub has no way to ask a node to do anything, so this is the command
   // that does it rather than a button that sends one.
+  //
+  // A node that has never reported has no address, and there is nothing to fill
+  // one in with: `install.sh` only auto-detects when the flag is absent, and
+  // `--vpn-ip` present but empty switches VPN setup on with an address it then
+  // refuses. So the flag is left out and the command says why, rather than
+  // carrying a `<节点公网IP>` placeholder that sh would read as a redirection.
   const command = (n: any) =>
-    installScriptCommand(site, ["--upgrade", "--vpn", `--vpn-ip ${n.ip || "<节点公网IP>"}`], acceptUnverified)
+    installScriptCommand(site, ["--upgrade", "--vpn", ...(n.ip ? [argPair("--vpn-ip", n.ip)] : [])], acceptUnverified)
 
   return (
     <div className="space-y-4">
@@ -113,7 +119,9 @@ export function Deploy({ site, selfSigned }: { site: string; selfSigned: boolean
                       </div>
                     </Field>
                     <p className="text-xs text-muted-foreground">
-                      重新执行会复用节点上已有的凭据，已发出的链接不受影响。
+                      {n.ip
+                        ? "重新执行会复用节点上已有的凭据，已发出的链接不受影响。"
+                        : "该节点还没有地址，命令里不带 --vpn-ip，由节点自行探测公网地址。想固定成某个地址，先让它上报一次。"}
                     </p>
                   </div>
                 )}

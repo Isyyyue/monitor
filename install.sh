@@ -27,6 +27,10 @@ IFACE_SET=""
 INTERVAL=""
 INSECURE=""
 INSECURE_SET=""
+# The digest the downloaded binary is held to, when the operator supplies one
+# with --agent-sha256. Empty means none was given, and the check after the
+# download falls back to $ROOT/SHA256SUMS and then to a warning.
+AGENT_SHA256=""
 UNINSTALL=""
 UPGRADE=""
 VPN_IP=""
@@ -93,7 +97,7 @@ while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
 	# message rather than the usage below, and `shift 2` cannot proceed.
 	case "$1" in
-	--server | --token | --register | --name | --iface | --interval | --vpn-ip | --sub-port)
+	--server | --token | --register | --name | --iface | --interval | --vpn-ip | --sub-port | --agent-sha256)
 		[ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;
 	esac
 	case "$1" in
@@ -105,6 +109,7 @@ while [ $# -gt 0 ]; do
 	--interval) INTERVAL="$2"; shift 2 ;;
 	--vpn-ip) VPN_IP="$2"; VPN_ENABLED=1; shift 2 ;;
 	--sub-port) SUB_PORT="$2"; SUB_PORT_SET=1; shift 2 ;;
+	--agent-sha256) AGENT_SHA256="$2"; shift 2 ;;
 	--no-vpn) NO_VPN=1; shift ;;
 	--vpn) VPN_ENABLED=1; shift ;;
 	--insecure) INSECURE=1; INSECURE_SET=1; shift ;;
@@ -207,8 +212,8 @@ if [ -n "$UPGRADE" ]; then
 fi
 
 if [ -z "$SERVER" ] || { [ -z "$TOKEN" ] && [ -z "$REGISTER" ]; }; then
-	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure]" >&2
-	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS] [--vpn-ip ADDRESS]" >&2
+	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure] [--agent-sha256 DIGEST]" >&2
+	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS] [--vpn-ip ADDRESS] [--agent-sha256 DIGEST]" >&2
 	echo "       install.sh --uninstall" >&2
 	echo "--name NAME names the node --register creates; the hostname otherwise" >&2
 	echo "--vpn-ip ADDRESS is this machine's public address, for the VPN links;" >&2
@@ -220,6 +225,9 @@ if [ -z "$SERVER" ] || { [ -z "$TOKEN" ] && [ -z "$REGISTER" ]; }; then
 	echo "--insecure accepts a hub whose certificate cannot be verified, which is a" >&2
 	echo "  self-signed address or a plain HTTP one. It skips the check for this" >&2
 	echo "  download and for the agent's connection, and is remembered across upgrades" >&2
+	echo "--agent-sha256 DIGEST holds the downloaded binary to a sha256 you supply;" >&2
+	echo "  without it the digest is taken from $ROOT/SHA256SUMS when that file is" >&2
+	echo "  present, and the download is only as trusted as TLS otherwise" >&2
 	exit 2
 fi
 # Names the node a registration creates. A token belongs to a node that already
@@ -239,6 +247,15 @@ if [ -z "$INTERVAL" ]; then
 fi
 case "$INTERVAL" in "" | *[!0-9]*) echo "interval must be an integer from 1 to 3600" >&2; exit 2 ;; esac
 [ "$INTERVAL" -ge 1 ] && [ "$INTERVAL" -le 3600 ] || { echo "interval must be from 1 to 3600" >&2; exit 2; }
+# The subscription port reaches two places that do not tolerate anything but a
+# number: nginx's `listen $SUB_PORT default_server` in write_sub_nginx, and the
+# URL clients are given. `--sub-port '80; } server { ...'` would otherwise be
+# written into that config verbatim -- nginx would reject the file, and the node
+# would silently fall back to 8080 with the panel still showing the old address.
+# Checked here, where the flag is parsed, rather than at each use: the value is
+# copied into $SUB_PORT by the fallbacks below as well.
+case "$SUB_PORT" in "" | *[!0-9]*) echo "--sub-port must be an integer from 1 to 65535, not: $SUB_PORT" >&2; exit 2 ;; esac
+[ "$SUB_PORT" -ge 1 ] && [ "$SUB_PORT" -le 65535 ] || { echo "--sub-port must be from 1 to 65535" >&2; exit 2; }
 # Which interfaces carry this machine's traffic is known only on the machine,
 # and the batch command a fleet shares cannot carry one value per machine. A
 # rerun without --iface, the documented upgrade, therefore keeps the value in
@@ -272,10 +289,21 @@ fi
 # without the flags the first install used, and a node that suddenly refuses its
 # hub's certificate is one that stops reporting -- which is the failure this
 # whole flag exists to avoid.
+#
+# The read-back stays, because dropping it breaks every upgrade of a self-signed
+# node. What must not stay silent is that it happened: the value outlives the
+# install that set it, so a node can keep running with TLS verification off for
+# years after the certificate that made it necessary was replaced by a real one,
+# with nothing in any output saying so. Said loudly here, at the one moment an
+# operator reads this script's output.
 if [ -z "$INSECURE_SET" ]; then
 	INSECURE=$(sed -n 's/^MONITOR_INSECURE=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
 	case "$INSECURE" in 1 | true | yes) INSECURE=1 ;; *) INSECURE="" ;; esac
-	[ -z "$INSECURE" ] || echo "keeping --insecure from the previous install"
+	if [ -n "$INSECURE" ]; then
+		echo "WARNING: --insecure was inherited from the previous install; TLS verification" >&2
+		echo "         stays off for the download below and for the agent's own connection." >&2
+		echo "         Pass --verify-tls to re-enable it, or --insecure to confirm you meant it." >&2
+	fi
 fi
 if [ -n "$INSECURE" ]; then SCHEME=http; else SCHEME=https; fi
 # `--insecure` reaches the agent, as MONITOR_INSECURE below. It used to stop at
@@ -361,6 +389,34 @@ https://*)
 	fi
 	;;
 esac
+# The value above reaches the env file as a bare `MONITOR_SERVER=...` assignment,
+# and OpenRC's start_pre() sources that file as root. A newline in it therefore
+# ends the assignment and starts a second line, which root's shell then runs as a
+# command -- so the address is held to a character set that cannot leave the
+# assignment: the URL grammar minus credentials, query and fragment, which the
+# agent's ws_url() refuses anyway. Whitespace, quotes, backticks, `$`, `;`, `|`,
+# `&`, `<>`, `()` and `\` all fall outside it, which is the same argument --iface
+# above rests on.
+#
+# Written as "delete everything allowed, then require nothing left" rather than
+# as a `case` bracket expression: `[`, `]` and `-` are needed inside the set (an
+# IPv6 literal is `[::1]`), and where they sit in a bracket expression is where
+# dash and BusyBox differ. tr has no such ambiguity, and LC_ALL=C keeps it
+# byte-wise so a multi-byte character cannot slip through as one allowed byte.
+#
+# The count comes from `wc -c` on the pipe, not from a variable: `$(...)` strips
+# trailing newlines, so an address ending in one would come back clean and be
+# accepted -- which is the whole attack. Reading the byte count before any
+# variable holds it keeps the newline visible.
+if [ "$(printf '%s' "$SERVER" | LC_ALL=C tr -d 'A-Za-z0-9._:/[]-' | wc -c)" -ne 0 ]; then
+	echo "the hub address may hold only letters, digits and . _ : / [ ] - , not: $SERVER" >&2
+	echo "a newline or a shell metacharacter here would be run as root by OpenRC's start_pre" >&2
+	exit 2
+fi
+case "$SERVER" in
+*://?*) ;;
+*) echo "the hub address has no host: $SERVER" >&2; exit 2 ;;
+esac
 if command -v systemctl >/dev/null; then
 	INIT=systemd
 elif command -v rc-update >/dev/null; then
@@ -423,6 +479,93 @@ done
 [ "$(head -c 4 "$TMP")" = "$(printf '\177ELF')" ] ||
 	{ echo "the download is not a Linux executable: $(head -n 1 "$TMP" | tr -cd '[:print:]' | cut -c1-200)" >&2; exit 1; }
 
+# The ELF magic above says the bytes are a Linux program. It says nothing about
+# which one: a substituted binary passes it as easily as the real agent, and the
+# next step installs it 0755 and starts it as root. So the bytes are held to a
+# sha256 digest when one can be had, and where that digest came from is printed,
+# because what it proves depends entirely on that.
+#
+# Two sources, in this order:
+#   1. --agent-sha256, given on this command line. The only one outside this
+#      machine's trust path, and the only one that proves anything against a hub
+#      whose release was taken over.
+#   2. $ROOT/SHA256SUMS, a copy an operator or a configuration manager placed
+#      there -- the same file the GitHub release publishes, holding bare asset
+#      names as `sha256sum monitor-agent-<target>` writes them. Local and
+#      root-owned, so at least it is not fetched over the channel the bytes
+#      arrive on. It catches a corrupted relay and a mirror's error page; it
+#      cannot catch a replaced release, since it is a copy of the same file.
+#
+# The hub serves no digest: /agent/<arch> relays the release body and nothing
+# else, so there is no third source to fall back to. A digest fetched from the
+# hub alongside the binary would prove only that the transfer arrived intact,
+# because whoever can replace one can replace the other -- where that is all
+# that is on offer, the warning below says so rather than implying more.
+AGENT_DIGEST=""
+AGENT_DIGEST_FROM=""
+if [ -n "$AGENT_SHA256" ]; then
+	case "$AGENT_SHA256" in
+	*[!0-9a-fA-F]*)
+		echo "--agent-sha256 is not a sha256 digest: $AGENT_SHA256" >&2
+		exit 2
+		;;
+	esac
+	if [ "${#AGENT_SHA256}" -ne 64 ]; then
+		echo "--agent-sha256 is not 64 hex characters: $AGENT_SHA256" >&2
+		exit 2
+	fi
+	# Lowercased: the release's sha256sums.txt writes lowercase, and a digest
+	# pasted from a page that upper-cases hex is still the same digest.
+	AGENT_DIGEST=$(printf '%s' "$AGENT_SHA256" | tr 'A-F' 'a-f')
+	AGENT_DIGEST_FROM="--agent-sha256"
+elif [ -f "$ROOT/SHA256SUMS" ]; then
+	# The release's name carries the target triple. A copy that renamed the
+	# asset to the arch alone (`monitor-agent-x86_64`) is also accepted, with or
+	# without a leading path and with the two-space separator sha256sum writes.
+	# A bare `monitor-agent` with no arch is deliberately not matched: it cannot
+	# say which architecture it describes, and pinning the wrong one would fail
+	# every install on the other.
+	AGENT_DIGEST=$(sed -n \
+		-e "s/^\([0-9a-f]\{64\}\)  *\(.*\/\)\{0,1\}monitor-agent-$ARCH\$/\1/p" \
+		-e "s/^\([0-9a-f]\{64\}\)  *\(.*\/\)\{0,1\}monitor-agent-$ARCH-unknown-linux-musl\$/\1/p" \
+		"$ROOT/SHA256SUMS" 2>/dev/null | head -n 1)
+	[ -z "$AGENT_DIGEST" ] || AGENT_DIGEST_FROM="$ROOT/SHA256SUMS"
+fi
+if [ -n "$AGENT_DIGEST" ] && ! command -v sha256sum >/dev/null 2>&1; then
+	# coreutils' sha256sum is on every host this script supports. Said rather
+	# than passed over: an unchecked digest is exactly the state the warning
+	# below describes, and reporting "verified" without checking would be worse
+	# than either.
+	echo "warning: no sha256sum here, so the digest from $AGENT_DIGEST_FROM was not checked" >&2
+	AGENT_DIGEST=""
+fi
+if [ -n "$AGENT_DIGEST" ]; then
+	AGENT_GOT=$(sha256sum "$TMP" | cut -d' ' -f1)
+	[ "$AGENT_GOT" = "$AGENT_DIGEST" ] || {
+		printf 'the agent binary does not match the digest from %s\n' "$AGENT_DIGEST_FROM" >&2
+		printf '  expected %s\n  got      %s\n' "$AGENT_DIGEST" "$AGENT_GOT" >&2
+		echo "the download was discarded; any agent already installed here is untouched" >&2
+		exit 1
+	}
+	echo "verified the agent binary against $AGENT_DIGEST_FROM"
+else
+	# Nothing to check the bytes against. Over TLS this is the ordinary case: the
+	# transport already vouched for what arrived, so it is a note. Under
+	# --insecure nothing vouched for it -- -k turned off exactly the check that
+	# would have -- so the warning says so in the terms that matter, that these
+	# bytes are about to be installed and started as root.
+	if [ -n "$INSECURE" ]; then
+		echo "WARNING: the agent binary was NOT verified. --insecure turned off the" >&2
+		echo "         certificate check on the download and no sha256 digest was available," >&2
+		echo "         so anyone on the path could have replaced these bytes before they" >&2
+		echo "         were installed and started as root." >&2
+		echo "         Re-run with --agent-sha256 DIGEST to pin the exact binary." >&2
+	else
+		echo "note: no sha256 digest was available for the agent binary; it is trusted" >&2
+		echo "      through TLS alone. Pass --agent-sha256 DIGEST to pin it explicitly." >&2
+	fi
+fi
+
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
 # is only written once the binary is in place. A download that fails after
@@ -475,6 +618,33 @@ if [ -z "$TOKEN" ]; then
 		echo "if that token was reissued rather than its node deleted, delete the old node in the panel."
 	fi
 fi
+# The token goes into $ENV_FILE as a bare `MONITOR_TOKEN=...` line, and OpenRC's
+# start_pre() sources that file as root. So the value is held to exactly what the
+# hub issues -- hex::encode([u8;32]), 64 lowercase hex characters -- and nothing
+# else may reach the file.
+#
+# The registration above reads this value out of a response body:
+# `TOKEN=$(printf '%s\n' "$REPLY" | sed '$d')` keeps every line but the last, so
+# a body carrying a second line injects a whole extra line into a file root then
+# executes. The hub answers with the bare token, but a proxy, a mirror, a captive
+# portal or a hub whose release was taken over can answer with anything, and this
+# is the step that turns that into root. Checking the shape here, once, covers
+# both sources: a token typed with --token is held to the same rule, since one
+# that is not 64 hex cannot open a node anyway.
+#
+# Both halves are needed: the `case` rejects a newline, a quote or a `;`, and the
+# length rejects a body that is hex throughout but not a token.
+token_shape=""
+case "$TOKEN" in
+"" | *[!0-9a-f]*) ;;
+*) if [ "${#TOKEN}" -eq 64 ]; then token_shape=1; fi ;;
+esac
+if [ -z "$token_shape" ]; then
+	echo "the node token is not 64 lowercase hex characters: $TOKEN" >&2
+	echo "the hub issues exactly that shape. Anything else would be written into a file" >&2
+	echo "OpenRC sources as root, so this install stops here. Register again from the panel." >&2
+	exit 1
+fi
 
 # Normal upgrades keep the process running until a changed binary/env/unit is
 # ready. Only the old DynamicUser migration needs an early stop to release its
@@ -522,6 +692,20 @@ fi
 # keeps it private, since $ROOT itself is readable and holds the binaries. Set in
 # a subshell, because the unit file written below is read by anyone debugging
 # with `systemctl cat` and need not be 0600.
+#
+# Both values were validated where they were read -- the token against 64 hex
+# characters, the address against the URL character set -- because this file is
+# sourced as root by OpenRC's start_pre(), where a newline in either would end
+# the assignment and start a command. Checked once more here, at the write: it is
+# the only line that puts them into that file, and the cost of being wrong about
+# an earlier check is root.
+case "$SERVER$TOKEN" in
+*"
+"*)
+	echo "internal: a newline reached the env file; refusing to write $ENV_FILE" >&2
+	exit 1
+	;;
+esac
 (
 	umask 077
 	cat >"$ENV_FILE" <<ENV
