@@ -1607,14 +1607,11 @@ pub async fn db_restore(
             // Held readings belong to the database just replaced.
             app.readings.lock().unwrap_or_else(|e| e.into_inner()).clear();
             invalidate_snapshot(&app);
-            let cookie = match app
-                .db
-                .drop_all_sessions()
-                .and_then(|()| issue_session(&app, &headers, peer.ip()))
-            {
-                Ok(cookie) => cookie,
-                Err(e) => return fail(e),
-            };
+            let cookie =
+                match app.db.drop_all_sessions().and_then(|()| issue_session(&app, &headers, peer.ip())) {
+                    Ok(cookie) => cookie,
+                    Err(e) => return fail(e),
+                };
             with_cookies(Json(json!({"ok": true})), [cookie])
         }
         Err(e) => fail(e),

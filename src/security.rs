@@ -78,10 +78,7 @@ pub fn harden(mut response: Response) -> Response {
     for (name, value) in COMMON {
         // `insert` rather than `append`: a duplicate security header is read
         // inconsistently across browsers. `entry` so a renderer's own value wins.
-        if let (Ok(name), Ok(value)) = (
-            name.parse::<header::HeaderName>(),
-            HeaderValue::from_str(value),
-        ) {
+        if let (Ok(name), Ok(value)) = (name.parse::<header::HeaderName>(), HeaderValue::from_str(value)) {
             headers.entry(name).or_insert(value);
         }
     }
@@ -228,9 +225,6 @@ mod tests {
         assert!(headers.contains_key(header::CONTENT_SECURITY_POLICY));
 
         let response = harden_theme(StatusCode::OK.into_response(), "n1");
-        assert!(response.headers()[header::CONTENT_SECURITY_POLICY]
-            .to_str()
-            .unwrap()
-            .contains("'nonce-n1'"));
+        assert!(response.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().contains("'nonce-n1'"));
     }
 }
