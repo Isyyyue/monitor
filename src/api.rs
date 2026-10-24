@@ -218,10 +218,17 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         "swap_total": live("swap_total", node.swap_total),
         "disk_total": live("disk_total", node.disk_total),
         "agent_version": node.agent_version,
-        "price": node.price,
-        "currency": node.currency,
-        "billing_cycle": node.billing_cycle,
-        "expires_at": node.expires_at,
+        // Billing is the operator's commercial data -- what each machine costs,
+        // how it is paid for, and when it renews. It is not a technical reading
+        // like the ones above, and a competitor or a renewal-timed social
+        // engineering attempt has no business reading it from an anonymous page.
+        // Moved behind `full` for that reason; the panel still shows it.
+        //
+        // `expires_in` stays public: it is the one billing figure a status page
+        // has a reason to publish (a visitor can see a node is winding down
+        // without learning what it costs or the exact date it renews). The date
+        // itself, the price, the currency and the cycle do not.
+        //
         // Counted on the hub's calendar, the one renewal follows. A page counting
         // on the visitor's clock would, with the hub on UTC and the visitor on
         // UTC+8, show every online node expired for eight hours each cycle
@@ -289,6 +296,14 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         view["remark"] = json!(node.remark);
         view["token"] = json!(node.token);
         view["notify"] = json!(node.notify);
+        // The billing fields the anonymous frame above no longer carries. Kept
+        // together here so the panel's edit form and its cost columns read them
+        // from one place. `expires_in` is not among them: the anonymous frame
+        // keeps the day count, which is the only part a status page needs.
+        view["price"] = json!(node.price);
+        view["currency"] = json!(node.currency);
+        view["billing_cycle"] = json!(node.billing_cycle);
+        view["expires_at"] = json!(node.expires_at);
     }
     view
 }
@@ -897,13 +912,15 @@ pub async fn create_node(
     if node.name.trim().is_empty() {
         return bad("请填写节点名称");
     }
-    if let Some(message) =
-        node_limits(Some(node.traffic_reset_day), Some(node.price), Some(node.traffic_limit))
-            .or_else(|| group_error(&mut node.group))
-            .or_else(|| billing_error(Some(&mut node.currency), Some(&mut node.billing_cycle)))
-    {
+    // The same validator an edit runs, over the same fields. Calling the
+    // individual checks here instead -- as this used to -- skipped
+    // `public_remark` and the address/country pins, which are exactly the values
+    // that reach every anonymous visitor.
+    let mut patch = node.as_patch();
+    if let Some(message) = patch_error(&mut patch) {
         return bad(message);
     }
+    node.apply_patch(patch);
     node.name = node.name.trim().to_owned();
     let token = random_token();
     match app.db.create_node(&node, &token) {
@@ -989,6 +1006,13 @@ pub async fn agent_register(
             // a machine whose node is intact.
             Err(e) => return script_fail(e),
         }
+        // A wrong token is a failure like a wrong key: it counts against the
+        // address. Left uncounted, this branch answered 200 for a token that
+        // opens a node and 403 for one that does not, with no limit on how many
+        // could be tried -- an oracle for token validity. The tokens are 256 bits
+        // so it was never a practical attack, but the route should not answer a
+        // question it was not asked.
+        app.registrations.record_failure(ip);
     }
     // One answer for both "no window is open" and "that key is wrong": the
     // difference is only useful to someone who has neither.
@@ -1000,7 +1024,7 @@ pub async fn agent_register(
     else {
         return closed();
     };
-    if agent_ws::bearer(&headers) != Some(key.as_str()) {
+    if !constant_time_eq(agent_ws::bearer(&headers).unwrap_or("").as_bytes(), key.as_bytes()) {
         // Only an incorrect key counts against the address. With the window
         // closed there is no secret to guess, and counting then would let anyone
         // lock an address they name in `X-Forwarded-For` out of the sign-in page.
@@ -1039,6 +1063,25 @@ pub async fn agent_register(
         }
         Err(e) => script_fail(e),
     }
+}
+
+/// Compares two secrets without letting the time taken depend on where they first
+/// differ.
+///
+/// `!=` on `str` stops at the first mismatched byte, which leaks a prefix through
+/// timing. The leak is not exploitable here -- the values are 256-bit random, the
+/// window is an hour, and five wrong keys shut the address out -- but a secret
+/// comparison should not depend on that reasoning holding forever.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    // Length is not secret: both are fixed-size hex from `random_token`.
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// [`fail`] for `install.sh`, whose own output is English and which prints the
@@ -1507,6 +1550,7 @@ pub async fn db_backup(_: Admin, State(app): State<Shared>) -> Response {
 pub async fn db_restore(
     _: Admin,
     State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     Query(chunk): Query<Chunk>,
     headers: HeaderMap,
     body: axum::body::Body,
@@ -1563,7 +1607,11 @@ pub async fn db_restore(
             // Held readings belong to the database just replaced.
             app.readings.lock().unwrap_or_else(|e| e.into_inner()).clear();
             invalidate_snapshot(&app);
-            let cookie = match app.db.drop_all_sessions().and_then(|()| issue_session(&app, &headers)) {
+            let cookie = match app
+                .db
+                .drop_all_sessions()
+                .and_then(|()| issue_session(&app, &headers, peer.ip()))
+            {
                 Ok(cookie) => cookie,
                 Err(e) => return fail(e),
             };
@@ -1736,7 +1784,10 @@ pub async fn install_downloadable(
     Path(short): Path<String>,
 ) -> Response {
     let Some(entry) = crate::frontend::DOWNLOADABLE.iter().find(|e| e.short == short) else {
-        return fail(anyhow::anyhow!("没有这个可下载主题：{short}"));
+        // `Shown` rather than a bare `anyhow!`: the latter carries no marker, so
+        // `fail` answers 500 "hub 内部出错" and hides the real reason in the log.
+        // A name that is not downloadable is the caller's mistake, not the hub's.
+        return fail(anyhow::Error::msg(crate::Shown(format!("没有这个可下载主题：{short}"))));
     };
     match install_from_url(&app, entry.url, &short).await {
         Ok(theme) => Json(json!({"theme": theme})).into_response(),
@@ -2014,7 +2065,13 @@ pub async fn theme_preview(_: Admin, State(app): State<Shared>, Path(short): Pat
 /// the theme restores it.
 pub async fn delete_theme(_: Admin, State(app): State<Shared>, Path(short): Path<String>) -> Response {
     match crate::frontend::remove(&app.themes, &short) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // Deleting the selected theme drops the public page back to the
+            // built-in one, and the cached name would keep pointing at a
+            // directory that no longer exists.
+            app.refresh_theme();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => fail(e),
     }
 }
@@ -2049,6 +2106,14 @@ pub async fn theme_config(
         return answer(StatusCode::UNAUTHORIZED, "需要登录后查看");
     }
     if !crate::frontend::valid_short(&short) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    // The write path has always required the theme to be installed; the read path
+    // did not, so an anonymous caller could name any legal short and receive
+    // whatever settings were saved under it. A theme that keeps an API key or a
+    // webhook URL in its settings would have handed it over. Both paths now ask
+    // the same question.
+    if !crate::frontend::selectable(&app, &short) {
         return StatusCode::NOT_FOUND.into_response();
     }
     match app.db.lookup(&theme_config_key(&short)) {
@@ -2209,6 +2274,11 @@ pub async fn save_settings(
             return fail(e);
         }
     }
+    // The theme name is cached for the static path; a change to it has to reach
+    // that cache or the page keeps serving the previous theme.
+    if map.contains_key("theme") {
+        app.refresh_theme();
+    }
     Json(json!({"ok": true})).into_response()
 }
 
@@ -2216,6 +2286,7 @@ pub async fn save_settings(
 pub async fn change_password(
     _: Admin,
     State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
@@ -2226,6 +2297,16 @@ pub async fn change_password(
         return answer(StatusCode::BAD_REQUEST, "新密码至少 12 位");
     }
 
+    // The same per-address lockout the sign-in page keeps. Without it this route
+    // is a way around that lockout: a session, however obtained, could guess the
+    // old password here indefinitely, and the `PASSWORD_GATE` below only
+    // serialises the attempts rather than bounding them.
+    let ip = client_ip(&headers, peer.ip());
+    if app.throttle.locked(ip) {
+        return answer(StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，稍后再试");
+    }
+    let peer_ip = peer.ip();
+
     // 验证旧密码
     let Some(stored) = app.db.get("admin_password_hash") else {
         return answer(StatusCode::FORBIDDEN, "没有设置密码");
@@ -2235,19 +2316,29 @@ pub async fn change_password(
     };
 
     // 设置新密码，其他设备登出，当前设备保持登录
+    // Cloned because the worker takes ownership while the throttle below still
+    // needs the handle.
+    let worker_app = app.clone();
     let result = crate::auth::password_task(permit, move || {
         if !crate::auth::verify_password(&old_password, &stored) {
             return Ok(None);
         }
         let h = crate::auth::hash_password(&new_password)?;
-        app.db.replace_password(&h)?;
-        crate::auth::issue_session(&app, &headers).map(Some)
+        worker_app.db.replace_password(&h)?;
+        crate::auth::issue_session(&worker_app, &headers, peer_ip).map(Some)
     })
     .await
     .and_then(|result| result);
     match result {
-        Ok(Some(cookie)) => with_cookies(Json(json!({"ok": true})), [cookie]),
-        Ok(None) => answer(StatusCode::UNAUTHORIZED, "旧密码错误"),
+        Ok(Some(cookie)) => {
+            // A correct password clears the count, as it does on the sign-in page.
+            app.throttle.clear(ip);
+            with_cookies(Json(json!({"ok": true})), [cookie])
+        }
+        Ok(None) => {
+            app.throttle.record_failure(ip);
+            answer(StatusCode::UNAUTHORIZED, "旧密码错误")
+        }
         Err(e) => fail(e),
     }
 }
@@ -2877,6 +2968,7 @@ mod tests {
         let done = db_restore(
             Admin,
             State(app.clone()),
+            axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 40000))),
             Query(Chunk { offset: 0, total: bytes.len() as u64 }),
             HeaderMap::new(),
             axum::body::Body::from(bytes),
@@ -4138,8 +4230,14 @@ mod tests {
             .unwrap();
         let body =
             Json(json!({"old_password":"the-old-password-123", "new_password": "a-long-enough-password"}));
-        let response =
-            change_password(Admin, axum::extract::State(app.clone()), HeaderMap::new(), body).await;
+        let response = change_password(
+            Admin,
+            axum::extract::State(app.clone()),
+            axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 40000))),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
 
         assert!(!app.db.session_valid(&sha256(&stale)), "sessions must not outlive the old password");
 

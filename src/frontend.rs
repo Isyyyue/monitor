@@ -9,12 +9,14 @@ use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use http_body_util::BodyExt;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::api::answer;
 use crate::auth::random_token;
+use crate::security;
 use crate::{App, Shared};
 
 #[derive(RustEmbed)]
@@ -89,21 +91,63 @@ pub async fn serve(State(app): State<Shared>, headers: HeaderMap, method: Method
     let path = uri.path().trim_start_matches('/');
     let known = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
     if is_api_path(path) {
-        return answer(StatusCode::NOT_FOUND, format!("没有这个接口：/{path}"));
+        return security::refusal(StatusCode::NOT_FOUND, format!("没有这个接口：/{path}"));
     }
 
     if path == "admin" || path.starts_with("admin/") {
         let path = path.strip_prefix("admin").unwrap_or(path).trim_start_matches('/');
-        return embedded::<AdminAssets>(path, "面板没有构建，在 web-admin/ 下运行 npm run build", known);
+        // The panel is first-party: every script it loads is a bundled asset, so
+        // it gets the strict policy with no nonce and no inline script.
+        return security::harden_admin(embedded::<AdminAssets>(
+            path,
+            "面板没有构建，在 web-admin/ 下运行 npm run build",
+            known,
+        ));
     }
 
-    let theme = app.db.get("theme").unwrap_or_default();
-    if let Some(root) = external_theme(&app.themes, &theme) {
-        if let Some(response) = disk(&root, path, &headers, &method).await {
-            return response;
-        }
+    // The public page is third-party markup served from the hub's own origin.
+    // It gets a per-response nonce, and its inline scripts are rewritten to carry
+    // it, so a theme runs its own code without gaining the ability to run
+    // arbitrary injected script -- and `script-src` never admits `unsafe-inline`.
+    let nonce = security::nonce();
+    let theme = app.theme();
+    let body = match external_theme(&app.themes, &theme) {
+        Some(root) => match disk(&root, path, &headers, &method).await {
+            Some(response) => return security::harden_theme(nonce_script(response, &nonce).await, &nonce),
+            None => embedded::<DefaultThemeAssets>(path, "默认主题缺失，运行 scripts/theme.sh", known),
+        },
+        None => embedded::<DefaultThemeAssets>(path, "默认主题缺失，运行 scripts/theme.sh", known),
+    };
+    security::harden_theme(nonce_script(body, &nonce).await, &nonce)
+}
+
+/// Injects the nonce into an HTML response's inline scripts, leaving everything
+/// else -- and every non-HTML asset -- byte-identical.
+///
+/// The body is only rewritten when it is HTML: a video or a stylesheet must be
+/// streamed through untouched, and a range response carries a fragment rather
+/// than a document.
+async fn nonce_script(response: Response, nonce: &str) -> Response {
+    let is_html = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/html"));
+    if !is_html || !response.status().is_success() {
+        return response;
     }
-    embedded::<DefaultThemeAssets>(path, "默认主题缺失，运行 scripts/theme.sh", known)
+    let (mut parts, body) = response.into_parts();
+    // The shells are read from disk or the binary, bounded by `MAX_FILE`.
+    let Ok(collected) = body.collect().await else {
+        return security::refusal(StatusCode::INTERNAL_SERVER_ERROR, "页面读取失败");
+    };
+    let bytes = security::nonce_into(collected.to_bytes().to_vec(), nonce);
+    // The length changed, so a validator computed over the old bytes no longer
+    // describes this one. Dropping it is what keeps a cached shell from being
+    // revalidated against a body that never carried the nonce.
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.remove(header::ETAG);
+    (parts, bytes).into_response()
 }
 
 fn is_api_path(path: &str) -> bool {

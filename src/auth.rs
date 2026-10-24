@@ -180,11 +180,12 @@ pub fn issued_at(expires_at: i64) -> i64 {
 }
 
 /// The request's headers decide the Secure flag when the hub has no `--site`;
-/// see `App::secure_cookies`.
-pub fn issue_session(app: &App, headers: &HeaderMap) -> Result<String> {
+/// see `App::secure_cookies`. The peer is passed because that decision now
+/// requires it: a forwarded header is only evidence when a local proxy wrote it.
+pub fn issue_session(app: &App, headers: &HeaderMap, peer: IpAddr) -> Result<String> {
     let token = random_token();
     app.db.create_session(&sha256(&token), Utc::now().timestamp() + SESSION_DAYS * 86_400)?;
-    Ok(set_cookie(COOKIE, &token, SESSION_DAYS * 86_400, app.secure_cookies(headers)))
+    Ok(set_cookie(COOKIE, &token, SESSION_DAYS * 86_400, app.secure_cookies(headers, peer)))
 }
 
 #[derive(Deserialize)]
@@ -210,11 +211,12 @@ pub async fn login(
         return answer(StatusCode::FORBIDDEN, "没有设置应急密码，无法用密码登录");
     };
     let worker_app = app.clone();
+    let peer_ip = peer.ip();
     let outcome = password_task(permit, move || {
         if !verify_password(&body.password, &stored) {
             return Ok(None);
         }
-        issue_session(&worker_app, &headers).map(Some)
+        issue_session(&worker_app, &headers, peer_ip).map(Some)
     })
     .await
     .and_then(|result| result);
@@ -232,13 +234,17 @@ pub async fn login(
     }
 }
 
-pub async fn logout(State(app): State<crate::Shared>, headers: HeaderMap) -> Response {
+pub async fn logout(
+    State(app): State<crate::Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
     if let Some(token) = cookie_value(&headers, COOKIE) {
         let _ = app.db.drop_session(&sha256(&token));
     }
     with_cookies(
         Json(serde_json::json!({"ok": true})),
-        [set_cookie(COOKIE, "", 0, app.secure_cookies(&headers))],
+        [set_cookie(COOKIE, "", 0, app.secure_cookies(&headers, peer.ip()))],
     )
 }
 
@@ -296,7 +302,7 @@ pub fn node_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
 }
 
 /// Loopback or a private network, where a reverse proxy resides.
-fn behind_local_proxy(ip: IpAddr) -> bool {
+pub(crate) fn behind_local_proxy(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
         // Unique-local (fc00::/7) and link-local (fe80::/10); the stable

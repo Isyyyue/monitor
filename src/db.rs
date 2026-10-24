@@ -618,6 +618,68 @@ fn expiry_patch<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<
     Option::<String>::deserialize(d).map(Some)
 }
 
+impl Node {
+    /// The writable half of a node, as a patch naming every field.
+    ///
+    /// `create_node` needs this so a node added through the panel passes through
+    /// exactly the checks an edit does. The two writers used to call the
+    /// individual validators directly, and the create path silently skipped
+    /// `public_remark` and the pins -- values that reach every anonymous visitor.
+    /// Routing both through one function is what keeps them equivalent.
+    pub fn as_patch(&self) -> NodePatch {
+        NodePatch {
+            name: Some(self.name.clone()),
+            public: Some(self.public),
+            price: Some(self.price),
+            currency: Some(self.currency.clone()),
+            billing_cycle: Some(self.billing_cycle.clone()),
+            expires_at: Some(self.expires_at.clone()),
+            remark: Some(self.remark.clone()),
+            public_remark: Some(self.public_remark.clone()),
+            traffic_limit: Some(self.traffic_limit),
+            traffic_mode: Some(self.traffic_mode.clone()),
+            traffic_reset_day: Some(self.traffic_reset_day),
+            notify: Some(self.notify),
+            country_pin: Some(self.country_pin.clone()),
+            ipv4_pin: Some(self.ipv4_pin.clone()),
+            ipv6_pin: Some(self.ipv6_pin.clone()),
+            group: Some(self.group.clone()),
+        }
+    }
+
+    /// Applies a normalized patch back onto the node, so `create_node` stores the
+    /// values the validators produced rather than the raw ones they read.
+    pub fn apply_patch(&mut self, patch: NodePatch) {
+        macro_rules! take {
+            ($field:ident) => {
+                if let Some(value) = patch.$field {
+                    self.$field = value;
+                }
+            };
+        }
+        take!(name);
+        take!(public);
+        take!(price);
+        take!(currency);
+        take!(billing_cycle);
+        take!(remark);
+        take!(public_remark);
+        take!(traffic_limit);
+        take!(traffic_mode);
+        take!(traffic_reset_day);
+        take!(notify);
+        take!(country_pin);
+        take!(ipv4_pin);
+        take!(ipv6_pin);
+        take!(group);
+        // `expires_at` is `Option<Option<String>>` in the patch: the outer option
+        // is "was it sent", the inner is "clear it".
+        if let Some(value) = patch.expires_at {
+            self.expires_at = value;
+        }
+    }
+}
+
 #[derive(Deserialize, Default)]
 pub struct TrafficPatch {
     pub total_rx: Option<i64>,

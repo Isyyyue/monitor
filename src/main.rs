@@ -31,6 +31,7 @@ mod auth;
 mod db;
 mod frontend;
 mod notify;
+mod security;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -83,6 +84,15 @@ pub struct App {
     pub themes: PathBuf,
     /// Alerts on their way out; see `notify::send`.
     pub notes: tokio::sync::mpsc::Sender<notify::Note>,
+    /// The selected theme's short name, cached because `frontend::serve` reads it
+    /// on every static request.
+    ///
+    /// Reading it from the database took the global connection mutex -- the same
+    /// one the agents write their reports through -- so an anonymous caller
+    /// fetching `/` in a loop could hold up the writers. The value changes only
+    /// when the operator saves settings, which is what `refresh_theme` is for;
+    /// `None` means it has not been read yet.
+    theme: RwLock<Option<String>>,
 }
 
 impl App {
@@ -101,7 +111,25 @@ impl App {
             site,
             themes,
             notes,
+            theme: RwLock::new(None),
         }
+    }
+
+    /// The selected theme's short name, read from the database once and then
+    /// served from memory. See the field's own note for why this is cached.
+    pub fn theme(&self) -> String {
+        if let Some(cached) = self.theme.read().unwrap_or_else(|e| e.into_inner()).clone() {
+            return cached;
+        }
+        let fresh = self.db.get("theme").unwrap_or_default();
+        *self.theme.write().unwrap_or_else(|e| e.into_inner()) = Some(fresh.clone());
+        fresh
+    }
+
+    /// Drops the cached theme name, so the next request re-reads it. Called
+    /// wherever the `theme` setting is written.
+    pub fn refresh_theme(&self) {
+        *self.theme.write().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     #[cfg(test)]
@@ -121,23 +149,35 @@ impl App {
     /// header. Marking the cookie Secure over plain HTTP would cause the browser
     /// to discard the session.
     ///
-    /// The header is supplied by the trusted reverse proxy, so the listener must
-    /// remain publicly unreachable for a caller not to set its own. A proxy that
-    /// sends none leaves the flag off, which costs the flag rather than the
-    /// session; `--site https://...` sets it regardless.
-    pub fn secure_cookies(&self, headers: &HeaderMap) -> bool {
+    /// The header is honoured only when the peer is itself a local proxy, the same
+    /// rule [`crate::auth::client_ip`] applies to `X-Forwarded-For`. Without that
+    /// check any caller reaching the listener directly could set its own value --
+    /// and while that only affects the caller's own response, the case that
+    /// matters is the opposite one: a deployment whose proxy does not send the
+    /// header leaves every session cookie unmarked, and an unmarked cookie travels
+    /// over the first plain-HTTP request to the same host. `--site https://...`
+    /// sets the flag regardless, which is the configuration to recommend.
+    ///
+    /// The last hop is read, not the first, for the reason given on `client_ip`:
+    /// both documented proxies append, so a caller supplying its own value leaves
+    /// it at the head. The comparison is case-insensitive, because `HTTPS` is a
+    /// legitimate spelling and reading it as false would silently drop the flag.
+    pub fn secure_cookies(&self, headers: &HeaderMap, peer: std::net::IpAddr) -> bool {
         if !self.site.is_empty() {
             return !self.site.starts_with("http://");
         }
-        forwarded_proto(headers) == Some("https")
+        if !crate::auth::behind_local_proxy(peer.to_canonical()) {
+            return false;
+        }
+        forwarded_proto(headers).is_some_and(|proto| proto.eq_ignore_ascii_case("https"))
     }
 }
 
 /// The scheme the browser used, as reported by a reverse proxy. Chained proxies
-/// append to the header, so the browser's own hop is the first value.
+/// append to the header, so the value the nearest proxy observed is the last one.
 fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
     let chain = headers.get("x-forwarded-proto")?.to_str().ok()?;
-    Some(chain.split(',').next()?.trim())
+    Some(chain.rsplit(',').next()?.trim())
 }
 
 /// Where the agent binaries are published, and where this hub is published. Not
@@ -648,6 +688,15 @@ async fn main() -> Result<()> {
                     }),
             ),
         )
+        // The outermost layer, so every reply carries the hardening headers --
+        // API responses included. The policy itself is attached by
+        // `frontend::serve`, which is the only place that knows whether a
+        // response is the panel, a theme, or JSON; this layer covers the rest
+        // (`nosniff`, framing, referrer) without ever overwriting a policy a
+        // renderer already set.
+        .layer(axum::middleware::map_response(|response: axum::response::Response| async move {
+            security::harden(response)
+        }))
         .with_state(app);
 
     let listener = match tokio::net::TcpListener::bind(args.listen).await {
@@ -1015,16 +1064,18 @@ mod tests {
     /// own address.
     #[test]
     fn the_cookie_flag_follows_site_when_it_is_set_and_the_proxy_when_it_is_not() {
+        let local: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let remote: std::net::IpAddr = "203.0.113.5".parse().unwrap();
         // Local development: no Secure flag, or the browser discards the cookie
         // entirely.
-        for local in ["http://127.0.0.1:28080", "http://localhost:28080", "http://[::1]:28080"] {
-            assert!(!app(local).secure_cookies(&proto(None)), "{local}");
-            assert!(!exposed_over_plain_http(local), "{local} is not exposed");
+        for local_site in ["http://127.0.0.1:28080", "http://localhost:28080", "http://[::1]:28080"] {
+            assert!(!app(local_site).secure_cookies(&proto(None), local), "{local_site}");
+            assert!(!exposed_over_plain_http(local_site), "{local_site} is not exposed");
         }
         // A configured --site takes precedence over the request in both
         // directions: operator configuration outranks a client-settable header.
-        assert!(app("https://hub.example.com").secure_cookies(&proto(Some("http"))));
-        assert!(!app("http://hub.example.com").secure_cookies(&proto(Some("https"))));
+        assert!(app("https://hub.example.com").secure_cookies(&proto(Some("http")), local));
+        assert!(!app("http://hub.example.com").secure_cookies(&proto(Some("https")), local));
         assert!(!exposed_over_plain_http("https://m.example.com"));
         // A registered name is not an address however it begins: reading one as
         // loopback would suppress the plaintext-cookie warning.
@@ -1033,15 +1084,26 @@ mod tests {
         // Nor is userinfo an address: the host follows the '@', and reading the
         // part before it as loopback suppresses the same warning.
         assert!(exposed_over_plain_http("http://127.0.0.1:28080@hub.example.com"));
-        assert!(!app("http://127.0.0.1:28080@hub.example.com").secure_cookies(&proto(None)));
+        assert!(!app("http://127.0.0.1:28080@hub.example.com").secure_cookies(&proto(None), local));
 
-        // Without --site the proxy's header is the only indication of scheme.
+        // Without --site the proxy's header is the only indication of scheme, and
+        // it counts only when a local proxy is the one that wrote it.
         let bare = app("");
-        assert!(!bare.secure_cookies(&proto(None)), "plain HTTP, answered directly");
-        assert!(bare.secure_cookies(&proto(Some("https"))));
-        // Chained proxies append, so the browser's own hop is the first value.
-        assert!(bare.secure_cookies(&proto(Some("https, http"))));
-        assert!(!bare.secure_cookies(&proto(Some("http, https"))));
+        assert!(!bare.secure_cookies(&proto(None), local), "plain HTTP, answered directly");
+        assert!(bare.secure_cookies(&proto(Some("https")), local));
+        // A caller reaching the listener directly sets its own header; it must not
+        // be able to talk the hub into the flag either way.
+        assert!(!bare.secure_cookies(&proto(Some("https")), remote), "a remote peer is not a proxy");
+        // Chained proxies append, so the hop the nearest proxy observed is the
+        // last one. A caller-supplied value sits at the head.
+        assert!(!bare.secure_cookies(&proto(Some("https, http")), local), "the tail wins");
+        assert!(bare.secure_cookies(&proto(Some("http, https")), local), "the tail wins");
+        // A proxy may spell it either way; reading `HTTPS` as false would silently
+        // drop the flag.
+        assert!(bare.secure_cookies(&proto(Some("HTTPS")), local));
+        // An IPv4 peer reported through the dual-stack listener is still local.
+        let mapped: std::net::IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(bare.secure_cookies(&proto(Some("https")), mapped));
     }
 
     /// A hub serving in the clear must report it, and a wildcard listener is not
@@ -1050,6 +1112,7 @@ mod tests {
     #[test]
     fn the_advertised_url_resolves_a_wildcard_listener_and_defers_to_site() {
         let listen = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let local: std::net::IpAddr = "127.0.0.1".parse().unwrap();
         assert_eq!(
             advertised_url("https://hub.example.com", listen("127.0.0.1:28080")),
             "https://hub.example.com"
@@ -1059,7 +1122,7 @@ mod tests {
         // Genuinely in the clear: warn, and still no Secure flag, which is what
         // makes the warning worth printing.
         for remote in ["http://203.0.113.10:28080", "http://hub.example.com"] {
-            assert!(!app(remote).secure_cookies(&proto(None)), "{remote}");
+            assert!(!app(remote).secure_cookies(&proto(None), local), "{remote}");
             assert!(exposed_over_plain_http(remote), "{remote} is exposed");
         }
 
