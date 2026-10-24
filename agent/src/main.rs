@@ -17,11 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::{
     connect_async_tls_with_config,
-    tungstenite::{
-        client::IntoClientRequest,
-        protocol::WebSocketConfig,
-        Message,
-    },
+    tungstenite::{client::IntoClientRequest, protocol::WebSocketConfig, Message},
     Connector,
 };
 use tracing::{error, info, warn};
